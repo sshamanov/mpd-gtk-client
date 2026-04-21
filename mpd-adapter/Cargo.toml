@@ -1,0 +1,17 @@
+[package]
+name = "mpd-adapter"
+version = "0.1.0"
+edition = "2021"
+authors = ["schaman"]
+license = "MIT"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+

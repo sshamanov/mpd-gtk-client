@@ -1,0 +1,21 @@
+[package]
+name = "cover-fetcher"
+version = "0.1.0"
+edition = "2021"
+authors = ["schaman"]
+license = "MIT"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+id3 = { workspace = true }
+mp4ameta = { workspace = true }
+image = { workspace = true }
+lru = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+async-trait = { workspace = true }
+
+# Internal workspace crates
+state = { path = "../state", version = "0.1.0" }

@@ -1,0 +1,20 @@
+[package]
+name = "state"
+version = "0.1.0"
+edition = "2021"
+authors = ["schaman"]
+license = "MIT"
+
+[dependencies]
+tokio = { workspace = true, features = ["sync", "time"] }
+serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+async-trait = { workspace = true }
+
+# Internal workspace crates
+mpd-adapter = { path = "../mpd-adapter", version = "0.1.0" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

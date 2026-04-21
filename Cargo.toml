@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "mpd-adapter",
+    "state",
+    "ui",
+    "cover-fetcher",
+    "bin",
+]
+
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.39", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+async-trait = "0.1"
+futures = "0.3"
+
+# UI dependencies
+gtk4 = { version = "0.8", package = "gtk4" }
+# libadwaita = { version = "0.8", package = "libadwaita" }
+glib = { version = "0.20", package = "glib" }
+gio = { version = "0.20", package = "gio" }
+gdk4 = { version = "0.8", package = "gdk4" }
+gdk-pixbuf = { version = "0.20", package = "gdk-pixbuf" }
+
+# Cover fetching
+reqwest = { version = "0.12", features = ["json"] }
+id3 = "1.1"
+mp4ameta = "0.5"
+image = "0.25"
+lru = "0.12"

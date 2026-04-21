@@ -1,0 +1,25 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2021"
+authors = ["schaman"]
+license = "MIT"
+
+[dependencies]
+gtk4 = { workspace = true }
+glib = { workspace = true }
+gio = { workspace = true }
+gdk4 = { workspace = true }
+gdk-pixbuf = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+
+# Internal workspace crates
+state = { path = "../state", version = "0.1.0" }
+mpd-adapter = { path = "../mpd-adapter", version = "0.1.0" }
+cover-fetcher = { path = "../cover-fetcher", version = "0.1.0" }
+
+[build-dependencies]
+glib-build-tools = "0.20"
