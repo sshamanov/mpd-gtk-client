@@ -624,12 +624,6 @@ impl App {
                         MpdEvent::Disconnected => {
                             ci_c.set_css_classes(&["connection-indicator", "disconnected"]);
                         }
-                        MpdEvent::Reconnected => {
-                            ci_c.set_css_classes(&["connection-indicator", "connected"]);
-                            if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
-                            let _ = cmd_c.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
-                            let _ = cmd_c.send(MpdCommand::ListQueue);
-                        }
                         MpdEvent::StateChanged(update) => {
                             current_song_pos.set(update.song.map(|s| s as i32));
                             update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &update);
@@ -775,6 +769,10 @@ impl App {
                             }
                             // Refresh shared item_ids for Delete key lookup
                             *ids_w.borrow_mut() = item_ids.clone();
+                        }
+                        MpdEvent::LibraryChanged => {
+                            if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
+                            let _ = cmd_c.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
                         }
                         MpdEvent::Error(msg) => {
                             ci_c.set_css_classes(&["connection-indicator", "error"]);

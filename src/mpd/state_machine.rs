@@ -40,13 +40,13 @@ pub enum MpdEvent {
     Connected,
     Connecting,
     Disconnected,
-    Reconnected,
     StateChanged(PlaybackUpdate),
     Albums(Vec<(String, String)>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
     SearchResults(Vec<(String, String)>),
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
+    LibraryChanged,
     Error(String),
 }
 
@@ -61,6 +61,7 @@ pub struct PlaybackUpdate {
     pub volume: i16,
     pub elapsed: Option<f64>,
     pub duration: Option<f64>,
+    pub playlist_version: Option<String>,
 }
 
 /// Internal state machine for the MPD connection lifecycle.
@@ -78,7 +79,7 @@ enum MpdState {
 }
 
 /// Exponential backoff for reconnection attempts.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExponentialBackoff {
     current: Duration,
     max: Duration,
@@ -248,6 +249,7 @@ fn connected_loop(
     let mut last_status = Instant::now();
     let mut last_song_pos: Option<u32>;
     let mut consecutive_failures: u32;
+    let mut last_playlist_version: Option<String> = None;
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -470,6 +472,11 @@ fn connected_loop(
                 consecutive_failures = 0;
                 let new_song = update.song;
                 let song_changed = new_song != last_song_pos;
+                let playlist_changed = update.playlist_version != last_playlist_version;
+                if playlist_changed && update.playlist_version.is_some() {
+                    last_playlist_version = update.playlist_version.clone();
+                    let _ = event_tx.try_send(MpdEvent::LibraryChanged);
+                }
                 match event_tx.try_send(MpdEvent::StateChanged(update)) {
                     Ok(()) => {
                         if song_changed {
@@ -511,6 +518,7 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
             .unwrap_or(0),
         elapsed: status.get("elapsed").and_then(|v| v.parse().ok()),
         duration: status.get("duration").and_then(|v| v.parse().ok()),
+        playlist_version: status.get("playlist").cloned(),
         ..Default::default()
     }
 }
