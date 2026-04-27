@@ -514,10 +514,21 @@ impl App {
             let playback_icon = Label::new(Some("⏹"));
             playback_icon.set_halign(gtk4::Align::Start);
 
+            let time_display = Label::new(Some("--:-- / --:--"));
+            time_display.set_halign(gtk4::Align::Start);
+            time_display.set_css_classes(&["time-display"]);
+
+            let format_badge = Label::new(None);
+            format_badge.set_halign(gtk4::Align::Start);
+            format_badge.set_css_classes(&["format-badge"]);
+            format_badge.set_visible(false);
+
             now_playing.append(&playback_icon);
             now_playing.append(&track_title);
             now_playing.append(&track_artist);
             now_playing.append(&track_album);
+            now_playing.append(&time_display);
+            now_playing.append(&format_badge);
             right_pane.append(&now_playing);
 
             // Queue display in right rail
@@ -601,6 +612,8 @@ impl App {
             let ar_c = track_artist.clone();
             let al_c = track_album.clone();
             let pi_c = playback_icon.clone();
+            let td_c = time_display.clone();
+            let fmt_c = format_badge.clone();
             let np_cover_c = np_cover.clone();
             let grid_c = album_grid.clone();
             let stack_c = left_stack.clone();
@@ -649,7 +662,7 @@ impl App {
                         }
                         MpdEvent::StateChanged(update) => {
                             current_song_pos.set(update.song.map(|s| s as i32));
-                            update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &np_cover_c, &cp_np, &update);
+                            update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &td_c, &fmt_c, &np_cover_c, &cp_np, &update);
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
@@ -914,6 +927,8 @@ fn update_now_playing(
     artist: &Label,
     album: &Label,
     icon: &Label,
+    time_display: &Label,
+    format_badge: &Label,
     cover: &Picture,
     cover_paths: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
     update: &PlaybackUpdate,
@@ -930,7 +945,6 @@ fn update_now_playing(
     }
     if let Some(ref a) = update.album {
         album.set_text(a);
-        // Update cover image for current album
         let cp = cover_paths.borrow();
         if let Some(Some(path)) = cp.get(a) {
             cover.set_filename(Some(path));
@@ -941,6 +955,22 @@ fn update_now_playing(
     } else {
         album.set_text("");
         cover.set_visible(false);
+    }
+    // Elapsed / Duration
+    match (update.elapsed, update.duration) {
+        (Some(el), Some(dur)) => {
+            time_display.set_text(&format!("{}:{:02} / {}:{:02}", el as u64 / 60, el as u64 % 60, dur as u64 / 60, dur as u64 % 60));
+        }
+        _ => {
+            time_display.set_text("--:-- / --:--");
+        }
+    }
+    // Format badge
+    if let Some(ref fmt) = update.format {
+        format_badge.set_text(fmt);
+        format_badge.set_visible(true);
+    } else {
+        format_badge.set_visible(false);
     }
     match update.state.as_str() {
         "play" => icon.set_text("▶"),

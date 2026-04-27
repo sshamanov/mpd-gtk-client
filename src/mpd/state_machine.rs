@@ -64,6 +64,7 @@ pub struct PlaybackUpdate {
     pub elapsed: Option<f64>,
     pub duration: Option<f64>,
     pub playlist_version: Option<String>,
+    pub format: Option<String>,
 }
 
 /// Internal state machine for the MPD connection lifecycle.
@@ -552,12 +553,35 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
 }
 
 fn parse_song_update(song: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
+    let format = format_badge_text(song);
     PlaybackUpdate {
         artist: song.get("Artist").cloned(),
         title: song.get("Title").cloned(),
         album: song.get("Album").cloned(),
+        format,
         ..Default::default()
     }
+}
+
+/// Build a compact format badge from MPD currentsong audio metadata.
+fn format_badge_text(song: &std::collections::HashMap<String, String>) -> Option<String> {
+    // Check for DSD audio first
+    if let Some(audio) = song.get("Audio") {
+        if audio.starts_with("dsd") {
+            // Format: "dsd64", "dsd128", etc.
+            return Some(audio.to_uppercase());
+        }
+    }
+    // PCM: use Format field (e.g., "44100:24:2" → "24/44.1")
+    if let Some(format) = song.get("Format") {
+        let parts: Vec<&str> = format.split(':').collect();
+        if parts.len() == 3 {
+            if let (Ok(rate), Ok(bits)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                return Some(format!("{}/{}", bits, (rate as f64 / 1000.0)));
+            }
+        }
+    }
+    None
 }
 
 /// Fetch a complete PlaybackUpdate: status + currentsong metadata when a song is active.
@@ -570,6 +594,7 @@ fn fetch_full_update(adapter: &mut MpdAdapter) -> Option<PlaybackUpdate> {
             if update.artist.is_none() { update.artist = song_update.artist; }
             if update.title.is_none() { update.title = song_update.title; }
             if update.album.is_none() { update.album = song_update.album; }
+            if update.format.is_none() { update.format = song_update.format; }
         }
     }
     Some(update)
