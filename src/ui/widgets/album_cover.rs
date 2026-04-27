@@ -40,6 +40,7 @@ pub fn create_album_cover(
     cover_area.append(&placeholder);
 
     let cover_image = Picture::new();
+    cover_image.set_widget_name("cover-image");
     cover_image.set_size_request(COVER_SIZE, COVER_SIZE);
     cover_image.set_halign(gtk4::Align::Center);
     cover_image.set_valign(gtk4::Align::Center);

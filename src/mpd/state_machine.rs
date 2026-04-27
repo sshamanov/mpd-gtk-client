@@ -257,6 +257,7 @@ fn connected_loop(
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
     let mut cover_fetcher = crate::coverart::CoverFetcher::new();
+    let mut pending_covers: Vec<(String, String)> = Vec::new();
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -345,8 +346,8 @@ fn connected_loop(
                         }
                     }
                     MpdCommand::FetchCovers(albums) => {
-                        let covers = fetch_cover_paths(&mut adapter, &albums, &mut cover_fetcher);
-                        let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
+                        // Store pending cover fetches; processed one per idle cycle below
+                        pending_covers = albums;
                     }
                     MpdCommand::Search(query) => {
                         if let Ok(results) = adapter.search_albums(&query) {
@@ -473,6 +474,15 @@ fn connected_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Process one pending cover fetch per idle cycle to avoid blocking
+                if !pending_covers.is_empty() {
+                    let (_, album_name) = pending_covers.remove(0);
+                    if let Some(path) = cover_fetcher.fetch_cover(&album_name, &mut adapter) {
+                        let mut covers = std::collections::HashMap::new();
+                        covers.insert(album_name, Some(path.to_string_lossy().to_string()));
+                        let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
+                    }
+                }
                 // Fall through to status poll check below
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -521,20 +531,6 @@ fn connected_loop(
             }
         }
     }
-}
-
-/// Scan for cover images for each album via MPD albumart command, returning a path map.
-fn fetch_cover_paths(
-    adapter: &mut MpdAdapter,
-    albums: &[(String, String)],
-    fetcher: &mut crate::coverart::CoverFetcher,
-) -> std::collections::HashMap<String, Option<String>> {
-    let mut covers = std::collections::HashMap::new();
-    for (_, album_name) in albums {
-        let path = fetcher.fetch_cover(album_name, adapter);
-        covers.insert(album_name.clone(), path.map(|p| p.to_string_lossy().to_string()));
-    }
-    covers
 }
 
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
