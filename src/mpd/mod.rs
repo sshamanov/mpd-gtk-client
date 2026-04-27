@@ -6,7 +6,7 @@ pub mod state_machine;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
@@ -85,7 +85,12 @@ pub struct MpdAdapter {
 
 impl MpdAdapter {
     pub fn connect(host: &str, port: u16) -> Result<Self, Error> {
-        let stream = TcpStream::connect((host, port))?;
+        let stream = TcpStream::connect_timeout(
+            &(host, port).to_socket_addrs()?.next().ok_or_else(|| {
+                Error::Connection(std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve host"))
+            })?,
+            Duration::from_secs(5),
+        )?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let mut reader = BufReader::new(stream.try_clone()?);

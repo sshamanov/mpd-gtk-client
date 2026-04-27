@@ -36,6 +36,17 @@ impl ToastOverlay {
     pub fn widget(&self) -> &Revealer { &self.revealer }
 
     pub fn show_toast(&self, msg: &str) {
+        // Rate-limit identical messages to prevent toast spam
+        if self.revealer.reveals_child() {
+            if let Some(last) = self.container.first_child()
+                .and_then(|c| c.downcast::<Label>().ok())
+            {
+                if &*last.text() == msg {
+                    return; // Same message already showing, skip
+                }
+            }
+        }
+
         while let Some(child) = self.container.first_child() {
             self.container.remove(&child);
         }
