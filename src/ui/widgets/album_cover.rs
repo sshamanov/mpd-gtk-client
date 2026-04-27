@@ -46,6 +46,7 @@ pub fn create_album_cover(
     cover_image.set_valign(gtk4::Align::Center);
     let has_cover = cover_path.is_some();
     if let Some(path) = cover_path {
+        log::info!("[cover] display: '{title}' -> {path}");
         cover_image.set_filename(Some(path));
     }
     cover_image.set_visible(has_cover);

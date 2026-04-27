@@ -814,10 +814,10 @@ impl App {
                         }
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = cover_paths.borrow_mut();
-                            for (album, path) in paths {
-                                cp.insert(album, path);
+                            for (album, path) in &paths {
+                                log::info!("[UI] cover path: '{album}' -> {:?}", path);
+                                cp.insert(album.clone(), path.clone());
                             }
-                            // Grid will pick up new covers on next refresh (group switch, etc.)
                         }
                         MpdEvent::LibraryChanged => {
                             if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }

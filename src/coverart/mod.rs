@@ -43,14 +43,25 @@ impl CoverFetcher {
 
     fn fetch_via_mpd(&self, album_name: &str, adapter: &mut MpdAdapter) -> Option<PathBuf> {
         let data = adapter.albumart(album_name).ok()??;
+        log::info!("[cover] '{album_name}': got {} bytes, saving to cache", data.len());
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         album_name.hash(&mut hasher);
         let hash = format!("{:016x}", hasher.finish());
         let path = self.cache_dir.join(format!("{hash}.jpg"));
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            let _ = f.write_all(&data);
+        match std::fs::File::create(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(&data) {
+                    log::error!("[cover] '{album_name}': write failed: {e}");
+                    return None;
+                }
+                log::info!("[cover] '{album_name}': saved to {}", path.display());
+                Some(path)
+            }
+            Err(e) => {
+                log::error!("[cover] '{album_name}': create file failed: {e}");
+                None
+            }
         }
-        Some(path)
     }
 }
