@@ -1,0 +1,129 @@
+#[path = "common.rs"]
+mod common;
+
+#[test]
+fn smoke_test_connect_and_status() {
+    let (server, mut client) = common::with_mpd_server();
+
+    let status = client.status().unwrap();
+    assert_eq!(status.get("volume"), Some(&"80".to_string()));
+    assert_eq!(status.get("state"), Some(&"play".to_string()));
+    assert_eq!(status.get("song"), Some(&"0".to_string()));
+
+    server.assert_received("status");
+}
+
+#[test]
+fn smoke_test_current_song() {
+    let (server, mut client) = common::with_mpd_server();
+
+    let song = client.current_song().unwrap();
+    assert!(song.is_some());
+    let song = song.unwrap();
+    assert_eq!(song.get("Artist"), Some(&"Test Artist".to_string()));
+    assert_eq!(song.get("Title"), Some(&"Test Track".to_string()));
+
+    server.assert_received("currentsong");
+}
+
+#[test]
+fn smoke_test_playback_commands() {
+    let (server, mut client) = common::with_mpd_server();
+
+    client.play().unwrap();
+    client.pause().unwrap();
+    client.next_track().unwrap();
+    client.previous().unwrap();
+    client.stop().unwrap();
+
+    server.assert_received("play");
+    server.assert_received("pause");
+    server.assert_received("next");
+    server.assert_received("previous");
+    server.assert_received("stop");
+}
+
+#[test]
+fn test_list_queue() {
+    let (server, mut client) = common::with_mpd_server();
+    let queue = client.list_queue().unwrap();
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue[0].title.as_deref(), Some("Test Track"));
+    assert_eq!(queue[0].position, 0);
+    assert_eq!(queue[1].title.as_deref(), Some("Second Track"));
+    assert_eq!(queue[2].title.as_deref(), Some("Third Track"));
+    server.assert_received("playlistinfo");
+}
+
+#[test]
+fn test_search_albums() {
+    let (server, mut client) = common::with_mpd_server();
+    let results = client.search_albums("test query").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].1, "Test Album");
+    assert_eq!(results[1].1, "Second Album");
+    server.assert_received("search");
+}
+
+#[test]
+fn test_list_albums() {
+    let (server, mut client) = common::with_mpd_server();
+    let albums = client.list_albums().unwrap();
+    assert_eq!(albums.len(), 3);
+    assert_eq!(albums[0].1, "Second Album"); // sorted alphabetically by album name
+    assert_eq!(albums[1].1, "Test Album");
+    assert_eq!(albums[2].1, "Third Album");
+    server.assert_received("list");
+}
+
+#[test]
+fn test_list_albums_grouped() {
+    let (server, mut client) = common::with_mpd_server();
+    let groups = client.list_albums_grouped("Artist").unwrap();
+    assert!(!groups.is_empty());
+    // First group should have header and albums
+    let (header, albums) = &groups[0];
+    assert!(!header.is_empty());
+    assert!(!albums.is_empty());
+    server.assert_received("list");
+}
+
+#[test]
+fn test_lsinfo_root() {
+    let (server, mut client) = common::with_mpd_server();
+    let entries = client.lsinfo("").unwrap();
+    assert!(!entries.is_empty());
+    // Should have at least one directory
+    let has_directory = entries.iter().any(|e| matches!(e, mpd_client::mpd::DirEntry::Directory { .. }));
+    assert!(has_directory);
+    server.assert_received("lsinfo");
+}
+
+#[test]
+fn test_find_album_uris() {
+    let (server, mut client) = common::with_mpd_server();
+    let uris = client.find_album_uris("Test Album").unwrap();
+    assert_eq!(uris.len(), 2);
+    assert_eq!(uris[0], "test/01-test.flac");
+    assert_eq!(uris[1], "test/01-test-2.flac");
+    server.assert_received("find");
+}
+
+#[test]
+fn test_addid() {
+    let (server, mut client) = common::with_mpd_server();
+    let id = client.addid("test/some-track.flac").unwrap();
+    assert_eq!(id, 99);
+    server.assert_received("addid");
+}
+
+#[test]
+fn test_queue_mutation_commands() {
+    let (server, mut client) = common::with_mpd_server();
+    client.send_command("deleteid 10").unwrap();
+    server.assert_received("deleteid");
+    client.send_command("moveid 10 0").unwrap();
+    server.assert_received("moveid");
+    client.send_command("clear").unwrap();
+    server.assert_received("clear");
+}
