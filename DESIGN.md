@@ -16,6 +16,53 @@ editHistory:
   - date: '2026-04-22'
     changes: 'Fix validation report issues: FR format violations, NFR measurability gaps, implementation leakage, project-type gaps; incorporate user tech stack (GTK4/Rust/Linux-only)'
 ---
+## Implementation Notes (v1 — 2026-04-27)
+
+The v1 implementation is complete. This section documents key architectural decisions made during implementation that extend or deviate from the original design below.
+
+### Technology Stack (Chosen)
+- **Rust** edition 2024, MSRV 1.85, single crate (not workspace)
+- **GTK4** 0.11 with v4_14 feature, glib 0.20, gdk4 0.11
+- **std::thread** with `mpsc::sync_channel` (not tokio — 4.2MB vs 15MB binary)
+- **env_logger** for logging, **TOML** (`dirs` crate) for config persistence
+- **Linux-only** — no Windows/macOS support planned
+
+### Architecture Deviations from Design
+
+**Threading model** — Two threads: UI (GTK4 main loop) + MPD background (`connected_loop`). The background thread processes commands via `recv_timeout(100ms)` and runs an independent 500ms status poll. No async runtime.
+
+**Status polling** — MPD's `idle` protocol is not used. Instead, a `fetch_full_update()` helper combines `status` + `currentsong` every 500ms to get complete playback state with metadata. External track changes (from other clients or auto-advance) are detected by comparing `last_song_pos` across polls and trigger a `Queue` event to refresh the queue display.
+
+**Event flow** — Commands that modify state (Play, Pause, PlayPosition, PlayAlbum, etc.) send both `StateChanged` and `Queue` events immediately after execution, plus the 500ms poll provides continuous status updates for external changes.
+
+**Channel backpressure** — `sync_channel(1024)` with `try_send`. If the channel fills, events are dropped and the next poll re-detects changes. Channel-full conditions log at warn level.
+
+**Event loop batching** — UI processes at most 64 events per 30ms tick (`timeout_add_local`) to yield to the GTK main loop and prevent UI freezes.
+
+**Toast notifications** — Re-enabled with `set_can_target(false)` on the `Revealer` when hidden, so the overlay passes through clicks to underlying widgets.
+
+**SIGINT/SIGTERM** — Signal handlers set the stop flag and defer `process::exit(0)` via `glib::idle_add` to allow the GLib main context to process pending events before exit.
+
+**Cover art** — Stub only; `CoverFetcher` returns `None`. Not yet implemented.
+
+**Queue model** — Simplified from the design: single track-oriented queue `ListBox` in the right rail (not separate album/track queue presenters). Queue items show title, artist, duration. Current track highlighted via CSS class `queue-current` and auto-selected.
+
+**Grouped views** — Artist grouping sets artist from the group header; Date/Genre groupings show "Unknown Artist" (MPD's `list album group` doesn't return artist for non-Artist groupings).
+
+### Known Limitations & Deferred Work
+See `_bmad-output/implementation-artifacts/deferred-work.md` for the full list. Key items:
+- No virtualized grid rendering (large libraries may cause UI freezes)
+- Dead MPD connection not detected (thread continues polling with errors)
+- Toast auto-dismiss race condition on rapid successive errors
+- `search_albums` doesn't handle `AlbumArtist` tag
+- Grouped-mode double-click index mismatch (headers offset album indices)
+- `Reconnected` event is dead code (only `Connected` is emitted)
+
+### Tests
+11 integration tests with mock MPD server covering: connect/status, currentsong, playback commands, queue listing, search, album listing, grouped albums, directory listing, album URIs, addid, queue mutations.
+
+---
+
 ## Executive Summary
 
 This MPD client focuses on two core music listening workflows with minimal feature creep:

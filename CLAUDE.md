@@ -4,57 +4,71 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is an MPD client project focused on two primary workflows:
-1. Listening to a known collection through an album-first visual grid (Album Mode)
-2. Discovering and checking new music through a folder-oriented technical view (Folder Mode)
-
-The project is currently in the design phase with a detailed specification in `DESIGN.md`. No implementation code exists yet.
+A GTK4-based MPD (Music Player Daemon) client in Rust with two primary workflows:
+1. **Album Mode** — visual cover grid with hover controls, grouped views, local search
+2. **Folder Mode** — directory browser with breadcrumbs, cue/DSD normalization
 
 ## Architecture
 
-The system follows a layered architecture with one playback core and mode-specific presentation layers:
+Single Rust crate (edition 2024, MSRV 1.85). No workspace. `src/main.rs` entry point.
 
-### Core Layers
-1. **MPD adapter layer** – Connects to MPD (Music Player Daemon), handles protocol and transport concerns
-2. **Application state layer** – Shared state across modes (playback, queue, current track, browsing state)
-3. **Browsing presenters** – Mode-specific presentation logic (album grid vs folder tree)
-4. **Queue presenters** – Mode-specific queue views (album mini-grid vs track list)
-5. **UI layer** – Renders the visual interface
+### Threading
+- **UI thread** — GTK4 main loop, polls event channel every 30ms (64-event batch limit)
+- **MPD background thread** — `src/mpd/state_machine.rs`, `connected_loop` with independent 500ms status polling
+- **Channel** — `std::sync::mpsc::sync_channel<MpdEvent>(1024)` for MPD→UI events, `mpsc::channel<MpdCommand>` for UI→MPD commands
+- No async runtime — `std::thread` over tokio (4.2MB vs 15MB binary)
 
-### Key Design Decisions
-- **Split view**: Persistent 70/30 split with left browsing area and right persistent rail
-- **Right rail contents**: Changes by mode but always shows playback controls
-- **Album mode**: Visual cover grid with hover controls, album-oriented queue (mini cover grid)
-- **Folder mode**: Text-first expandable folder tree with technical metadata, track-oriented queue
-- **Queue model**: Single underlying queue with two presentation layers (album vs track views)
-- **Drag and drop**: Supported for queue reordering in both modes
-- **Normalization**: Folder presenter normalizes music directory structures (cue files, DSD folders, etc.)
+### Module Map
+| Module | Purpose |
+|--------|---------|
+| `src/main.rs` | Entry point, env_logger init, signal handlers, GTK app launch |
+| `src/mpd/mod.rs` | MPD TCP protocol adapter (`MpdAdapter`) |
+| `src/mpd/state_machine.rs` | Background thread: connection lifecycle, command dispatch, 500ms status poll |
+| `src/mpd/mock.rs` | Mock MPD server for integration tests |
+| `src/state/mod.rs` | Application state (`SharedState = Arc<RwLock<AppState>>`) |
+| `src/ui/mod.rs` | GTK4 UI: window, menus, album grid, queue, now-playing, settings |
+| `src/ui/widgets/` | Reusable widgets: album_cover, folder_tree, toast |
+| `src/config/mod.rs` | TOML config persistence (`~/.config/mpd-client/config.toml`) |
+| `src/search/mod.rs` | Local keyword→album search index (hash-based, no MPD round-trip) |
+| `src/coverart/mod.rs` | Cover art fetching (stub — returns None pending implementation) |
+| `src/constants.rs` | Layout constants |
+| `src/errors.rs` | Error types |
 
-### Layout Constants
-- Shell split: 70% left / 30% right (starting point)
-- Right rail width: `clamp(320px, 30vw, 420px)`
-- Album mode rail proportions: Now Playing (40%), Current Album track window (20%), Album Queue (40%)
-- Folder mode rail proportions: Now Playing (55%), Queue (45%)
+### Key Architecture Decisions
+- **MPD is remote** — no local filesystem assumptions, all data via MPD protocol
+- **Status polling** — 500ms independent poll in `connected_loop` (not tied to `recv_timeout`); `fetch_full_update()` combines `status` + `currentsong` for complete metadata
+- **External change detection** — `last_song_pos` tracking in periodic poll; triggers `Queue` event on external song changes
+- **Channel backpressure** — `try_send` with drop; channel-full warnings at warn level; overflow tolerance via position re-detection on next poll
+- **`Rc<RefCell<>>`** — shared state pattern for UI-thread-only data; `Arc<Mutex<>>` for cross-thread state
 
 ## Development Status
 
-- **Current phase**: Design specification complete (`DESIGN.md`)
-- **Implementation**: Not started – no source files exist yet
-- **Technology stack**: Not chosen – needs to be selected based on design requirements
-- **BMad integration**: The project has BMad installed for project management (`_bmad/` directory)
+- **Phase**: v1 implementation complete — all 7 epics done
+- **Tests**: 11 integration tests with mock MPD server (`cargo test`)
+- **Pending**: integration tests for real MPD, keyboard shortcut docs in-app
+- **BMad**: installed for project management (`_bmad/` directory)
 
-## Reference
+## Build & Run
 
-- **Primary specification**: `DESIGN.md` contains the complete product design, interaction rules, and technical architecture
-- **BMad workflow**: Use `bmad-help` skill to navigate the BMad project management system if needed
+```bash
+cargo build
+cargo test                    # 11 integration tests
+RUST_LOG=info cargo run       # normal operation
+RUST_LOG=debug cargo run      # verbose MPD protocol logging
+```
 
-## Implementation Notes
+## Key Files
 
-When implementing, prioritize:
-1. MPD integration layer first (playback transport, queue management)
-2. Application state management (shared across modes)
-3. Album mode implementation (default entry point)
-4. Folder mode implementation
-5. Responsive layout system that respects the design proportions
+- **Specification**: `DESIGN.md` — complete product design and interaction rules
+- **Architecture decisions**: `_bmad-output/planning-artifacts/architecture.md`
+- **Sprint status**: `_bmad-output/implementation-artifacts/sprint-status.yaml`
+- **Deferred work**: `_bmad-output/implementation-artifacts/deferred-work.md`
+- **Config**: `~/.config/mpd-client/config.toml` (host/port, auto-created on first save)
 
-The UI should remain calm, utilitarian, and focused on the two core workflows without feature creep.
+## Code Conventions
+
+- No async — all blocking I/O on background thread, all UI on GTK main thread
+- Log via `log` crate + `env_logger`; errors at error level, channel-full at warn, timing at debug
+- No unwrap/expect in library code; `if let Ok(...)` patterns for fallible operations
+- MPD adapter commands return `Result<_, Error>`; callers log errors and continue
+- GTK4 0.11 with v4_14 feature; glib 0.20, gdk4 0.11
