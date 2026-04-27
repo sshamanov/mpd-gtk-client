@@ -7,7 +7,7 @@ use crate::mpd::state_machine::{MpdCommand, MpdEvent, PlaybackUpdate};
 use crate::search::SearchIndex;
 use crate::state::SharedState;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box, EventControllerKey, FlowBox, Label, ListBox, Orientation, Paned, ScrolledWindow};
+use gtk4::{Application, ApplicationWindow, Box, EventControllerKey, FlowBox, Label, ListBox, Orientation, Paned, Picture, ScrolledWindow};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
@@ -493,6 +493,12 @@ impl App {
             now_playing.set_margin_end(12);
             now_playing.set_margin_top(12);
 
+            let np_cover = Picture::new();
+            np_cover.set_size_request(120, 120);
+            np_cover.set_halign(gtk4::Align::Center);
+            np_cover.set_visible(false);
+            now_playing.append(&np_cover);
+
             let track_title = Label::new(Some("No track"));
             track_title.set_halign(gtk4::Align::Start);
             track_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -595,6 +601,7 @@ impl App {
             let ar_c = track_artist.clone();
             let al_c = track_album.clone();
             let pi_c = playback_icon.clone();
+            let np_cover_c = np_cover.clone();
             let grid_c = album_grid.clone();
             let stack_c = left_stack.clone();
             let empty_c = empty_label.clone();
@@ -605,6 +612,7 @@ impl App {
             let si_c = search_index.clone();
             let toast_q = toast.clone();
             let cover_paths: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+            let cp_np = cover_paths.clone();
             let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
 
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
@@ -641,7 +649,7 @@ impl App {
                         }
                         MpdEvent::StateChanged(update) => {
                             current_song_pos.set(update.song.map(|s| s as i32));
-                            update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &update);
+                            update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &np_cover_c, &cp_np, &update);
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
@@ -906,6 +914,8 @@ fn update_now_playing(
     artist: &Label,
     album: &Label,
     icon: &Label,
+    cover: &Picture,
+    cover_paths: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
     update: &PlaybackUpdate,
 ) {
     if let Some(ref t) = update.title {
@@ -920,8 +930,17 @@ fn update_now_playing(
     }
     if let Some(ref a) = update.album {
         album.set_text(a);
+        // Update cover image for current album
+        let cp = cover_paths.borrow();
+        if let Some(Some(path)) = cp.get(a) {
+            cover.set_filename(Some(path));
+            cover.set_visible(true);
+        } else {
+            cover.set_visible(false);
+        }
     } else {
         album.set_text("");
+        cover.set_visible(false);
     }
     match update.state.as_str() {
         "play" => icon.set_text("▶"),
