@@ -33,6 +33,7 @@ pub enum MpdCommand {
     PlayAlbum(String),
     Clear,
     Reconnect,
+    FetchCovers(Vec<(String, String)>),
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -335,19 +336,17 @@ fn connected_loop(
                     }
                     MpdCommand::ListAlbums => {
                         if let Ok(albums) = adapter.list_albums() {
-                            let covers = fetch_cover_paths(&mut adapter, &albums, &mut cover_fetcher);
-                            let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                             let _ = event_tx.try_send(MpdEvent::Albums(albums));
                         }
                     }
                     MpdCommand::ListAlbumsGrouped(group) => {
                         if let Ok(groups) = adapter.list_albums_grouped(&group) {
-                            let flat: Vec<_> = groups.iter()
-                                .flat_map(|(_, a)| a.clone()).collect();
-                            let covers = fetch_cover_paths(&mut adapter, &flat, &mut cover_fetcher);
-                            let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                             let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                         }
+                    }
+                    MpdCommand::FetchCovers(albums) => {
+                        let covers = fetch_cover_paths(&mut adapter, &albums, &mut cover_fetcher);
+                        let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                     }
                     MpdCommand::Search(query) => {
                         if let Ok(results) = adapter.search_albums(&query) {

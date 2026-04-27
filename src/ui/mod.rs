@@ -678,6 +678,8 @@ impl App {
                                 let cp = cover_paths.borrow().clone();
                                 populate_album_grid(&grid_c, &albums, &cmd_c, &cp);
                                 stack_c.set_visible_child(&grid_c);
+                                let covers_for_fetch = albums.clone();
+                                let _ = cmd_c.send(MpdCommand::FetchCovers(covers_for_fetch));
                             }
                         }
                         MpdEvent::AlbumsGrouped(groups) => {
@@ -699,6 +701,7 @@ impl App {
                                 let cp = cover_paths.borrow().clone();
                                 populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp);
                                 stack_c.set_visible_child(&grid_c);
+                                let _ = cmd_c.send(MpdCommand::FetchCovers(flat.clone()));
                             }
                         }
                         MpdEvent::SearchResults(results) => {
