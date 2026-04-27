@@ -477,6 +477,8 @@ fn connected_loop(
                 // Process one pending cover fetch per idle cycle to avoid blocking
                 if !pending_covers.is_empty() {
                     let (_, album_name) = pending_covers.remove(0);
+                    log::debug!("[MPD] fetching cover for '{album_name}' ({}/{} left)",
+                        pending_covers.len(), pending_covers.len() + 1);
                     if let Some(path) = cover_fetcher.fetch_cover(&album_name, &mut adapter) {
                         let mut covers = std::collections::HashMap::new();
                         covers.insert(album_name, Some(path.to_string_lossy().to_string()));

@@ -213,8 +213,14 @@ impl MpdAdapter {
     pub fn albumart(&mut self, album: &str) -> Result<Option<Vec<u8>>, Error> {
         let uris = self.find_album_uris(album)?;
         let uri = match uris.first() {
-            Some(u) => u.clone(),
-            None => return Ok(None),
+            Some(u) => {
+                log::debug!("[adapter] albumart: found URI for '{album}': {u}");
+                u.clone()
+            }
+            None => {
+                log::debug!("[adapter] albumart: no URIs found for '{album}'");
+                return Ok(None);
+            }
         };
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
         let cmd = format!("albumart \"{}\" 0\n", escaped);
@@ -256,10 +262,12 @@ impl MpdAdapter {
                     self.reader.read_line(&mut line)?; // newline
                     line.clear();
                     self.reader.read_line(&mut line)?; // OK
+                    log::debug!("[adapter] albumart: got {} bytes for '{album}'", data.len());
                     return Ok(Some(data));
                 }
             }
         }
+        log::debug!("[adapter] albumart: no art found for '{album}' (no binary response)");
         Ok(None)
     }
 

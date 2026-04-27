@@ -815,16 +815,9 @@ impl App {
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = cover_paths.borrow_mut();
                             for (album, path) in paths {
-                                cp.insert(album.clone(), path.clone());
-                                // Update matching grid cells in-place
-                                let mut child = grid_c.first_child();
-                                while let Some(w) = child {
-                                    if let Some(cover_cell) = w.downcast_ref::<gtk4::Box>() {
-                                        update_cover_image(cover_cell, album.as_str(), path.as_deref());
-                                    }
-                                    child = w.next_sibling();
-                                }
+                                cp.insert(album, path);
                             }
+                            // Grid will pick up new covers on next refresh (group switch, etc.)
                         }
                         MpdEvent::LibraryChanged => {
                             if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
@@ -994,34 +987,3 @@ fn update_now_playing(
     }
 }
 
-/// Update cover image in an album cell widget tree when cover paths arrive asynchronously.
-fn update_cover_image(container: &gtk4::Box, _album_name: &str, cover_path: Option<&str>) {
-    // Traverse: container → overlay → cover_area → picture widget
-    if let Some(overlay) = container.first_child()
-        .and_then(|c| c.downcast::<gtk4::Overlay>().ok())
-    {
-        if let Some(cover_area) = overlay.child()
-            .and_then(|c| c.downcast::<gtk4::Box>().ok())
-        {
-            let mut child = cover_area.first_child();
-            while let Some(w) = child {
-                if w.widget_name() == "cover-image" {
-                    if let Some(pic) = w.downcast_ref::<gtk4::Picture>() {
-                        if let Some(path) = cover_path {
-                            pic.set_filename(Some(path));
-                            pic.set_visible(true);
-                            // Hide placeholder (first child of cover_area)
-                            if let Some(ph) = cover_area.first_child()
-                                .and_then(|c| c.downcast::<gtk4::DrawingArea>().ok())
-                            {
-                                ph.set_visible(false);
-                            }
-                        }
-                    }
-                    break;
-                }
-                child = w.next_sibling();
-            }
-        }
-    }
-}
