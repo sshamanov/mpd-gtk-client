@@ -5,7 +5,7 @@ pub mod mock;
 pub mod state_machine;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -207,6 +207,60 @@ impl MpdAdapter {
             .and_then(|l| l.strip_prefix("Id: "))
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| Error::Protocol("No Id in addid response".into()))
+    }
+
+    /// Fetch album art via MPD's `albumart` command. Returns raw JPEG/PNG bytes.
+    pub fn albumart(&mut self, album: &str) -> Result<Option<Vec<u8>>, Error> {
+        let uris = self.find_album_uris(album)?;
+        let uri = match uris.first() {
+            Some(u) => u.clone(),
+            None => return Ok(None),
+        };
+        let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+        let cmd = format!("albumart \"{}\" 0\n", escaped);
+        self.stream.write_all(cmd.as_bytes())?;
+        self.stream.flush()?;
+
+        let mut line = String::new();
+        let mut size: Option<usize> = None;
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 {
+                return Err(Error::Protocol("Connection closed during albumart".into()));
+            }
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("OK") {
+                break;
+            }
+            if trimmed.starts_with("ACK") {
+                return Err(Error::MpdError(trimmed.to_string()));
+            }
+            if let Some(s) = trimmed.strip_prefix("size: ") {
+                size = s.parse().ok();
+            } else if trimmed.starts_with("binary: ") {
+                if let Some(sz) = size {
+                    // BufReader may have already consumed some binary data into its buffer
+                    let buf_data = self.reader.buffer().to_vec();
+                    let buf_len = buf_data.len();
+                    self.reader.consume(buf_len);
+
+                    let mut data = vec![0u8; sz];
+                    let from_buffer = buf_len.min(sz);
+                    data[..from_buffer].copy_from_slice(&buf_data[..from_buffer]);
+                    if from_buffer < sz {
+                        self.reader.get_mut().read_exact(&mut data[from_buffer..])?;
+                    }
+                    // Read trailing newline + OK
+                    line.clear();
+                    self.reader.read_line(&mut line)?; // newline
+                    line.clear();
+                    self.reader.read_line(&mut line)?; // OK
+                    return Ok(Some(data));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Find all track URIs for an album.
