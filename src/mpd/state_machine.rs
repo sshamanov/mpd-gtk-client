@@ -255,6 +255,7 @@ fn connected_loop(
     let mut last_song_pos: Option<u32>;
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
+    let mut cover_fetcher = crate::coverart::CoverFetcher::new();
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -334,7 +335,7 @@ fn connected_loop(
                     }
                     MpdCommand::ListAlbums => {
                         if let Ok(albums) = adapter.list_albums() {
-                            let covers = fetch_cover_paths(&mut adapter, &albums);
+                            let covers = fetch_cover_paths(&mut adapter, &albums, &mut cover_fetcher);
                             let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                             let _ = event_tx.try_send(MpdEvent::Albums(albums));
                         }
@@ -343,7 +344,7 @@ fn connected_loop(
                         if let Ok(groups) = adapter.list_albums_grouped(&group) {
                             let flat: Vec<_> = groups.iter()
                                 .flat_map(|(_, a)| a.clone()).collect();
-                            let covers = fetch_cover_paths(&mut adapter, &flat);
+                            let covers = fetch_cover_paths(&mut adapter, &flat, &mut cover_fetcher);
                             let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                             let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                         }
@@ -523,12 +524,12 @@ fn connected_loop(
     }
 }
 
-/// Scan local filesystem for cover images for each album and return a map.
+/// Scan for cover images for each album via MPD albumart command, returning a path map.
 fn fetch_cover_paths(
     adapter: &mut MpdAdapter,
     albums: &[(String, String)],
+    fetcher: &mut crate::coverart::CoverFetcher,
 ) -> std::collections::HashMap<String, Option<String>> {
-    let mut fetcher = crate::coverart::CoverFetcher::new();
     let mut covers = std::collections::HashMap::new();
     for (_, album_name) in albums {
         let path = fetcher.fetch_cover(album_name, adapter);
