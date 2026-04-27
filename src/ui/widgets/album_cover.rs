@@ -15,6 +15,7 @@ pub fn create_album_cover(
     album_name: &str,
     title: &str,
     artist: &str,
+    cover_path: Option<&str>,
     cmd_tx: mpsc::Sender<MpdCommand>,
 ) -> Box {
     let container = Box::new(Orientation::Vertical, 0);
@@ -42,7 +43,12 @@ pub fn create_album_cover(
     cover_image.set_size_request(COVER_SIZE, COVER_SIZE);
     cover_image.set_halign(gtk4::Align::Center);
     cover_image.set_valign(gtk4::Align::Center);
-    cover_image.set_visible(false);
+    let has_cover = cover_path.is_some();
+    if let Some(path) = cover_path {
+        cover_image.set_filename(Some(path));
+    }
+    cover_image.set_visible(has_cover);
+    placeholder.set_visible(!has_cover);
     cover_area.append(&cover_image);
 
     overlay.set_child(Some(&cover_area));

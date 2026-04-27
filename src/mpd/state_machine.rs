@@ -48,6 +48,7 @@ pub enum MpdEvent {
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
     LibraryChanged,
+    CoverPaths(std::collections::HashMap<String, Option<String>>),
     Error(String),
 }
 
@@ -332,12 +333,18 @@ fn connected_loop(
                     }
                     MpdCommand::ListAlbums => {
                         if let Ok(albums) = adapter.list_albums() {
+                            let covers = fetch_cover_paths(&mut adapter, &albums);
                             let _ = event_tx.try_send(MpdEvent::Albums(albums));
+                            let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                         }
                     }
                     MpdCommand::ListAlbumsGrouped(group) => {
                         if let Ok(groups) = adapter.list_albums_grouped(&group) {
+                            let flat: Vec<_> = groups.iter()
+                                .flat_map(|(_, a)| a.clone()).collect();
+                            let covers = fetch_cover_paths(&mut adapter, &flat);
                             let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+                            let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
                         }
                     }
                     MpdCommand::Search(query) => {
@@ -513,6 +520,20 @@ fn connected_loop(
             }
         }
     }
+}
+
+/// Scan local filesystem for cover images for each album and return a map.
+fn fetch_cover_paths(
+    adapter: &mut MpdAdapter,
+    albums: &[(String, String)],
+) -> std::collections::HashMap<String, Option<String>> {
+    let mut fetcher = crate::coverart::CoverFetcher::new();
+    let mut covers = std::collections::HashMap::new();
+    for (_, album_name) in albums {
+        let path = fetcher.fetch_cover(album_name, adapter);
+        covers.insert(album_name.clone(), path.map(|p| p.to_string_lossy().to_string()));
+    }
+    covers
 }
 
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {

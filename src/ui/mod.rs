@@ -337,7 +337,8 @@ impl App {
                         if !results.is_empty() {
                             let names: Vec<String> = results.iter().map(|r: &(String, String)| r.1.clone()).collect();
                             if let Ok(mut store) = an.lock() { *store = names; }
-                            populate_album_grid(&g, &results, &tx);
+                            let empty_covers = std::collections::HashMap::new();
+                            populate_album_grid(&g, &results, &tx, &empty_covers);
                             s.set_visible_child(&g);
                         } else {
                             // Fall back to MPD search
@@ -603,6 +604,7 @@ impl App {
             let ids_w = item_ids_w.clone();
             let si_c = search_index.clone();
             let toast_q = toast.clone();
+            let cover_paths: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
             let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
 
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
@@ -652,7 +654,8 @@ impl App {
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
-                                populate_album_grid(&grid_c, &albums, &cmd_c);
+                                let cp = cover_paths.borrow().clone();
+                                populate_album_grid(&grid_c, &albums, &cmd_c, &cp);
                                 stack_c.set_visible_child(&grid_c);
                             }
                         }
@@ -672,7 +675,8 @@ impl App {
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
-                                populate_grouped_grid(&grid_c, &groups, &cmd_c);
+                                let cp = cover_paths.borrow().clone();
+                                populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp);
                                 stack_c.set_visible_child(&grid_c);
                             }
                         }
@@ -685,7 +689,8 @@ impl App {
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
-                                populate_album_grid(&grid_c, &results, &cmd_c);
+                                let cp = cover_paths.borrow().clone();
+                                populate_album_grid(&grid_c, &results, &cmd_c, &cp);
                                 stack_c.set_visible_child(&grid_c);
                             }
                         }
@@ -783,6 +788,12 @@ impl App {
                             // Refresh shared item_ids for Delete key lookup
                             *ids_w.borrow_mut() = item_ids.clone();
                         }
+                        MpdEvent::CoverPaths(paths) => {
+                            let mut cp = cover_paths.borrow_mut();
+                            for (album, path) in paths {
+                                cp.insert(album, path);
+                            }
+                        }
                         MpdEvent::LibraryChanged => {
                             if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
                             let _ = cmd_c.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
@@ -845,7 +856,7 @@ impl App {
 }
 
 /// Populate the album grid with group headers and album cells.
-fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)>)], cmd_tx: &mpsc::Sender<MpdCommand>) {
+fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)>)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>) {
     while let Some(child) = grid.first_child() {
         grid.remove(&child);
     }
@@ -864,8 +875,9 @@ fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)
         for (i, (artist, album_name)) in albums.iter().enumerate() {
             let album_id = format!("{header}-album-{i}");
             let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
+            let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
             let cell = album_cover::create_album_cover(
-                &album_id, album_name, album_name, display_artist, cmd_tx.clone());
+                &album_id, album_name, album_name, display_artist, cover_path, cmd_tx.clone());
             grid.append(&cell);
         }
     }
@@ -873,7 +885,7 @@ fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)
 
 /// Populate the album grid from loaded album data.
 /// Each cell gets hover buttons wired to cmd_tx for MPD commands.
-fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mpsc::Sender<MpdCommand>) {
+fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>) {
     while let Some(child) = grid.first_child() {
         grid.remove(&child);
     }
@@ -882,8 +894,9 @@ fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mps
     for (i, (artist, album_name)) in albums.iter().enumerate() {
         let album_id = format!("album-{i}");
         let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
+        let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
         let cell = album_cover::create_album_cover(
-            &album_id, album_name, album_name, display_artist, cmd_tx.clone());
+            &album_id, album_name, album_name, display_artist, cover_path, cmd_tx.clone());
         grid.append(&cell);
     }
 }
