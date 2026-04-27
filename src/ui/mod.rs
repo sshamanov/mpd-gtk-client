@@ -19,6 +19,7 @@ pub struct App {
     state: SharedState,
     event_rx: Arc<Mutex<mpsc::Receiver<MpdEvent>>>,
     cmd_tx: mpsc::Sender<MpdCommand>,
+    conn_params: Arc<Mutex<(String, u16)>>,
 }
 
 impl App {
@@ -26,11 +27,13 @@ impl App {
         state: SharedState,
         event_rx: mpsc::Receiver<MpdEvent>,
         cmd_tx: mpsc::Sender<MpdCommand>,
+        conn_params: Arc<Mutex<(String, u16)>>,
     ) -> Self {
         Self {
             state,
             event_rx: Arc::new(Mutex::new(event_rx)),
             cmd_tx,
+            conn_params,
         }
     }
 
@@ -42,6 +45,7 @@ impl App {
         let event_rx = self.event_rx.clone();
         let cmd_tx = self.cmd_tx.clone();
         let state = self.state.clone();
+        let conn_params = self.conn_params.clone();
 
         // Clone for use inside connect_activate (to avoid capturing application itself)
         let app_clone = application.clone();
@@ -364,6 +368,8 @@ impl App {
             let cfg = Config::load();
             let sw = window.clone();
             let btn_clone = settings_btn.clone();
+            let cp_save = conn_params.clone();
+            let stx = cmd_tx.clone();
             settings_btn.connect_clicked(move |_| {
                 let d = gtk4::Window::new();
                 d.set_title(Some("Settings"));
@@ -392,6 +398,8 @@ impl App {
                 let he = host_entry.clone();
                 let pe = port_entry.clone();
                 let perr = port_error.clone();
+                let cp = cp_save.clone();
+                let tx = stx.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.mpd_host = he.text().to_string();
@@ -400,6 +408,11 @@ impl App {
                             c.mpd_port = p;
                             perr.set_visible(false);
                             let _ = c.save();
+                            // Update shared host/port and trigger reconnect
+                            if let Ok(mut params) = cp.lock() {
+                                *params = (c.mpd_host.clone(), c.mpd_port);
+                            }
+                            let _ = tx.send(MpdCommand::Reconnect);
                             dw.close();
                         }
                         _ => {

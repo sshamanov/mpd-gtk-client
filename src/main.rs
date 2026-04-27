@@ -16,6 +16,7 @@ use log::info;
 use mpd::state_machine::{MpdEvent, MpdEventLoop};
 use state::create_initial_state;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use ui::App;
@@ -27,12 +28,19 @@ fn main() {
     let config = config::Config::load();
     let state = create_initial_state();
 
+    // Shared host/port for live reconnect (Settings writes, background thread reads)
+    let conn_params: Arc<Mutex<(String, u16)>> = Arc::new(Mutex::new((
+        config.mpd_host.clone(),
+        config.mpd_port,
+    )));
+
     // Create bounded MPD event channel (backpressure: drop events when UI is busy)
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(1024);
     let (event_loop, cmd_tx) = MpdEventLoop::spawn(
         config.mpd_host.clone(),
         config.mpd_port,
         event_tx,
+        conn_params.clone(),
     );
 
     info!("MPD event loop started");
@@ -55,7 +63,7 @@ fn main() {
     });
 
     // Block until the GTK application exits
-    let app = App::new(state, event_rx, cmd_tx);
+    let app = App::new(state, event_rx, cmd_tx, conn_params);
     app.run();
 
     info!("Shutting down MPD connection");

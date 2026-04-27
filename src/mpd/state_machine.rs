@@ -32,6 +32,7 @@ pub enum MpdCommand {
     InsertNext(String),
     PlayAlbum(String),
     Clear,
+    Reconnect,
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -119,9 +120,10 @@ pub struct MpdEventLoop {
 impl MpdEventLoop {
     /// Spawn the background thread and return a handle + command sender.
     pub fn spawn(
-        host: String,
-        port: u16,
+        _host: String,
+        _port: u16,
         event_tx: mpsc::SyncSender<MpdEvent>,
+        conn_params: Arc<std::sync::Mutex<(String, u16)>>,
     ) -> (Self, mpsc::Sender<MpdCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<MpdCommand>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -165,7 +167,8 @@ impl MpdEventLoop {
                         }
                         MpdState::Connecting { start_time: _ } => {
                             let _ = event_tx.try_send(MpdEvent::Connecting);
-                            match MpdAdapter::connect(&host, port) {
+                            let (ref c_host, c_port) = *conn_params.lock().expect("conn_params lock");
+                            match MpdAdapter::connect(c_host, c_port) {
                                 Ok(adapter) => {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
                                     connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone);
@@ -454,6 +457,10 @@ fn connected_loop(
                         }
                         if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                         last_status = Instant::now();
+                    }
+                    MpdCommand::Reconnect => {
+                        log::info!("[MPD] received Reconnect command, restarting connection");
+                        return;
                     }
                 }
             }
