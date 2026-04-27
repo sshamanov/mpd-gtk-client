@@ -246,12 +246,17 @@ fn connected_loop(
     stop: &AtomicBool,
 ) {
     let mut last_status = Instant::now();
-    let mut last_song_pos: Option<u32> = None;
+    let mut last_song_pos: Option<u32>;
+    let mut consecutive_failures: u32;
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
         last_song_pos = update.song;
+        consecutive_failures = 0;
         let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+    } else {
+        log::error!("[MPD] initial status fetch failed, connection may be dead");
+        return;
     }
 
     loop {
@@ -462,6 +467,7 @@ fn connected_loop(
         if last_status.elapsed() >= Duration::from_millis(500) {
             last_status = Instant::now();
             if let Some(update) = fetch_full_update(&mut adapter) {
+                consecutive_failures = 0;
                 let new_song = update.song;
                 let song_changed = new_song != last_song_pos;
                 match event_tx.try_send(MpdEvent::StateChanged(update)) {
@@ -482,6 +488,13 @@ fn connected_loop(
                     if let Ok(queue) = adapter.list_queue() {
                         let _ = event_tx.try_send(MpdEvent::Queue(queue));
                     }
+                }
+            } else {
+                consecutive_failures += 1;
+                log::error!("[MPD] status poll failed ({consecutive_failures}/3)");
+                if consecutive_failures >= 3 {
+                    log::error!("[MPD] connection dead after 3 consecutive poll failures, triggering reconnect");
+                    return;
                 }
             }
         }
