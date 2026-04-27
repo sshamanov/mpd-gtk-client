@@ -2,10 +2,13 @@
 
 use gtk4::prelude::*;
 use gtk4::{Box, Label, Orientation, Revealer};
+use std::cell::Cell;
+use std::rc::Rc;
 
 pub struct ToastOverlay {
     pub container: Box,
     revealer: Revealer,
+    generation: Rc<Cell<u64>>,
 }
 
 impl Default for ToastOverlay {
@@ -27,13 +30,12 @@ impl ToastOverlay {
         revealer.set_reveal_child(false);
         revealer.set_can_target(false);
 
-        Self { container, revealer }
+        Self { container, revealer, generation: Rc::new(Cell::new(0)) }
     }
 
     pub fn widget(&self) -> &Revealer { &self.revealer }
 
     pub fn show_toast(&self, msg: &str) {
-        // Clear old toasts
         while let Some(child) = self.container.first_child() {
             self.container.remove(&child);
         }
@@ -46,7 +48,6 @@ impl ToastOverlay {
         label.set_margin_top(4);
         label.set_margin_bottom(4);
 
-        // Click to dismiss
         let revealer = self.revealer.clone();
         let gesture = gtk4::GestureClick::new();
         gesture.connect_pressed(move |_g, _n, _x, _y| {
@@ -58,11 +59,17 @@ impl ToastOverlay {
         self.revealer.set_can_target(true);
         self.revealer.set_reveal_child(true);
 
-        // Auto-dismiss after 3 seconds
+        // Generation counter prevents stale timers from hiding new toasts
+        let cur = self.generation.get();
+        let next = cur.wrapping_add(1);
+        self.generation.set(next);
         let r = self.revealer.clone();
+        let g = self.generation.clone();
         glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
-            r.set_reveal_child(false);
-            r.set_can_target(false);
+            if g.get() == next {
+                r.set_reveal_child(false);
+                r.set_can_target(false);
+            }
         });
     }
 }
