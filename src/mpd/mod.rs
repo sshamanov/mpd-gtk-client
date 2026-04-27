@@ -284,6 +284,9 @@ impl MpdAdapter {
                 current_artist.clear();
             } else if let Some(artist) = line.strip_prefix("Artist: ") {
                 current_artist = artist.to_string();
+            } else if let Some(artist) = line.strip_prefix("AlbumArtist: ") {
+                // AlbumArtist takes priority over per-track Artist
+                current_artist = artist.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
                 album_artist.entry(album.to_string())
                     .or_insert_with(|| current_artist.clone());
