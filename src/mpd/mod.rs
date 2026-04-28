@@ -259,10 +259,12 @@ impl MpdAdapter {
                     }
                     // Read trailing newline + OK
                     line.clear();
-                    self.reader.read_line(&mut line)?; // newline
+                    self.reader.read_line(&mut line)?;
                     line.clear();
-                    self.reader.read_line(&mut line)?; // OK
+                    self.reader.read_line(&mut line)?;
                     log::debug!("[adapter] albumart: got {} bytes for '{album}'", data.len());
+                    // Reset BufReader — binary read via get_mut() corrupts its internal buffer state
+                    self.reader = BufReader::new(self.stream.try_clone()?);
                     return Ok(Some(data));
                 }
             }

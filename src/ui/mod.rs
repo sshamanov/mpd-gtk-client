@@ -823,8 +823,12 @@ impl App {
                                 // Update the Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
                                     if let Some(pic) = widgets.get(album) {
+                                        log::info!("[UI] cover update: '{album}' -> {p}");
                                         pic.set_filename(Some(p));
                                         pic.set_visible(true);
+                                        pic.queue_draw();
+                                    } else {
+                                        log::warn!("[UI] cover: no widget registered for '{album}'");
                                     }
                                 }
                             }
