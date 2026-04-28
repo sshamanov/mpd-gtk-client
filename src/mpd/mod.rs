@@ -240,6 +240,7 @@ impl MpdAdapter {
                 break;
             }
             if trimmed.starts_with("ACK") {
+                log::warn!("[adapter] albumart ACK for '{uri}': {trimmed}");
                 return Err(Error::MpdError(trimmed.to_string()));
             }
             if let Some(s) = trimmed.strip_prefix("size: ") {
@@ -269,7 +270,7 @@ impl MpdAdapter {
                 }
             }
         }
-        log::debug!("[adapter] albumart: no art found for '{album}' (no binary response)");
+        log::info!("[adapter] albumart: no art for '{album}' — MPD sent no binary data");
         Ok(None)
     }
 
