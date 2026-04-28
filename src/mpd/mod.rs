@@ -250,28 +250,50 @@ impl MpdAdapter {
         // Restore normal read timeout
         self.stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-        // Parse: find "size: N\nbinary: N\n" header, then extract binary data before \nOK\n
+        // Parse MPD albumart response: "size: N\n" then "binary: N\n" then N bytes of data, then "\nOK\n"
+        // MPD may send multiple binary chunks for large images
         let raw_str = String::from_utf8_lossy(&raw);
-        let size: usize = raw_str.lines()
+        let total_size: usize = raw_str.lines()
             .find_map(|l| l.strip_prefix("size: ").and_then(|s| s.parse().ok()))
             .unwrap_or(0);
-        if size == 0 {
+        if total_size == 0 {
             log::info!("[adapter] albumart: no art for '{album}'");
             return Ok(None);
         }
-        // Find binary data offset: after "binary: N\n"
-        let bin_marker = format!("binary: {size}\n");
-        if let Some(pos) = raw.windows(bin_marker.len()).position(|w| w == bin_marker.as_bytes()) {
-            let data_start = pos + bin_marker.len();
-            let data_end = raw.len() - 4; // before "\nOK\n"
+        // Find all "binary: N\n" headers and collect their data chunks
+        let mut data = Vec::with_capacity(total_size);
+        let mut search_from = 0;
+        let header_marker = b"binary: ";
+        while let Some(bin_pos) = raw[search_from..].windows(header_marker.len())
+            .position(|w| w == header_marker)
+        {
+            let abs_pos = search_from + bin_pos;
+            let header_start = abs_pos + header_marker.len();
+            let header_end = match raw[header_start..].iter().position(|&b| b == b'\n') {
+                Some(p) => header_start + p,
+                None => break,
+            };
+            let chunk_size: usize = match std::str::from_utf8(&raw[header_start..header_end])
+                .ok().and_then(|s| s.parse().ok()) {
+                Some(sz) => sz,
+                None => break,
+            };
+            let data_start = header_end + 1;
+            let data_end = (data_start + chunk_size).min(raw.len());
             if data_end > data_start {
-                let data = raw[data_start..data_end].to_vec();
-                log::info!("[adapter] albumart: got {} bytes for '{album}'", data.len());
-                return Ok(Some(data));
+                data.extend_from_slice(&raw[data_start..data_end]);
             }
+            search_from = data_end;
         }
-        log::info!("[adapter] albumart: no art for '{album}' — parse failed");
-        Ok(None)
+        if data.len() < total_size / 2 {
+            // Heuristic: should get at least half the declared size
+            log::warn!("[adapter] albumart: only got {}/{} bytes for '{album}'", data.len(), total_size);
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        log::info!("[adapter] albumart: got {}/{} bytes for '{album}'", data.len(), total_size);
+        Ok(Some(data))
     }
 
     /// Find all track URIs for an album.
