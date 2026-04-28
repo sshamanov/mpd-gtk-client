@@ -100,6 +100,7 @@ impl MpdAdapter {
             Ok(0) => return Err(Error::Protocol("MPD closed connection during greeting".into())),
             Err(e) => return Err(Error::Connection(e)),
             Ok(_) => {
+                log::info!("[adapter] MPD greeting: {}", greeting.trim());
                 if !greeting.trim().starts_with("OK ") {
                     return Err(Error::Protocol(format!(
                         "Unexpected MPD greeting: {}",
