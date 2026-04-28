@@ -229,11 +229,15 @@ impl MpdAdapter {
         self.stream.write_all(cmd.as_bytes())?;
         self.stream.flush()?;
 
+        // Use a fresh reader for albumart response — the shared BufReader may have
+        // stale buffered data from the preceding find_album_uris/send_command call.
+        let mut reader = BufReader::new(self.stream.try_clone()?);
+
         let mut line = String::new();
         let mut size: Option<usize> = None;
         loop {
             line.clear();
-            let n = self.reader.read_line(&mut line)?;
+            let n = reader.read_line(&mut line)?;
             if n == 0 {
                 log::error!("[adapter] albumart: connection closed");
                 return Err(Error::Protocol("Connection closed during albumart".into()));
@@ -251,25 +255,22 @@ impl MpdAdapter {
                 size = s.parse().ok();
             } else if trimmed.starts_with("binary: ") {
                 if let Some(sz) = size {
-                    // BufReader may have already consumed some binary data into its buffer
-                    let buf_data = self.reader.buffer().to_vec();
+                    let buf_data = reader.buffer().to_vec();
                     let buf_len = buf_data.len();
-                    self.reader.consume(buf_len);
+                    reader.consume(buf_len);
 
                     let mut data = vec![0u8; sz];
                     let from_buffer = buf_len.min(sz);
                     data[..from_buffer].copy_from_slice(&buf_data[..from_buffer]);
                     if from_buffer < sz {
-                        self.reader.get_mut().read_exact(&mut data[from_buffer..])?;
+                        reader.get_mut().read_exact(&mut data[from_buffer..])?;
                     }
                     // Read trailing newline + OK
                     line.clear();
-                    self.reader.read_line(&mut line)?;
+                    reader.read_line(&mut line)?;
                     line.clear();
-                    self.reader.read_line(&mut line)?;
-                    log::debug!("[adapter] albumart: got {} bytes for '{album}'", data.len());
-                    // Reset BufReader — binary read via get_mut() corrupts its internal buffer state
-                    self.reader = BufReader::new(self.stream.try_clone()?);
+                    reader.read_line(&mut line)?;
+                    log::info!("[adapter] albumart: got {} bytes for '{album}'", data.len());
                     return Ok(Some(data));
                 }
             }
