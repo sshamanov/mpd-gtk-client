@@ -210,88 +210,75 @@ impl MpdAdapter {
             .ok_or_else(|| Error::Protocol("No Id in addid response".into()))
     }
 
+    fn read_albumart_response(&mut self) -> Result<Vec<u8>, Error> {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        self.stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        loop {
+            let n = self.stream.read(&mut buf)?;
+            if n == 0 { return Err(Error::Protocol("Connection closed".into())); }
+            raw.extend_from_slice(&buf[..n]);
+            if raw.ends_with(b"\nOK\n") { break; }
+        }
+        self.stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        Ok(raw)
+    }
+
+/// Parse the total picture size from an albumart response.
+fn parse_albumart_size(raw: &[u8]) -> Option<usize> {
+    let s = String::from_utf8_lossy(raw);
+    s.lines().find_map(|l| l.strip_prefix("size: ").and_then(|v| v.parse().ok()))
+}
+
+/// Parse the binary data chunk from an albumart response.
+fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
+    let header = b"binary: ";
+    let Some(bin_pos) = raw.windows(header.len()).position(|w| w == header) else { return vec![] };
+    let header_start = bin_pos + header.len();
+    let Some(nl_pos) = raw[header_start..].iter().position(|&b| b == b'\n') else { return vec![] };
+    let chunk_size: usize = std::str::from_utf8(&raw[header_start..header_start + nl_pos])
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let data_start = header_start + nl_pos + 1;
+    let data_end = (data_start + chunk_size).min(raw.len());
+    if data_end > data_start { raw[data_start..data_end].to_vec() } else { vec![] }
+}
+
     /// Fetch album art via MPD's `albumart` command. Returns raw JPEG/PNG bytes.
+    /// Issues multiple commands with increasing offsets to reassemble large images.
     pub fn albumart(&mut self, album: &str) -> Result<Option<Vec<u8>>, Error> {
         let uris = self.find_album_uris(album)?;
         let uri = match uris.first() {
-            Some(u) => {
-                log::debug!("[adapter] albumart: found URI for '{album}': {u}");
-                u.clone()
-            }
-            None => {
-                log::debug!("[adapter] albumart: no URIs found for '{album}'");
-                return Ok(None);
-            }
+            Some(u) => u.clone(),
+            None => return Ok(None),
         };
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-        let cmd = format!("albumart \"{}\" 0\n", escaped);
-        self.stream.write_all(cmd.as_bytes())?;
-        self.stream.flush()?;
 
-        // Read raw response: header lines, then binary data, ending with \nOK\n
-        let mut raw = Vec::new();
-        let mut buf = [0u8; 4096];
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        self.stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        loop {
-            let n = self.stream.read(&mut buf)
-                .map_err(|e| Error::Connection(e))?;
-            if n == 0 {
-                return Err(Error::Protocol("Connection closed during albumart".into()));
-            }
-            raw.extend_from_slice(&buf[..n]);
-            if raw.ends_with(b"\nOK\n") {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(Error::Protocol("albumart read timed out".into()));
-            }
-        }
-        // Restore normal read timeout
-        self.stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        // First request: get total size and first chunk
+        let total_size = {
+            let cmd = format!("albumart \"{}\" 0\n", escaped);
+            self.stream.write_all(cmd.as_bytes())?;
+            self.stream.flush()?;
+            let raw = self.read_albumart_response()?;
+            if raw.is_empty() { return Ok(None); }
+            Self::parse_albumart_size(&raw)
+        };
+        let Some(total_size) = total_size else { return Ok(None); };
 
-        // Parse MPD albumart response: "size: N\n" then "binary: N\n" then N bytes of data, then "\nOK\n"
-        // MPD may send multiple binary chunks for large images
-        let raw_str = String::from_utf8_lossy(&raw);
-        let total_size: usize = raw_str.lines()
-            .find_map(|l| l.strip_prefix("size: ").and_then(|s| s.parse().ok()))
-            .unwrap_or(0);
-        if total_size == 0 {
-            log::info!("[adapter] albumart: no art for '{album}'");
-            return Ok(None);
-        }
-        // Find all "binary: N\n" headers and collect their data chunks
+        // Fetch all chunks with increasing offsets
         let mut data = Vec::with_capacity(total_size);
-        let mut search_from = 0;
-        let header_marker = b"binary: ";
-        while let Some(bin_pos) = raw[search_from..].windows(header_marker.len())
-            .position(|w| w == header_marker)
-        {
-            let abs_pos = search_from + bin_pos;
-            let header_start = abs_pos + header_marker.len();
-            let header_end = match raw[header_start..].iter().position(|&b| b == b'\n') {
-                Some(p) => header_start + p,
-                None => break,
-            };
-            let chunk_size: usize = match std::str::from_utf8(&raw[header_start..header_end])
-                .ok().and_then(|s| s.parse().ok()) {
-                Some(sz) => sz,
-                None => break,
-            };
-            let data_start = header_end + 1;
-            let data_end = (data_start + chunk_size).min(raw.len());
-            if data_end > data_start {
-                data.extend_from_slice(&raw[data_start..data_end]);
-            }
-            search_from = data_end;
+        let mut offset = 0usize;
+        while data.len() < total_size {
+            let cmd = format!("albumart \"{}\" {offset}\n", escaped);
+            self.stream.write_all(cmd.as_bytes())?;
+            self.stream.flush()?;
+            let raw = self.read_albumart_response()?;
+            if raw.is_empty() { break; }
+            let chunk = Self::parse_albumart_chunk(&raw);
+            if chunk.is_empty() { break; }
+            data.extend_from_slice(&chunk);
+            offset += chunk.len();
         }
-        if data.len() < total_size / 2 {
-            // Heuristic: should get at least half the declared size
-            log::warn!("[adapter] albumart: only got {}/{} bytes for '{album}'", data.len(), total_size);
-        }
-        if data.is_empty() {
-            return Ok(None);
-        }
+        if data.is_empty() { return Ok(None); }
         log::info!("[adapter] albumart: got {}/{} bytes for '{album}'", data.len(), total_size);
         Ok(Some(data))
     }
