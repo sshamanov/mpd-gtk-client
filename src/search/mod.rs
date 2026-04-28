@@ -32,6 +32,9 @@ impl SearchIndex {
         if let Ok(mut guard) = self.index.write() { *guard = idx; }
     }
 
+    /// Return the number of indexed albums.
+    pub fn album_count(&self) -> usize { self.albums.len() }
+
     /// Search the local index. Returns matching (artist, album) pairs.
     pub fn search(&self, query: &str) -> Vec<(String, String)> {
         let Ok(index) = self.index.read() else { return Vec::new(); };

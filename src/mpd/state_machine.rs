@@ -344,6 +344,7 @@ fn connected_loop(
                     MpdCommand::ListAlbumsGrouped(group) => {
                         // Use cache for Albums/Artist views — no MPD round-trip needed
                         if !cached_flat_albums.is_empty() && (group == "Albums" || group == "Artist") {
+                            log::info!("[MPD] ListAlbumsGrouped({group}): using cache ({})", cached_flat_albums.len());
                             let groups = if group == "Albums" {
                                 vec![("All Albums".into(), cached_flat_albums.clone())]
                             } else {
@@ -351,6 +352,7 @@ fn connected_loop(
                             };
                             let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                         } else if let Ok(groups) = adapter.list_albums_grouped(&group) {
+                            log::info!("[MPD] ListAlbumsGrouped({group}): fetched from MPD");
                             // Cache the flat list for future local regrouping
                             if group == "Albums" {
                                 cached_flat_albums = groups.iter()

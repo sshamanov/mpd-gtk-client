@@ -685,25 +685,32 @@ impl App {
                             }
                         }
                         MpdEvent::AlbumsGrouped(groups) => {
-                            // Build local search index from flat album list
                             let flat: Vec<(String, String)> = groups.iter()
                                 .flat_map(|(_, a)| a.clone()).collect();
-                            if let Ok(mut idx) = search_index.write() { idx.build(&flat); }
                             if groups.is_empty() {
                                 empty_c.set_text("No albums found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                // Update album name store for double-click handler
                                 let names: Vec<String> = groups.iter()
                                     .flat_map(|(_, albums)| albums.iter().map(|(_, n)| n.clone()))
                                     .collect();
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
+                                // Only rebuild search index if flat list changed
+                                let need_index = if let Ok(idx) = search_index.read() {
+                                    idx.album_count() != flat.len()
+                                } else { true };
+                                if need_index {
+                                    if let Ok(mut idx) = search_index.write() { idx.build(&flat); }
+                                }
                                 let cp = cover_paths.borrow().clone();
                                 populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp, &cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
-                                let _ = cmd_c.send(MpdCommand::FetchCovers(flat.clone()));
+                                // Only trigger cover fetch if we didn't already
+                                if need_index {
+                                    let _ = cmd_c.send(MpdCommand::FetchCovers(flat));
+                                }
                             }
                         }
                         MpdEvent::SearchResults(results) => {
