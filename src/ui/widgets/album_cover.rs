@@ -16,6 +16,7 @@ pub fn create_album_cover(
     title: &str,
     artist: &str,
     cover_path: Option<&str>,
+    cover_widgets: &std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>,
     cmd_tx: mpsc::Sender<MpdCommand>,
 ) -> Box {
     let container = Box::new(Orientation::Vertical, 0);
@@ -51,6 +52,8 @@ pub fn create_album_cover(
     }
     cover_image.set_visible(has_cover);
     placeholder.set_visible(!has_cover);
+    // Register for in-place updates when covers arrive asynchronously
+    cover_widgets.borrow_mut().insert(album_name.to_string(), cover_image.clone());
     cover_area.append(&cover_image);
 
     overlay.set_child(Some(&cover_area));

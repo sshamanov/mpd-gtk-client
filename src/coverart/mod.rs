@@ -27,12 +27,11 @@ impl CoverFetcher {
         Self { cache: HashMap::new(), cache_dir }
     }
 
-    /// Fetch cover art via MPD albumart command. Caches to disk for GTK Picture display.
     pub fn fetch_cover(&mut self, album_name: &str, adapter: &mut MpdAdapter) -> Option<PathBuf> {
         if let Some(cached) = self.cache.get(album_name) {
             return cached.clone();
         }
-        let result = self.fetch_via_mpd(album_name, adapter);
+        let result = fetch_via_mpd(album_name, adapter, &self.cache_dir);
         self.cache.insert(album_name.to_string(), result.clone());
         result
     }
@@ -40,28 +39,28 @@ impl CoverFetcher {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
     }
+}
 
-    fn fetch_via_mpd(&self, album_name: &str, adapter: &mut MpdAdapter) -> Option<PathBuf> {
-        let data = adapter.albumart(album_name).ok()??;
-        log::info!("[cover] '{album_name}': got {} bytes, saving to cache", data.len());
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        album_name.hash(&mut hasher);
-        let hash = format!("{:016x}", hasher.finish());
-        let path = self.cache_dir.join(format!("{hash}.jpg"));
-        match std::fs::File::create(&path) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(&data) {
-                    log::error!("[cover] '{album_name}': write failed: {e}");
-                    return None;
-                }
-                log::info!("[cover] '{album_name}': saved to {}", path.display());
-                Some(path)
+fn fetch_via_mpd(album_name: &str, adapter: &mut MpdAdapter, cache_dir: &std::path::Path) -> Option<PathBuf> {
+    let data = adapter.albumart(album_name).ok()??;
+    log::info!("[cover] '{album_name}': got {} bytes", data.len());
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    album_name.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    let path = cache_dir.join(format!("{hash}.jpg"));
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(&data) {
+                log::error!("[cover] '{album_name}': write failed: {e}");
+                return None;
             }
-            Err(e) => {
-                log::error!("[cover] '{album_name}': create file failed: {e}");
-                None
-            }
+            log::info!("[cover] '{album_name}': saved to {}", path.display());
+            Some(path)
+        }
+        Err(e) => {
+            log::error!("[cover] '{album_name}': create failed: {e}");
+            None
         }
     }
 }

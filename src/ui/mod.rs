@@ -338,7 +338,8 @@ impl App {
                             let names: Vec<String> = results.iter().map(|r: &(String, String)| r.1.clone()).collect();
                             if let Ok(mut store) = an.lock() { *store = names; }
                             let empty_covers = std::collections::HashMap::new();
-                            populate_album_grid(&g, &results, &tx, &empty_covers);
+                            let empty_widgets = CoverWidgets::new(std::collections::HashMap::new());
+                            populate_album_grid(&g, &results, &tx, &empty_covers, &empty_widgets);
                             s.set_visible_child(&g);
                         } else {
                             // Fall back to MPD search
@@ -625,6 +626,7 @@ impl App {
             let si_c = search_index.clone();
             let toast_q = toast.clone();
             let cover_paths: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
+            let cover_widgets: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
             let cp_np = cover_paths.clone();
             let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
 
@@ -676,7 +678,7 @@ impl App {
                                     *store = names;
                                 }
                                 let cp = cover_paths.borrow().clone();
-                                populate_album_grid(&grid_c, &albums, &cmd_c, &cp);
+                                populate_album_grid(&grid_c, &albums, &cmd_c, &cp, &cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
                                 let covers_for_fetch = albums.clone();
                                 let _ = cmd_c.send(MpdCommand::FetchCovers(covers_for_fetch));
@@ -699,7 +701,7 @@ impl App {
                                     *store = names;
                                 }
                                 let cp = cover_paths.borrow().clone();
-                                populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp);
+                                populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp, &cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
                                 let _ = cmd_c.send(MpdCommand::FetchCovers(flat.clone()));
                             }
@@ -714,7 +716,7 @@ impl App {
                                     *store = names;
                                 }
                                 let cp = cover_paths.borrow().clone();
-                                populate_album_grid(&grid_c, &results, &cmd_c, &cp);
+                                populate_album_grid(&grid_c, &results, &cmd_c, &cp, &cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
                             }
                         }
@@ -814,9 +816,17 @@ impl App {
                         }
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = cover_paths.borrow_mut();
+                            let widgets = cover_widgets.borrow();
                             for (album, path) in &paths {
                                 log::info!("[UI] cover path: '{album}' -> {:?}", path);
                                 cp.insert(album.clone(), path.clone());
+                                // Update the Picture widget in-place if registered
+                                if let Some(p) = path.as_deref() {
+                                    if let Some(pic) = widgets.get(album) {
+                                        pic.set_filename(Some(p));
+                                        pic.set_visible(true);
+                                    }
+                                }
                             }
                         }
                         MpdEvent::LibraryChanged => {
@@ -881,7 +891,9 @@ impl App {
 }
 
 /// Populate the album grid with group headers and album cells.
-fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)>)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>) {
+type CoverWidgets = std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>;
+
+fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)>)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>, cover_widgets: &CoverWidgets) {
     while let Some(child) = grid.first_child() {
         grid.remove(&child);
     }
@@ -902,7 +914,7 @@ fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)
             let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
             let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
             let cell = album_cover::create_album_cover(
-                &album_id, album_name, album_name, display_artist, cover_path, cmd_tx.clone());
+                &album_id, album_name, album_name, display_artist, cover_path, cover_widgets, cmd_tx.clone());
             grid.append(&cell);
         }
     }
@@ -910,7 +922,7 @@ fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)
 
 /// Populate the album grid from loaded album data.
 /// Each cell gets hover buttons wired to cmd_tx for MPD commands.
-fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>) {
+fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>, cover_widgets: &CoverWidgets) {
     while let Some(child) = grid.first_child() {
         grid.remove(&child);
     }
@@ -921,7 +933,7 @@ fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mps
         let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
         let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
         let cell = album_cover::create_album_cover(
-            &album_id, album_name, album_name, display_artist, cover_path, cmd_tx.clone());
+            &album_id, album_name, album_name, display_artist, cover_path, cover_widgets, cmd_tx.clone());
         grid.append(&cell);
     }
 }
