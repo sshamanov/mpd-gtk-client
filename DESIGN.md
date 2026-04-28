@@ -16,50 +16,102 @@ editHistory:
   - date: '2026-04-22'
     changes: 'Fix validation report issues: FR format violations, NFR measurability gaps, implementation leakage, project-type gaps; incorporate user tech stack (GTK4/Rust/Linux-only)'
 ---
-## Implementation Notes (v1 — 2026-04-27)
+## Implementation Notes (v2 — 2026-04-28)
 
-The v1 implementation is complete. This section documents key architectural decisions made during implementation that extend or deviate from the original design below.
+The v1 implementation is complete. This section documents the v2 architecture refinements based on cross-project analysis (Ario C/GTK3, Plattenalbum Python/GTK4, CoverGrid Python/GTK4) and advanced elicitation. All v1 decisions remain valid unless explicitly overridden below.
 
-### Technology Stack (Chosen)
-- **Rust** edition 2024, MSRV 1.85, single crate (not workspace)
-- **GTK4** 0.11 with v4_14 feature, glib 0.20, gdk4 0.11
-- **std::thread** with `mpsc::sync_channel` (not tokio — 4.2MB vs 15MB binary)
-- **env_logger** for logging, **TOML** (`dirs` crate) for config persistence
-- **Linux-only** — no Windows/macOS support planned
+### Technology Stack (v2)
+- **Rust** edition 2024, MSRV 1.85, single crate
+- **GTK4** 0.11 with v4_14 feature + **libadwaita** 0.8 (adw crate)
+- **std::thread** with `mpsc::sync_channel` / `mpsc::channel`
+- **zbus** crate for MPRIS D-Bus (disabled by default, opt-in via config)
+- **env_logger**, **TOML** (dirs crate), **Linux-only**
 
-### Architecture Deviations from Design
+### MPD Idle Protocol (v2 — replaces 500ms poll)
 
-**Threading model** — Two threads: UI (GTK4 main loop) + MPD background (`connected_loop`). The background thread processes commands via `recv_timeout(100ms)` and runs an independent 500ms status poll. No async runtime.
+**Before (v1):** 500ms polling loop calling `fetch_full_update()` (status + currentsong) every tick. External changes detected by `last_song_pos` comparison.
 
-**Status polling** — MPD's `idle` protocol is not used. Instead, a `fetch_full_update()` helper combines `status` + `currentsong` every 500ms to get complete playback state with metadata. External track changes (from other clients or auto-advance) are detected by comparing `last_song_pos` across polls and trigger a `Queue` event to refresh the queue display.
+**After (v2):** True MPD `idle`/`noidle` protocol (CoverGrid pattern). Worker thread blocks on `idle` when command queue is empty. Main thread writes `noidle\n` to socket clone (via `TcpStream::try_clone()`) to break idle when sending commands. Thread safety: half-duplex MPD protocol means read clone and write clone never contend. If `idle` returns a transient error, fall back to 100ms poll for 10 cycles then retry idle. If `idle` returns "unknown command", fall back to 500ms poll permanently.
 
-**Event flow** — Commands that modify state (Play, Pause, PlayPosition, PlayAlbum, etc.) send both `StateChanged` and `Queue` events immediately after execution, plus the 500ms poll provides continuous status updates for external changes.
+**Rationale:** Eliminates poll overhead entirely. State changes (from other MPD clients) are reflected immediately, not within 500ms. The `try_clone` pattern is safe because MPD's protocol is serialized — you never read and write simultaneously.
 
-**Channel backpressure** — `sync_channel(1024)` with `try_send`. If the channel fills, events are dropped and the next poll re-detects changes. Channel-full conditions log at warn level.
+### Cover Art Pipeline (v2 — replaces stub)
 
-**Event loop batching** — UI processes at most 64 events per 30ms tick (`timeout_add_local`) to yield to the GTK main loop and prevent UI freezes.
+**Two-layer split architecture:**
 
-**Toast notifications** — Re-enabled with `set_can_target(false)` on the `Revealer` when hidden, so the overlay passes through clicks to underlying widgets.
+- **CoverProvider** — pure cache read, must be blazing fast. Takes album ID, reads disk cache, returns `(PathBuf, MD5, Option<Timestamp>)` or `None`. Never blocks, never falls through to providers.
 
-**SIGINT/SIGTERM** — Signal handlers set the stop flag and defer `process::exit(0)` via `glib::idle_add` to allow the GLib main context to process pending events before exit.
+- **ActualRead** — background fetch queue, runs one album per idle cycle. Two providers:
+  - **AlbumArtProvider** (primary): fetches via MPD `albumart <uri>`, computes MD5 of binary data, compares to cache hash. Emits `CoverRefreshed(id, Vec<u8>)` only if hash differs.
+  - **ReadPictureProvider** (fallback, always enabled): fetches via MPD `readpicture <uri>`, compares timestamp. Emits only if timestamp is newer.
 
-**Cover art** — Stub only; `CoverFetcher` returns `None`. Not yet implemented.
+**Key rules:**
+- Content-addressed for `albumart` (MD5 hash, no timestamp available)
+- Time-addressed for `readpicture` (MPD provides modification time)
+- CoverRefreshed carries raw bytes, not a path — UI decodes immediately, background writes cache independently
+- CoverProvider and ActualRead never call each other (no loops)
+- On reconnect/library change: enqueue visible albums into ActualRead, emit only on actual difference
+- Cache: `~/.cache/mpd-client/covers/{md5_hash}.jpg` with metadata sidecar
 
-**Queue model** — Simplified from the design: single track-oriented queue `ListBox` in the right rail (not separate album/track queue presenters). Queue items show title, artist, duration. Current track highlighted via CSS class `queue-current` and auto-selected.
+### Queue Updates (v2 — replaces full playlistinfo)
 
-**Grouped views** — Artist grouping sets artist from the group header; Date/Genre groupings show "Unknown Artist" (MPD's `list album group` doesn't return artist for non-Artist groupings).
+**Before (v1):** Full `list_queue` → playlistinfo re-fetch on every Queue event.
+
+**After (v2):** Incremental via `plchanges <version>`. Store `playlist_version` from status response. On playlist change signal, call `plchanges(last_version)` to get only changed items. Handle deletions by cross-referencing positions with reported playlist length. Every 50th update: full `playlistinfo` sync to reconcile. On version wrap-around (32-bit counter): full sync.
+
+**Rationale:** Preserves UI state (scroll position, selection, animation) during surgical updates. Full re-fetch replaces the entire model, losing view state.
+
+### Command List Batching (v2 — new)
+
+Add `MpdCommand::Batch(Vec<MpdCommand>)` variant. MPD's `command_list_begin`/`command_list_end` wraps multiple commands atomically. If any command fails, the entire list is aborted — this is a feature, not a bug.
+
+**Batch operations:** PlayAlbum, AddAlbum (all-or-nothing, transactional).
+**No batch:** DeleteId, MoveId, InsertNext (partial failure acceptable).
+
+Before: adding a 20-track album = 20 `addid` + 1 `play` = 21 individual channel messages + 21 MPD round-trips.
+After: adding a 20-track album = 1 Batch message + 1 MPD command_list with 21 commands.
+
+### Unix Socket Auto-Detection (v2 — new)
+
+Priority: `$XDG_RUNTIME_DIR/mpd/socket` → `/run/mpd/socket` → TCP localhost:6600 → connection settings dialog. Skipped entirely if user has configured a host. Each failed connect is harmless (ECONNREFUSED/ENOENT, just try next).
+
+### Multi-Profile Connections (v2 — new, previously deferred)
+
+Config supports `[profiles.<name>]` sections. `--profile <name>` CLI flag. Auto-detect on first connect saves into "default" profile. Profile selector in connection dialog. No profile editing UI in v1 — profiles are hand-edited.
+
+### MPRIS D-Bus Integration (v2 — new, previously deferred)
+
+MPRIS v2.1 Player interface via `zbus` crate. D-Bus bus name `org.mpris.MediaPlayer2.mpdclient`. Player interface only (Play/Pause/Stop/Next/Previous/Seek/SetPosition + standard properties). **Disabled by default** — `[mpris] enabled = false` in config. Connect MPRIS method calls to existing MpdCommand channel — no new code paths.
+
+### libadwaita Integration (v2 — new)
+
+Added `adw` crate dependency. Replaces:
+- Custom toast → `Adw.ToastOverlay`
+- Manual navigation stack → `Adw.NavigationView`
+- Responsive breakpoint CSS → `Adw.MultiLayoutView` + `Adw.BottomSheet`
+- Mode switch → `Adw.ViewSwitcher`
+
+Requires libadwaita >= 1.6 at runtime (included in GNOME runtime, available in all major distros).
+
+### Queue Model (unchanged from v1)
+Single track-oriented queue `ListBox` in the right rail. Album mode mini cover grid derived from same linear source. Track queue in folder mode remains flat. Dual-presenter architecture verified as correct.
 
 ### Known Limitations & Deferred Work
-See `_bmad-output/implementation-artifacts/deferred-work.md` for the full list. Key items:
-- No virtualized grid rendering (large libraries may cause UI freezes)
-- Dead MPD connection not detected (thread continues polling with errors)
-- Toast auto-dismiss race condition on rapid successive errors
-- `search_albums` doesn't handle `AlbumArtist` tag
-- Grouped-mode double-click index mismatch (headers offset album indices)
-- `Reconnected` event is dead code (only `Connected` is emitted)
+See `_bmad-output/implementation-artifacts/deferred-work.md` for the full list. New v2 additions:
+- Cover art cache revalidation on reconnect/library change
+- MPRIS disabled by default — no D-Bus until user opts in
+- Profile management UI deferred to post-v1
+- ReadPictureProvider timestamp comparison edge cases on some MPD versions
 
 ### Tests
-11 integration tests with mock MPD server covering: connect/status, currentsong, playback commands, queue listing, search, album listing, grouped albums, directory listing, album URIs, addid, queue mutations.
+11 integration tests with mock MPD server. New v2 tests needed:
+- MPD idle protocol (idle/noidle handshake, socket clone behavior)
+- Cover art binary protocol (albumart/readpicture parsing, partial reads)
+- CoverProvider cache hit/miss/refresh
+- plchanges incremental update + version wrap
+- Command list batch atomicity
+- Unix socket auto-detection order
+- Multi-profile config loading/fallback
 
 ---
 

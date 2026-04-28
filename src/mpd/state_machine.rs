@@ -258,6 +258,7 @@ fn connected_loop(
     let mut last_playlist_version: Option<String> = None;
     let mut cover_fetcher = crate::coverart::CoverFetcher::new();
     let mut pending_covers: Vec<(String, String)> = Vec::new();
+    let mut cached_flat_albums: Vec<(String, String)> = Vec::new();
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -341,7 +342,20 @@ fn connected_loop(
                         }
                     }
                     MpdCommand::ListAlbumsGrouped(group) => {
-                        if let Ok(groups) = adapter.list_albums_grouped(&group) {
+                        // Use cache for Albums/Artist views — no MPD round-trip needed
+                        if !cached_flat_albums.is_empty() && (group == "Albums" || group == "Artist") {
+                            let groups = if group == "Albums" {
+                                vec![("All Albums".into(), cached_flat_albums.clone())]
+                            } else {
+                                group_albums_by_artist(&cached_flat_albums)
+                            };
+                            let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+                        } else if let Ok(groups) = adapter.list_albums_grouped(&group) {
+                            // Cache the flat list for future local regrouping
+                            if group == "Albums" {
+                                cached_flat_albums = groups.iter()
+                                    .flat_map(|(_, a)| a.clone()).collect();
+                            }
                             let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                         }
                     }
@@ -533,6 +547,16 @@ fn connected_loop(
             }
         }
     }
+}
+
+/// Group a flat (artist, album) list by artist name, sorted alphabetically.
+fn group_albums_by_artist(albums: &[(String, String)]) -> crate::mpd::AlbumGroup {
+    let mut map: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
+    for (artist, album) in albums {
+        let key = if artist.is_empty() { "Unknown Artist" } else { artist.as_str() };
+        map.entry(key.to_string()).or_default().push((artist.clone(), album.clone()));
+    }
+    map.into_iter().collect()
 }
 
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
