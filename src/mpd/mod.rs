@@ -225,57 +225,52 @@ impl MpdAdapter {
         };
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
         let cmd = format!("albumart \"{}\" 0\n", escaped);
-        log::info!("[adapter] albumart CMD: {cmd:?}");
         self.stream.write_all(cmd.as_bytes())?;
         self.stream.flush()?;
 
-        // Use a fresh reader for albumart response — the shared BufReader may have
-        // stale buffered data from the preceding find_album_uris/send_command call.
-        let mut reader = BufReader::new(self.stream.try_clone()?);
-
-        let mut line = String::new();
-        let mut size: Option<usize> = None;
+        // Read raw response: header lines, then binary data, ending with \nOK\n
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        self.stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = self.stream.read(&mut buf)
+                .map_err(|e| Error::Connection(e))?;
             if n == 0 {
-                log::error!("[adapter] albumart: connection closed");
                 return Err(Error::Protocol("Connection closed during albumart".into()));
             }
-            let trimmed = line.trim_end();
-            log::debug!("[adapter] albumart line: {trimmed:?}");
-            if trimmed.starts_with("OK") {
+            raw.extend_from_slice(&buf[..n]);
+            if raw.ends_with(b"\nOK\n") {
                 break;
             }
-            if trimmed.starts_with("ACK") {
-                log::warn!("[adapter] albumart ACK: {trimmed}");
-                return Err(Error::MpdError(trimmed.to_string()));
-            }
-            if let Some(s) = trimmed.strip_prefix("size: ") {
-                size = s.parse().ok();
-            } else if trimmed.starts_with("binary: ") {
-                if let Some(sz) = size {
-                    let buf_data = reader.buffer().to_vec();
-                    let buf_len = buf_data.len();
-                    reader.consume(buf_len);
-
-                    let mut data = vec![0u8; sz];
-                    let from_buffer = buf_len.min(sz);
-                    data[..from_buffer].copy_from_slice(&buf_data[..from_buffer]);
-                    if from_buffer < sz {
-                        reader.get_mut().read_exact(&mut data[from_buffer..])?;
-                    }
-                    // Read trailing newline + OK
-                    line.clear();
-                    reader.read_line(&mut line)?;
-                    line.clear();
-                    reader.read_line(&mut line)?;
-                    log::info!("[adapter] albumart: got {} bytes for '{album}'", data.len());
-                    return Ok(Some(data));
-                }
+            if std::time::Instant::now() > deadline {
+                return Err(Error::Protocol("albumart read timed out".into()));
             }
         }
-        log::info!("[adapter] albumart: no art for '{album}' — MPD sent no binary data");
+        // Restore normal read timeout
+        self.stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+        // Parse: find "size: N\nbinary: N\n" header, then extract binary data before \nOK\n
+        let raw_str = String::from_utf8_lossy(&raw);
+        let size: usize = raw_str.lines()
+            .find_map(|l| l.strip_prefix("size: ").and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        if size == 0 {
+            log::info!("[adapter] albumart: no art for '{album}'");
+            return Ok(None);
+        }
+        // Find binary data offset: after "binary: N\n"
+        let bin_marker = format!("binary: {size}\n");
+        if let Some(pos) = raw.windows(bin_marker.len()).position(|w| w == bin_marker.as_bytes()) {
+            let data_start = pos + bin_marker.len();
+            let data_end = raw.len() - 4; // before "\nOK\n"
+            if data_end > data_start {
+                let data = raw[data_start..data_end].to_vec();
+                log::info!("[adapter] albumart: got {} bytes for '{album}'", data.len());
+                return Ok(Some(data));
+            }
+        }
+        log::info!("[adapter] albumart: no art for '{album}' — parse failed");
         Ok(None)
     }
 
