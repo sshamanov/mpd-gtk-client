@@ -224,6 +224,7 @@ impl MpdAdapter {
         };
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
         let cmd = format!("albumart \"{}\" 0\n", escaped);
+        log::info!("[adapter] albumart CMD: {cmd:?}");
         self.stream.write_all(cmd.as_bytes())?;
         self.stream.flush()?;
 
@@ -233,14 +234,16 @@ impl MpdAdapter {
             line.clear();
             let n = self.reader.read_line(&mut line)?;
             if n == 0 {
+                log::error!("[adapter] albumart: connection closed");
                 return Err(Error::Protocol("Connection closed during albumart".into()));
             }
             let trimmed = line.trim_end();
+            log::debug!("[adapter] albumart line: {trimmed:?}");
             if trimmed.starts_with("OK") {
                 break;
             }
             if trimmed.starts_with("ACK") {
-                log::warn!("[adapter] albumart ACK for '{uri}': {trimmed}");
+                log::warn!("[adapter] albumart ACK: {trimmed}");
                 return Err(Error::MpdError(trimmed.to_string()));
             }
             if let Some(s) = trimmed.strip_prefix("size: ") {
