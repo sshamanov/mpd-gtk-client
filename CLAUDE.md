@@ -10,8 +10,9 @@ A GTK4-based MPD (Music Player Daemon) client in Rust with two primary workflows
 
 ## Architecture
 
-Single Rust crate (edition 2024, MSRV 1.85). Two threads: GTK4 main loop + MPD background thread.
-Channels: `sync_channel<MpdEvent>(1024)` for MPD→UI, `mpsc::channel<MpdCommand>` for UI→MPD.
+Single Rust crate (edition 2024, MSRV 1.85). GTK4 main loop + background workers.
+See `_bmad-output/planning-artifacts/architecture.md` §3 for the full thread topology
+(MPD IO, MPD Cover, Cover Proc, Search, NotificationRouter).
 No async runtime — `std::thread` over tokio (4.2MB vs 15MB binary).
 
 **Full architecture decisions:** `_bmad-output/planning-artifacts/architecture.md`
