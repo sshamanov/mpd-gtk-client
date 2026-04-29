@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use widgets::album_cover;
 
-type SharedIds = std::rc::Rc<std::cell::RefCell<Arc<Mutex<HashMap<i32, i32>>>>>;
+type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;
 
 pub struct App {
     state: SharedState,
@@ -552,37 +552,63 @@ impl App {
             right_pane.append(&queue_scroll);
 
             // Shared item_ids for Delete key — updated by Queue event handler
-            let item_ids_w: SharedIds = std::rc::Rc::new(std::cell::RefCell::new(Arc::new(Mutex::new(HashMap::new()))));
+            let item_ids_w: SharedIds = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
             let ql_del = queue_list.clone();
             let cmd_del = cmd_tx.clone();
             let ids_del = item_ids_w.clone();
             let kc = EventControllerKey::new();
             kc.connect_key_pressed(move |_ctrl, key, _code, _mods| {
-                let ids = ids_del.borrow().clone();
-                if let Ok(m) = ids.lock() {
-                    match key {
-                        gtk4::gdk::Key::Delete | gtk4::gdk::Key::KP_Delete => {
-                            let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
-                            if let Some(id) = m.get(&idx) {
-                                let _ = cmd_del.send(MpdCommand::DeleteId(*id));
-                            }
+                // NOTE: `ids_del` is an Rc<RefCell<HashMap<i32, i32>>>.
+                // All access is on the GTK main thread, so RefCell is safe.
+                match key {
+                    gtk4::gdk::Key::Delete | gtk4::gdk::Key::KP_Delete => {
+                        let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
+                        let id = ids_del.borrow().get(&idx).copied();
+                        if let Some(id) = id {
+                            let _ = cmd_del.send(MpdCommand::DeleteId(id));
                         }
-                        gtk4::gdk::Key::Up if _mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK) => {
-                            let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
-                            if idx > 0 {
-                                if let Some(id) = m.get(&idx) {
-                                    let _ = cmd_del.send(MpdCommand::MoveId(*id, idx - 1));
+                    }
+                    gtk4::gdk::Key::Up if _mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK) => {
+                        let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
+                        if idx > 0 {
+                            let id = ids_del.borrow().get(&idx).copied();
+                            if let Some(id) = id {
+                                let _ = cmd_del.send(MpdCommand::MoveId(id, idx - 1));
+                                // Optimistic update: reflect the move in the local map so
+                                // rapid key presses read correct index->id mappings before
+                                // the queue refresh arrives (fixes race condition).
+                                let mut ids = ids_del.borrow_mut();
+                                if let Some(removed) = ids.remove(&idx) {
+                                    // Shift item at idx-1 up to idx,
+                                    // then place the moved item at idx-1.
+                                    if let Some(v) = ids.remove(&(idx - 1)) {
+                                        ids.insert(idx, v);
+                                    }
+                                    ids.insert(idx - 1, removed);
                                 }
                             }
                         }
-                        gtk4::gdk::Key::Down if _mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK) => {
-                            let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
-                            if let Some(id) = m.get(&idx) {
-                                let _ = cmd_del.send(MpdCommand::MoveId(*id, idx + 1));
+                    }
+                    gtk4::gdk::Key::Down if _mods.contains(gtk4::gdk::ModifierType::SHIFT_MASK) => {
+                        let idx = ql_del.selected_row().map(|r| r.index()).unwrap_or(-1);
+                        let id = ids_del.borrow().get(&idx).copied();
+                        if let Some(id) = id {
+                            let _ = cmd_del.send(MpdCommand::MoveId(id, idx + 1));
+                            // Optimistic update: reflect the move in the local map.
+                            let mut ids = ids_del.borrow_mut();
+                            if let Some(removed) = ids.remove(&idx) {
+                                if ids.contains_key(&(idx + 1)) {
+                                    let v = ids.remove(&(idx + 1)).unwrap();
+                                    ids.insert(idx, v);
+                                    ids.insert(idx + 1, removed);
+                                } else {
+                                    // Last item in queue — MoveId to idx+1 is a no-op in MPD.
+                                    ids.insert(idx, removed);
+                                }
                             }
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
                 gtk4::glib::Propagation::Proceed
             });
@@ -763,12 +789,10 @@ impl App {
                             }
                             let csp = current_song_pos.get();
                             let q_tx = cmd_c.clone();
-                            let item_ids: Arc<Mutex<HashMap<i32, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+                            let mut item_ids = HashMap::new();
                             let mut current_row: Option<gtk4::ListBoxRow> = None;
                             for (row_idx, item) in queue.iter().enumerate() {
-                                if let Ok(mut m) = item_ids.lock() {
-                                    m.insert(row_idx as i32, item.id);
-                                }
+                                item_ids.insert(row_idx as i32, item.id);
                                 let row = gtk4::ListBoxRow::new();
                                 let vbox = Box::new(Orientation::Vertical, 0);
                                 vbox.set_margin_start(8);
@@ -843,8 +867,8 @@ impl App {
                             if let Some(ref cr) = current_row {
                                 ql_c.select_row(Some(cr));
                             }
-                            // Refresh shared item_ids for Delete key lookup
-                            *ids_w.borrow_mut() = item_ids.clone();
+                            // Refresh shared item_ids for key-based delete/move lookup
+                            *ids_w.borrow_mut() = item_ids;
                         }
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = cover_paths.borrow_mut();

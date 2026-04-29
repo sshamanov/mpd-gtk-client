@@ -92,7 +92,7 @@ development_status:
   6-4-search-index-on-library-change: done
   6-5-dead-code-cleanup: done
   6-6-graceful-mpd-shutdown: done
-  6-7-queue-key-race-condition: backlog
+  6-7-queue-key-race-condition: done
 
   epic-9: in-progress
   9-3-fix-grouped-double-click: done
