@@ -23,9 +23,12 @@ Thumbs.db
 **/debug/
 **/release/
 
-# Documentation
-_bmad-output/
+# Runtime artifacts
+error.log
 *.log
+
+# AI tools
+.codex/
 
 # Temporary files
 tmp/

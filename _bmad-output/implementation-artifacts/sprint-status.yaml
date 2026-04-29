@@ -1,0 +1,87 @@
+# generated: 2026-04-25
+# last_updated: 2026-04-27
+# project: mpd-client
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: _bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: "2026-04-25"
+last_updated: "2026-04-27"
+project: mpd-client
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+
+development_status:
+  epic-0: done
+  0-1-tech-stack-validation-spikes: done
+  0-2-crate-restructure-and-gtk4-upgrade: done
+  0-3-code-hygiene-and-pattern-enforcement: done
+  0-4-test-infrastructure: done
+  epic-0-retrospective: done
+
+  epic-1a: done
+  1a-1-mpd-connection-and-app-shell: done
+  epic-1a-retrospective: done
+
+  epic-1b: done
+  1b-1-album-library-and-cover-grid: done
+  1b-2-hover-controls-and-double-click: done
+  1b-3-grouped-views: done
+  1b-4-basic-mpd-search: done
+  epic-1b-retrospective: done
+
+  epic-2: done
+  2-1-folder-tree-browser: done
+  2-2-breadcrumb-and-file-playback: done
+  2-3-cue-and-dsd-detection: done
+  epic-2-retrospective: done
+
+  epic-3: done
+  3-1-queue-display: done
+  3-2-queue-actions: done
+  3-3-context-menu-and-remove: done
+  3-4-drag-drop-reorder: done
+
+  epic-4a: done
+  4a-1-local-search-index: done
+
+  epic-4b: done
+  4b-1-cover-art-cache: done
+
+  epic-5a: done
+  5a-1-toast-notifications: done
+  5a-2-workspace-orchestrator: done
+
+  epic-5b: done
+  5b-1-settings-dialog: done
+  5b-2-keyboard-navigation: done

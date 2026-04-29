@@ -549,123 +549,23 @@ Show concise, readable format information.
 
 ## Covers And Artwork
 
-### Cover Lookup Priority (Strict Order)
-1. **Local files:** `cover.jpg`, `cover.jpeg`, `album.jpg`, `album.jpeg`, `folder.jpg`, `folder.jpeg` in same directory as music files
-2. **Embedded artwork:** Extract first front‑cover image from audio files (ID3v2, FLAC/Vorbis comments, etc.)
-3. **Online lookup:** Query MusicBrainz, Discogs, or other metadata services (configurable)
+### Cover Lookup (MPD-Driven)
 
-### Caching Policies
+Cover art is fetched exclusively via the MPD protocol. No local filesystem scanning or online lookup is performed by the client. See `_bmad-output/planning-artifacts/architecture.md` for the full pipeline design (CoverProvider + ActualRead with MPD albumart/readpicture).
 
-#### Session Cache (Memory)
-- **Purpose:** Avoid repeated lookups within same application session
-- **Storage:** In‑memory hashmap keyed by `(album_artist, album_title)` normalized tuple
-- **Size limit:** 10,000 entries (LRU eviction)
-- **Hit rate target:** >90% after initial library scan
-- **Invalidation:** Manual “refresh cover” action clears entry; library rescans clear entire cache
+### UI Behavior
 
-#### Persistent Disk Cache
-- **Purpose:** Survive application restarts, reduce network requests
-- **Storage:** `~/.cache/mpd‑client/covers/` with SHA‑256 hash of `(artist, album)` as filename
-- **Size limit:** 1GB total, 10,000 files (LRU eviction)
-- **Format:** JPEG/PNG as returned by source (preserve original dimensions)
-- **Metadata:** Store source URL/timestamp for conditional re‑fetch
-- **Lifetime:** Entries older than 30 days re‑validated on next access
-
-#### Cache Coordination Rules
-- **Read path:** Session cache → disk cache → fresh lookup
-- **Write path:** Fresh lookup populates both caches
-- **Concurrent requests:** Deduplicate simultaneous lookups for same album
-- **Priority:** Visible/viewport items populate cache before background scanning
-
-### Online Lookup Policies
-
-#### Rate Limiting
-- **Default:** 1 request per second (sliding window)
-- **Burst:** Allow 5 requests in first 2 seconds after app start (for visible items)
-- **Backoff:** Exponential backoff on HTTP 429/503 (1s, 2s, 4s, 8s… max 60s)
-- **Service limits:** Respect `Retry‑After` headers; pause all requests if service indicates overload
-
-#### Retry Logic
-- **Transient failures** (network timeout, 5xx errors): Retry up to 3 times with 2s delay
-- **Permanent failures** (404, 401, 400): Mark album as “no cover available”; skip future lookups for 7 days
-- **Partial failures** (image download fails after metadata success): Retry image fetch twice, then fall back to next source
-
-#### Source Fallback Chain
-1. MusicBrainz (release‑group cover art)
-2. Discogs (primary image)
-3. Last.fm (album.getInfo)
-4. Local fallback: Generic “no cover” placeholder (subtle gradient with album initials)
-
-### Background Fetching Strategy
-
-#### Priority Tiers
-1. **Now Playing & Visible Items:** Immediate fetch (bypasses rate limit for first 2 items)
-2. **Selected/Highlighted Albums:** High‑priority background queue (processed within 5s)
-3. **Remaining Library:** Low‑priority background queue (processed during idle periods)
-
-#### Queue Management
-- **Max concurrent fetches:** 2 (to respect rate limits)
-- **Queue size:** Unlimited but bounded by library size
-- **Pause/resume:** Suspend when window not focused; resume on focus
-- **Progress indication:** Show “fetching covers” badge in status area when active
-
-### Storage & Performance Limits
-
-#### Memory Footprint
-- **Decoded images in UI:** Keep only visible covers in memory (viewport + prefetch margin)
-- **Max decoded size:** 512×512 pixels (downsample larger images)
-- **Texture cache:** GPU‑side cache for album grid (retain last 100 covers)
-
-#### Disk Usage
-- **Max cache size:** 1GB (configurable)
-- **Cleanup:** LRU eviction; manual “clear cache” action
-- **Integrity:** Verify downloaded files are valid images; delete corrupt entries
-
-#### Network Usage
-- **Monthly budget:** 500MB default (configurable)
-- **Warning:** Notify user when 80% of budget used
-- **Offline mode:** Disable online lookups when network unavailable or budget exhausted
+- Cover grid shows placeholder (artist-hash color with album initials) while art loads
+- Covers load incrementally — one per idle cycle, never blocking the UI
+- When a cover arrives from the background pipeline, the UI redraws immediately
+- No cover ever holds up browsing, playback, or search
 
 ### Failure States & Degradation
 
-#### No Cover Found
-- **Display:** Subtle gradient placeholder with album initials (e.g., “AB” for “Abbey Road”)
-- **Color:** Derived from album artist hash (consistent across sessions)
-- **Size:** Matches cover dimensions; no broken‑image icon
+- **No cover found:** Subtle gradient placeholder with album initials, color derived from artist name
+- **Lookup in progress:** Existing placeholder remains; no shimmer/animation
+- **MPD unavailable:** Covers remain at last cached state
 
-#### Lookup In Progress
-- **Placeholder:** Animated shimmer overlay on existing placeholder
-- **Cancelation:** User interaction (scroll away) does not cancel fetch
-
-#### Service Unavailable
-- **Fallback:** Continue with local/embedded covers only
-- **Retry:** Attempt service again after 1 hour or on next app start
-- **User notification:** Brief toast “Cover service temporarily unavailable”
-
-### Configuration & Overrides
-
-#### User‑Configurable Settings
-- **Enable/disable online lookups:** Global toggle
-- **Cache size:** Adjust disk cache limit (100MB–5GB)
-- **Rate limit:** Adjust requests per second (0.5–5)
-- **Source selection:** Enable/disable individual services
-- **Network budget:** Set monthly data cap
-
-#### Admin/Advanced
-- **Custom API keys:** Per‑service authentication
-- **Proxy support:** HTTP/SOCKS5 proxy for lookups
-- **Local source directories:** Additional folders to scan for `cover.jpg`
-- **Ignore list:** Artist/album patterns to skip online lookups
-
-### Success Metrics
-- **Cache hit rate:** >90% after initial library scan
-- **Load time:** 95% of covers appear within 100ms of becoming visible
-- **Network efficiency:** <5% of covers require fresh online fetch after first week
-- **Memory footprint:** Cover subsystem <50MB RAM for 10,000‑track library
-
-### MPD Compatibility Notes
-
-**MPD Integration for Cover Art:** MPD's `readpicture` command returns binary image data; client must handle decoding (JPEG, PNG). MPD may return empty/placeholder for missing covers; fallback logic must respect MPD's response. Album art caching should consider MPD's `albumart` command limitations (max size 1MB). Online lookup rate limits must not interfere with MPD command queue (separate worker thread).
 
 ## Search Functionality
 
@@ -932,15 +832,15 @@ Keep the main interaction model consistent.
 - **NFR‑O5:** Performance profiling support for large libraries (>100,000 tracks) as verified by profiling tool integration testing
 
 ### Traceability Mapping
-Each requirement traces to one or more sections in this document:
-- **Playback control:** Technical Architecture → MPD Adapter Layer
-- **Queue management:** Playback And Queue Design, Interaction Rules  
-- **Browsing & navigation:** User Journeys, Interaction Rules, Technical Architecture → Browsing Presenters
-- **Layout & UI:** Layout, Technical Architecture → Layout Service Consideration
-- **Cover art:** Covers And Artwork (detailed policies)
-- **Search:** Search Functionality (detailed specification)
+Each requirement traces to one or more sections in this document or architecture:
+- **Playback control:** `_bmad-output/planning-artifacts/architecture.md` — MPD Adapter Architecture
+- **Queue management:** Playback And Queue Design, Interaction Rules
+- **Browsing & navigation:** User Journeys, Interaction Rules, `_bmad-output/planning-artifacts/architecture.md` — Browsing Sort / Folder Normalization
+- **Layout & UI:** Layout, `_bmad-output/planning-artifacts/architecture.md` — Layout & Responsive / libadwaita
+- **Cover art:** Covers And Artwork, `_bmad-output/planning-artifacts/architecture.md` — Cover Art Pipeline
+- **Search:** Search Functionality, `_bmad-output/planning-artifacts/architecture.md` — Search Architecture
 - **Performance:** Success Criteria (Technical Performance)
-- **Reliability:** Technical Architecture → Resilience And Fallbacks
+- **Reliability:** `_bmad-output/planning-artifacts/architecture.md` — Startup/Shutdown Lifecycle, Notifications
 - **Usability:** Success Criteria (Business Outcomes, Quality Metrics)
 
 ## Technical Specifications
@@ -1045,320 +945,25 @@ The client relies on MPD for actual playback; these specifications define what t
 
 **Verification Method:** During implementation, cross‑check each technical specification against MPD protocol documentation (https://mpd.readthedocs.io).
 
-## Technical Architecture
-
-### Backend Role
-
-MPD is the initial playback and library backend.
-
-MPD is responsible for:
-
-- playback transport
-- current playback state
-- queue state
-- library access
-- output and format data where available
-
-The client is responsible for:
-
-- screen structure
-- browsing models
-- queue presentation
-- interpretation of folder structures
-- drag and drop behavior
-- mode-specific UX rules
-
-This keeps the product focused on UX and preserves the option to replace the playback backend later.
-
-### High-Level Structure
-
-Use one playback core with mode-specific presentation layers.
-
-Suggested structure:
-
-1. MPD adapter layer
-2. application state layer
-3. browsing presenters
-4. queue presenters
-5. UI layer
-
-### MPD Adapter Layer
-
-The MPD adapter isolates protocol and transport concerns.
-
-Responsibilities:
-
-- connect and reconnect to MPD
-- fetch playback state
-- fetch queue state
-- fetch library and file data
-- issue playback and queue commands
-- normalize MPD responses into application-friendly models
-
-#### MPD Adapter Resilience Requirements
-
-The adapter must handle MPD’s real‑world failure modes gracefully:
-
-- **Connection state machine:** Track disconnected, connecting, connected, error states
-- **Exponential backoff retry:** Automatic reconnection with increasing delays after failures
-- **Metadata caching:** Cache album and track metadata to survive temporary disconnections
-- **Partial failure handling:** Continue operating when some MPD commands fail (e.g., cover art lookup)
-- **Queue sync verification:** Periodically verify local queue state matches MPD’s actual queue
-
-### Application State Layer
-
-Maintain one shared application state that feeds both modes.
-
-State domains:
-
-- playback state
-- current track
-- current album context
-- queue state
-- album browsing state
-- folder browsing state
-- selection state
-- drag and drop state
-- layout state
-
-Rules:
-
-- playback state is shared across modes
-- browsing state is mode-specific
-- queue presentation changes by mode, but the underlying queue remains one source of truth
-
-#### State Domain Boundaries
-
-**Shared state (visible in both modes):**
-- Playback state (playing/paused, current position)
-- Current track and album context
-- Queue state (the underlying linear playback sequence)
-- Connection state (MPD connected/disconnected)
-
-**Mode‑local state (isolated per mode):**
-- Album browsing: grid scroll position, selected album, hover state, group expansion
-- Folder browsing: expanded folder paths, selected track, folder tree scroll position
-- Layout preferences: split ratios, rail proportions (can persist per‑mode if desired)
-- Drag‑and‑drop transient state
-
-### Browsing Presenters
-
-#### Album Presenter
-
-Responsibilities:
-
-- produce album cards for the main grid
-- provide grouped views for `Albums`, `Artists`, `Years`, and `Genres`
-- expose pinned group headers
-- support manual ordering only in plain `Albums` view
-- expose drag reorder targets for manual album ordering
-- apply natural default sorting in grouped views: `Artists` A-Z, `Years` newest-first, `Genres` A-Z
-
-#### Folder Presenter
-
-Responsibilities:
-
-- build directory-like rows for music browsing
-- expose folder expand and collapse state
-- expose track rows with per-track technical metadata
-- provide lightweight normalization for the known folder cases
-- fall back to a one-album track split when normalization is unclear
-
-Normalization should improve readability but must never hide ambiguity.
-Normalization is for the left browsing panel only. Once a directory or cue structure has been converted into folder and track entities, all later flows should treat those entities as normal folders and tracks.
-
-Normalization rules:
-
-- Plain directory with track files: use the files directly and ignore `cue` or `m3u` if regular tracks are already present
-- First-level directory plus second-level `dsd` or `dsf` tracks: use the longest folder name as album name and treat `dsd` or `dsf` files as tracks
-- Single image file plus `cue`: use the `cue` file and present the image as split tracks
-- Multi-disc image files plus `cue`: use `cue` files and merge discs into one album
-- If naming differs across nested folders, choose the longest folder name by character count as album name
-- If normalization is unclear, split to tracks but still present the result as one album
-- If a `cue` file is broken, first try resolving the referenced image by basename with a different common audio extension such as `flac` instead of `wav`
-- If cue resolution still fails, discard the `cue` and fall back to the underlying playable file
-
-#### Normalization Failure Handling
-
-When normalization cannot produce a clean result:
-
-- **Show ambiguity:** Present the raw folder structure with a visual indicator (e.g., "⚠ ambiguous structure")
-- **Preserve playability:** All playable files remain accessible even if grouping is unclear
-- **Error recovery:** If cue parsing throws an unhandled exception, log the error and fall back to treating the cue file as a single playable item
-- **User override:** Allow manual "split as album" or "treat as folder" action via context menu
-- **Session memory:** Remember user’s choice for the same folder path during the session
-
-### Queue Model
-
-Use one underlying queue model and two presenters.
-
-Underlying queue requirements:
-
-- ordered linear playback sequence
-- enough metadata to derive album-level and track-level views
-- references for album identity, track identity, source path, queue position, and current/playing state
-
-#### Album Queue Presenter
-
-Responsibilities:
-
-- group queued items by album
-- produce mini cover grid items for queued albums
-- mark the currently playing album
-- support drag insertion before or after target album
-- preserve exact queue order beneath the album-level view
-- allow duplicate album instances in the queue
-- support removal by dragging album items off the queue grid
-- append dragged items to the end when dropped onto empty queue background
-- support edge autoscroll during drag operations
-- support `Play now` as jump-only behavior that keeps the rest of the queue unchanged
-
-##### Grid↔Queue Mapping Algorithm
-
-The album queue grid is a visual representation of the underlying linear queue. Mapping between 2D grid positions and linear queue order follows these rules:
-
-- **Grid layout:** Left‑to‑right, then top‑to‑bottom (row‑major order)
-- **Grid dimensions:** Initially 3 columns (`3x2`), adjustable based on rail width
-- **Position mapping:** Grid cell `(row, col)` maps to queue position `row * columns + col`
-- **Drag reordering:** Dropping between grid cells inserts between the corresponding linear positions
-- **Edge cases:** 
-  - Dropping on the right half of a cell → insert after that queue item
-  - Dropping on the left half → insert before that queue item
-  - Dropping on empty grid background → append to end of queue
-- **Visual feedback:** Show insertion marker between grid cells, not within cells
-
-This ensures drag‑and‑drop in the grid visually matches the linear queue reordering.
-
-#### Track Queue Presenter
-
-Responsibilities:
-
-- expose ordered track rows
-- support plain visible list rendering
-- support drag reorder when used in queue context
-- support follow-on-leave scroll behavior for the current track
-- support insertion before or after queue items using a thin insertion line, including top and bottom insertion zones
-- treat dropped folders as batches of tracks
-- append dragged items to the end when dropped onto empty queue background
-- support edge autoscroll during drag operations
-- support removal by dragging items off the queue viewport
-- support `Play now` as jump-only behavior that keeps the rest of the queue unchanged
-
-### Current Album Track Window Model
-
-This is not a separate queue. It is a derived view over the current album context.
-
-Responsibilities:
-
-- derive the currently playing album track list
-- maintain a scrollable visible window
-- anchor the list on the played/current track area
-- reset that anchor on track change
-- allow manual scrolling backward and forward
-- expose direct track selection within the current album
-
-### Drag And Drop
-
-#### Album Mode
-
-Supported operations:
-
-- reorder albums inside album queue
-- drag albums from the main grid into the queue
-- insert albums before or after exact target positions
-- manually reorder albums in plain `Albums` view only
-- append to the end when dropped onto empty queue background
-- edge autoscroll is enabled during drag
-
-Constraints:
-
-- grouped views such as `Artists`, `Years`, and `Genres` do not support free manual reordering
-- drag logic must operate on a linear queue even when rendered as a grid
-
-#### Folder Mode
-
-Supported operations are part of v1:
-
-- drag track to queue
-- drag folder or album block to queue
-- drag tracks within queue to reorder
-- insert at exact position between queue items, or at explicit top or bottom zones
-- treat dragged folders as batches of tracks
-- append to the end when dropped onto empty queue background
-- edge autoscroll is enabled during drag
-- dragging queue items out of the queue viewport removes them
-
-Do not support arbitrary reordering of the source folder tree itself.
-
-### Layout Configuration
-
-These values should stay configurable rather than hard-coded:
-
-- shell split
-- right rail width
-- album-mode rail proportions
-- folder-mode rail proportions
-
-Initial values:
-
-- shell split: `70/30`
-- right rail width: `clamp(320px, 30vw, 420px)`
-- album mode rail: `40 / 20 / 40`
-- folder mode rail: `55 / 45`
-
-#### Layout Service Consideration
-
-For maintainability, consider centralizing layout logic in a layout service that:
-
-- **Manages proportional splits:** Stores and applies shell split, rail widths, internal proportions
-- **Handles responsive breakpoints:** Adjusts grid columns, rail visibility on window resize
-- **Persists preferences:** Remembers user adjustments per mode across sessions
-- **Coordinates UI updates:** Notifies presenters when layout values change
-- **Validates constraints:** Ensures proportions stay within usable ranges
-
-This keeps layout calculations separate from presentation logic.
-
-### Resilience And Fallbacks
-
-The client should remain usable when MPD or media data is imperfect.
-
-- Automatically try to reconnect to MPD when disconnected
-- Be ready for temporary disconnect state in the UI
-- Show disconnected or missing-MPD state as a calm inline empty panel rather than a blocking takeover screen
-- Show the inline empty or disconnected panel primarily in the main content area
-- Empty library should render as an empty interface state rather than an error
-- Empty folder roots should simply show no folder entries
-- Missing cover art should not block playback or browsing
-- Missing technical data should simply not be shown
-
-### Failure Mode Analysis
-
-**Critical Subsystem Failure Scenarios:**
-- **MPD Connection Loss:** Exponential backoff retry (1s, 2s, 4s, 8s, 16s) → after 5 failures, show disconnected panel; continue polling every 30s.
-- **Cover Fetch Cascade Failure:** Embedded art missing → folder image missing → online lookup fails → placeholder icon; cache negative results for 24h.
-- **Queue Sync Desynchronization:** Detect mismatch between client queue and MPD queue via hash comparison; resync with MPD's `playlistinfo`; preserve user intent (undo stack).
-- **Metadata Parsing Failure:** Cue sheet parse error → treat as single file; ID3 tag corruption → fallback to filename; charset detection failure → UTF‑8 with replacement char.
-- **UI Layout Calculation Failure:** CSS/GTK layout error → fallback to default proportions (70/30, 40/20/40, 55/45); log error but continue.
-- **Search Index Corruption:** Rebuild index on next library scan; disable search temporarily; notify user via subtle status message.
-
-**Mitigation Priority:** 1. Maintain playback continuity 2. Preserve queue state 3. Keep UI responsive 4. Degrade gracefully 5. Log diagnostics.
-
-### Future-Proofing
-
-The architecture should allow later changes without redesigning the app.
-
-Be ready for:
-
-- changing the split from `70/30` to `75/25`
-- changing right rail internal proportions
-- swapping the playback backend later
-- extending queue interactions without changing the main shell
-
-Key invariant:
-
-- one playback core
-- one source of truth for queue and playback state
-- multiple mode-specific presenters
+### Technical Architecture Reference
+
+See `_bmad-output/planning-artifacts/architecture.md` for the full technical architecture including:
+- Threading model and MPD idle protocol
+- Cover art pipeline (CoverProvider + ActualRead)
+- State management and presenters
+- Queue processing and plchanges strategy
+- Command batching, Unix socket detection
+- UI widget architecture and libadwaita integration
+- MPRIS D-Bus integration
+- Layout service and responsive breakpoints
+
+### Proven Implementation Patterns
+
+Real-MPD validation confirmed the following patterns (see `architecture.md` "Proven Patterns from Validation Session"):
+- Dead connection detection (3 consecutive failures → reconnect)
+- Cover art binary protocol (albumart multi-chunk reassembly, BufReader fix)
+- Widget registry for in-place cover cell updates
+- 64-event batch limit in UI event processing
 
 ## Detailed Interaction Flows
 
