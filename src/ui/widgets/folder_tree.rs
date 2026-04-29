@@ -16,6 +16,10 @@ pub struct FolderBrowser {
     pub shared_path: Rc<RefCell<String>>,
     #[allow(dead_code)]
     cmd_tx: mpsc::Sender<MpdCommand>,
+    /// Full MPD URIs of audio files hidden by CUE normalization (for CUE summary row playback).
+    cue_tracks: Rc<RefCell<Vec<String>>>,
+    /// Full MPD URIs of .dsf/.dff files hidden by DSD normalization (for DSD summary row playback).
+    dsd_tracks: Rc<RefCell<Vec<String>>>,
 }
 
 impl FolderBrowser {
@@ -35,10 +39,14 @@ impl FolderBrowser {
         container.append(&scroll);
 
         let shared_path: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let cue_tracks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let dsd_tracks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
-        // Row activation: navigate directories / play files
+        // Row activation: navigate directories / play files / play CUE/DSD summary rows
         let tx = cmd_tx.clone();
         let sp = shared_path.clone();
+        let ct = cue_tracks.clone();
+        let dt = dsd_tracks.clone();
         list.connect_row_activated(move |_list, row| {
             if let Some(w) = row.child() {
                 let css = w.css_classes();
@@ -47,6 +55,20 @@ impl FolderBrowser {
                 if name.starts_with("file:") {
                     let filepath = name.strip_prefix("file:").unwrap_or("");
                     let _ = tx.send(MpdCommand::PlayFile(filepath.to_string()));
+                } else if name.starts_with("cue:") {
+                    // CUE summary row: clear queue, add all cue-associated tracks, play
+                    let _ = tx.send(MpdCommand::Clear);
+                    for uri in ct.borrow().iter() {
+                        let _ = tx.send(MpdCommand::Add(uri.clone()));
+                    }
+                    let _ = tx.send(MpdCommand::PlayPosition(0));
+                } else if name.starts_with("dsd:") {
+                    // DSD summary row: clear queue, add all DSD tracks, play
+                    let _ = tx.send(MpdCommand::Clear);
+                    for uri in dt.borrow().iter() {
+                        let _ = tx.send(MpdCommand::Add(uri.clone()));
+                    }
+                    let _ = tx.send(MpdCommand::PlayPosition(0));
                 } else if name == ".." {
                     let cur = sp.borrow().clone();
                     let parent = Path::new(&cur).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -76,7 +98,7 @@ impl FolderBrowser {
         });
         list.add_controller(key_ctrl);
 
-        Self { container, list, breadcrumb, shared_path, cmd_tx }
+        Self { container, list, breadcrumb, shared_path, cmd_tx, cue_tracks, dsd_tracks }
     }
 
     pub fn set_entries(&mut self, path: &str, entries: Vec<DirEntry>) {
@@ -145,6 +167,29 @@ impl FolderBrowser {
                 } else { None }
             } else { None }
         }).unwrap_or_default();
+
+        // Collect URIs for CUE-associated audio files and DSD files
+        let mut cue_file_uris: Vec<String> = Vec::new();
+        let mut dsd_file_uris: Vec<String> = Vec::new();
+        for entry in &entries {
+            if let DirEntry::File { path, name, .. } = entry {
+                if has_cue && (ends_with_ci(name, ".flac") || ends_with_ci(name, ".wav")
+                    || ends_with_ci(name, ".ape") || ends_with_ci(name, ".ogg")
+                    || ends_with_ci(name, ".mp3") || ends_with_ci(name, ".m4a")
+                    || ends_with_ci(name, ".aiff") || ends_with_ci(name, ".aif")
+                    || ends_with_ci(name, ".wv") || ends_with_ci(name, ".wma")
+                    || ends_with_ci(name, ".opus") || ends_with_ci(name, ".aac"))
+                {
+                    cue_file_uris.push(path.clone());
+                }
+                if is_dsd_folder && (ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff")) {
+                    dsd_file_uris.push(path.clone());
+                }
+            }
+        }
+        *self.cue_tracks.borrow_mut() = cue_file_uris;
+        *self.dsd_tracks.borrow_mut() = dsd_file_uris;
+
         let mut has_visible = false;
 
         for entry in entries {
@@ -187,10 +232,10 @@ impl FolderBrowser {
             let cue_row = gtk4::ListBoxRow::new();
             let hbox = Box::new(Orientation::Horizontal, 4);
             let lbl = Label::new(Some("[CUE] Cue Sheet Album"));
-            let info = Label::new(Some("click to browse"));
+            let info = Label::new(Some("click to play"));
             info.set_css_classes(&["format-badge"]);
             hbox.set_css_classes(&["dir-entry"]);
-            hbox.set_widget_name("");
+            hbox.set_widget_name("cue:");
             hbox.append(&lbl);
             hbox.append(&info);
             cue_row.set_child(Some(&hbox));
@@ -203,7 +248,7 @@ impl FolderBrowser {
             let badge = Label::new(Some(&dsd_format));
             badge.set_css_classes(&["format-badge"]);
             hbox.set_css_classes(&["dir-entry"]);
-            hbox.set_widget_name("");
+            hbox.set_widget_name("dsd:");
             hbox.append(&lbl);
             hbox.append(&badge);
             dsd_row.set_child(Some(&hbox));
