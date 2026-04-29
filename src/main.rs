@@ -10,13 +10,16 @@ pub mod state;
 pub mod ui;
 
 use log::info;
-use mpd::state_machine::{MpdEvent, MpdEventLoop};
+use mpd::state_machine::{MpdCommand, MpdEvent, MpdEventLoop};
 use state::create_initial_state;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use ui::App;
+
+/// Set by SIGINT/SIGTERM signal handlers to request a graceful GTK main loop exit.
+pub(crate) static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() {
     env_logger::init();
@@ -42,28 +45,35 @@ fn main() {
 
     info!("MPD event loop started");
 
-    // Register SIGINT (2) / SIGTERM (15) handlers
-    // Use idle_add to defer exit to the GLib main context, allowing clean shutdown
-    let sig_stop = event_loop.get_stop_flag();
+    // Register SIGINT (2) / SIGTERM (15) handlers.
+    // Sets the shutdown flag; the 30ms UI timer detects it and calls app.quit()
+    // to gracefully exit the GTK main loop.
     glib::source::unix_signal_add(2, move || {
         info!("Received SIGINT, shutting down");
-        sig_stop.store(true, Ordering::Release);
-        glib::idle_add(|| std::process::exit(0));
+        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Release);
         glib::ControlFlow::Break
     });
-    let sig_stop2 = event_loop.get_stop_flag();
     glib::source::unix_signal_add(15, move || {
         info!("Received SIGTERM, shutting down");
-        sig_stop2.store(true, Ordering::Release);
-        glib::idle_add(|| std::process::exit(0));
+        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Release);
         glib::ControlFlow::Break
     });
 
     // Block until the GTK application exits
+    let close_tx = cmd_tx.clone();
     let app = App::new(state, event_rx, cmd_tx, conn_params);
     app.run();
 
     info!("Shutting down MPD connection");
+
+    // Send the MPD close command for graceful shutdown before stopping the thread.
+    // This ensures MPD sees a clean disconnect rather than an abrupt TCP close.
+    if close_tx.send(MpdCommand::Close).is_ok() {
+        thread::sleep(Duration::from_millis(100));
+    } else {
+        log::warn!("MPD command channel already closed during shutdown");
+    }
+
     event_loop.signal_stop();
 
     // Attempt join with 3-second timeout

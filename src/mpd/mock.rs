@@ -104,6 +104,9 @@ fn handle_client(stream: TcpStream, received: &Arc<Mutex<Vec<String>>>) {
             Ok(line) => {
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed == "close" {
+                    if trimmed == "close" {
+                        received.lock().unwrap().push("close".to_string());
+                    }
                     break;
                 }
                 let cmd = trimmed.split_whitespace().next().unwrap_or(trimmed);

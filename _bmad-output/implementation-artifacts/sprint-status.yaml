@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-04-27"
+last_updated: "2026-04-29"
 project: mpd-client
 project_key: NOKEY
 tracking_system: file-system
@@ -85,3 +85,29 @@ development_status:
   epic-5b: done
   5b-1-settings-dialog: done
   5b-2-keyboard-navigation: done
+
+  epic-6: in-progress
+  6-1-dead-connection-detection: done
+  6-2-toast-timer-management: done
+  6-4-search-index-on-library-change: done
+  6-5-dead-code-cleanup: done
+  6-6-graceful-mpd-shutdown: done
+  6-7-queue-key-race-condition: backlog
+
+  epic-9: in-progress
+  9-3-fix-grouped-double-click: done
+  9-4-cue-dsd-row-playback: backlog
+  9-5-albumartist-search: done
+  9-6-list-albums-grouped-artist-loss: backlog
+  9-7-search-albums-stale-artist: backlog
+
+  epic-12: backlog
+  12-1-async-grid-population: backlog
+  12-2-frame-clock-integration: backlog
+
+  epic-13: backlog
+  13-1-coverprovider-cache-read: backlog
+  13-2-actualread-background-fetch: backlog
+  13-3-scroll-aware-cover-loading: backlog
+  13-4-widget-registry-in-place-updates: backlog
+  13-5-online-cover-lookup: backlog

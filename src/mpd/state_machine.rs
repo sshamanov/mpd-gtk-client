@@ -34,6 +34,8 @@ pub enum MpdCommand {
     Clear,
     Reconnect,
     FetchCovers(Vec<(String, String)>),
+    /// Send the MPD `close` command and exit the connected loop gracefully.
+    Close,
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -485,6 +487,13 @@ fn connected_loop(
                     }
                     MpdCommand::Reconnect => {
                         log::info!("[MPD] received Reconnect command, restarting connection");
+                        return;
+                    }
+                    MpdCommand::Close => {
+                        log::info!("[MPD] received Close command, sending close to MPD");
+                        let _ = adapter.send_command("close");
+                        // Prevent the outer state machine from attempting reconnection
+                        stop.store(true, Ordering::Release);
                         return;
                     }
                 }

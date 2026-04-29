@@ -127,3 +127,24 @@ fn test_queue_mutation_commands() {
     client.send_command("clear").unwrap();
     server.assert_received("clear");
 }
+
+#[test]
+fn test_close_command() {
+    let (server, mut client) = common::with_mpd_server();
+
+    // Send a known-good command first to verify connection is alive
+    client.send_command("status").unwrap();
+    server.assert_received("status");
+
+    // Send close — the mock disconnects; send_command returns an error
+    // because reading the response fails after the server drops the connection
+    let result = client.send_command("close");
+    assert!(result.is_err(), "close should fail because server disconnects");
+
+    // Verify the mock received the close command
+    server.assert_received("close");
+
+    // Subsequent commands should also fail — connection is dead
+    let result = client.send_command("status");
+    assert!(result.is_err(), "status after close should fail");
+}

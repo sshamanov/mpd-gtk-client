@@ -9,6 +9,7 @@ use crate::state::SharedState;
 use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, Box, EventControllerKey, FlowBox, Label, ListBox, Orientation, Paned, Picture, ScrolledWindow};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use widgets::album_cover;
@@ -79,6 +80,9 @@ impl App {
         // Mode switching actions — application.add_action will be called inside connect_activate
 
         application.connect_activate(move |window_app| {
+            // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
+            let shutdown_app = window_app.clone();
+
             let window = ApplicationWindow::builder()
                 .application(window_app)
                 .default_width(1200)
@@ -146,13 +150,13 @@ impl App {
             album_grid.set_max_children_per_line(n);
 
             // Shared album name store for double-click handler
-            let album_names = Arc::new(Mutex::new(Vec::<String>::new()));
+            let album_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
             let dbl_tx = cmd_tx.clone();
             let an_dbl = album_names.clone();
             album_grid.connect_child_activated(move |_grid, child| {
                 let idx = child.index() as usize;
                 if let Ok(store) = an_dbl.lock() {
-                    if let Some(name) = store.get(idx) {
+                    if let Some(Some(name)) = store.get(idx) {
                         let _ = dbl_tx.send(MpdCommand::PlayAlbum(name.clone()));
                     }
                 }
@@ -335,7 +339,7 @@ impl App {
                         let Ok(index) = idx.read() else { return; };
                         let results = index.search(&qc);
                         if !results.is_empty() {
-                            let names: Vec<String> = results.iter().map(|r: &(String, String)| r.1.clone()).collect();
+                            let names: Vec<Option<String>> = results.iter().map(|r: &(String, String)| Some(r.1.clone())).collect();
                             if let Ok(mut store) = an.lock() { *store = names; }
                             let empty_covers = std::collections::HashMap::new();
                             let empty_widgets = CoverWidgets::new(std::collections::HashMap::new());
@@ -629,8 +633,16 @@ impl App {
             let cover_widgets: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
             let cp_np = cover_paths.clone();
             let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            let shutdown_app = shutdown_app.clone();
 
             glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+                // Check for shutdown request from SIGINT/SIGTERM signal handlers.
+                // This runs within the GTK main loop, so we can call app.quit() directly.
+                if crate::SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel) {
+                    shutdown_app.quit();
+                    return glib::ControlFlow::Break;
+                }
+
                 let mut guard = match rx_c.lock() {
                     Ok(g) => g,
                     Err(poisoned) => {
@@ -682,7 +694,7 @@ impl App {
                                 empty_c.set_text("No albums found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<String> = albums.iter().map(|(_, n)| n.clone()).collect();
+                                let names: Vec<Option<String>> = albums.iter().map(|(_, n)| Some(n.clone())).collect();
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
@@ -700,8 +712,12 @@ impl App {
                                 empty_c.set_text("No albums found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<String> = groups.iter()
-                                    .flat_map(|(_, albums)| albums.iter().map(|(_, n)| n.clone()))
+                                let names: Vec<Option<String>> = groups.iter()
+                                    .flat_map(|(_, albums)| {
+                                        let mut items: Vec<Option<String>> = vec![None]; // group header
+                                        items.extend(albums.iter().map(|(_, n)| Some(n.clone())));
+                                        items
+                                    })
                                     .collect();
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
@@ -727,7 +743,7 @@ impl App {
                                 empty_c.set_text("No results found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<String> = results.iter().map(|(_, n)| n.clone()).collect();
+                                let names: Vec<Option<String>> = results.iter().map(|(_, n)| Some(n.clone())).collect();
                                 if let Ok(mut store) = album_names.lock() {
                                     *store = names;
                                 }
