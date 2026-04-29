@@ -664,7 +664,16 @@ impl App {
                         }
                         MpdEvent::StateChanged(update) => {
                             current_song_pos.set(update.song.map(|s| s as i32));
-                            update_now_playing(&tl_c, &ar_c, &al_c, &pi_c, &td_c, &fmt_c, &np_cover_c, &cp_np, &update);
+                            update_now_playing(NowPlayingWidgets {
+    title: &tl_c,
+    artist: &ar_c,
+    album: &al_c,
+    icon: &pi_c,
+    time_display: &td_c,
+    format_badge: &fmt_c,
+    cover: &np_cover_c,
+    cover_paths: &cp_np,
+}, &update);
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
@@ -949,63 +958,65 @@ fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mps
     }
 }
 
+struct NowPlayingWidgets<'a> {
+    title: &'a Label,
+    artist: &'a Label,
+    album: &'a Label,
+    icon: &'a Label,
+    time_display: &'a Label,
+    format_badge: &'a Label,
+    cover: &'a Picture,
+    cover_paths: &'a std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
+}
+
 fn update_now_playing(
-    title: &Label,
-    artist: &Label,
-    album: &Label,
-    icon: &Label,
-    time_display: &Label,
-    format_badge: &Label,
-    cover: &Picture,
-    cover_paths: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
+    w: NowPlayingWidgets,
     update: &PlaybackUpdate,
 ) {
     if let Some(ref t) = update.title {
-        title.set_text(t);
+        w.title.set_text(t);
     } else {
-        title.set_text("");
+        w.title.set_text("");
     }
     if let Some(ref a) = update.artist {
-        artist.set_text(a);
+        w.artist.set_text(a);
     } else {
-        artist.set_text("");
+        w.artist.set_text("");
     }
     if let Some(ref a) = update.album {
-        album.set_text(a);
-        let cp = cover_paths.borrow();
+        w.album.set_text(a);
+        let cp = w.cover_paths.borrow();
         if let Some(Some(path)) = cp.get(a) {
-            cover.set_filename(Some(path));
-            cover.set_visible(true);
+            w.cover.set_filename(Some(path));
+            w.cover.set_visible(true);
         } else {
-            cover.set_visible(false);
+            w.cover.set_visible(false);
         }
     } else {
-        album.set_text("");
-        cover.set_visible(false);
+        w.album.set_text("");
+        w.cover.set_visible(false);
     }
-    // Elapsed / Duration
     match (update.elapsed, update.duration) {
         (Some(el), Some(dur)) => {
-            time_display.set_text(&format!("{}:{:02} / {}:{:02}", el as u64 / 60, el as u64 % 60, dur as u64 / 60, dur as u64 % 60));
+            w.time_display.set_text(&format!("{}:{:02} / {}:{:02}", el as u64 / 60, el as u64 % 60, dur as u64 / 60, dur as u64 % 60));
         }
         _ => {
-            time_display.set_text("--:-- / --:--");
+            w.time_display.set_text("--:-- / --:--");
         }
     }
-    // Format badge
     if let Some(ref fmt) = update.format {
-        format_badge.set_text(fmt);
-        format_badge.set_visible(true);
+        w.format_badge.set_text(fmt);
+        w.format_badge.set_visible(true);
     } else {
-        format_badge.set_visible(false);
+        w.format_badge.set_visible(false);
     }
     match update.state.as_str() {
-        "play" => icon.set_text("▶"),
-        "pause" => icon.set_text("⏸"),
-        "stop" | "" => icon.set_text("⏹"),
+        "play" => w.icon.set_text("▶"),
+        "pause" => w.icon.set_text("⏸"),
+        "stop" | "" => w.icon.set_text("⏹"),
         _ => {
             log::warn!("Unknown playback state: {}", update.state);
-            icon.set_text("⏹");
+            w.icon.set_text("⏹");
         }
     }
 }

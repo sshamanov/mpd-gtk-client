@@ -1,16 +1,13 @@
 //! Application entry point — initializes env_logger, creates state, starts GTK main loop. Thread: UI (startup then GTK main loop).
 
-mod app;
-mod config;
+pub mod config;
 pub mod constants;
 pub mod coverart;
 pub mod errors;
 pub mod mpd;
-pub mod presenters;
 pub mod search;
 pub mod state;
 pub mod ui;
-pub mod utils;
 
 use log::info;
 use mpd::state_machine::{MpdEvent, MpdEventLoop};
