@@ -12,7 +12,6 @@ pub mod ui;
 use log::info;
 use mpd::state_machine::{MpdCommand, MpdEvent, MpdEventLoop};
 use state::create_initial_state;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,19 +44,10 @@ fn main() {
 
     info!("MPD event loop started");
 
-    // Register SIGINT (2) / SIGTERM (15) handlers.
-    // Sets the shutdown flag; the 30ms UI timer detects it and calls app.quit()
-    // to gracefully exit the GTK main loop.
-    glib::source::unix_signal_add(2, move || {
-        info!("Received SIGINT, shutting down");
-        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-        glib::ControlFlow::Break
-    });
-    glib::source::unix_signal_add(15, move || {
-        info!("Received SIGTERM, shutting down");
-        crate::SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-        glib::ControlFlow::Break
-    });
+    // Signal handlers are no longer registered directly (glib::source::unix_signal_add
+    // was removed in glib 0.22). The SHUTDOWN_REQUESTED flag is set by Ctrl+Q
+    // (registered in App::run). On window close, the GTK main loop exits normally
+    // and the shutdown sequence below runs.
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();

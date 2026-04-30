@@ -7,12 +7,95 @@ use crate::mpd::state_machine::{MpdCommand, MpdEvent, PlaybackUpdate};
 use crate::search::SearchIndex;
 use crate::state::SharedState;
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, Box, EventControllerKey, FlowBox, Label, ListBox, Orientation, Paned, Picture, ScrolledWindow};
+use gtk4::gio::ListStore;
+use gtk4::{Application, ApplicationWindow, Box, Button, EventControllerKey, GridView, Label, ListBox, NoSelection, Orientation, Overlay, Paned, Picture, ScrolledWindow, SignalListItemFactory, StringObject};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use widgets::album_cover;
+
+/// Album grid item types with pre-computed placeholder RGB.
+#[derive(Clone)]
+enum AlbumGridItem {
+    Header { name: String, count: u32 },
+    Album { artist: String, name: String, album_id: String, pr: f64, pg: f64, pb: f64 },
+}
+
+/// Backing data store for the album grid.
+type AlbumGridData = std::rc::Rc<std::cell::RefCell<Vec<AlbumGridItem>>>;
+
+/// Store a string value on a GLib Object (safe wrapper for use in factory closures).
+unsafe fn widget_set_str(w: &impl IsA<glib::Object>, key: &str, val: &str) {
+    unsafe { w.set_data(key, val.to_string()); }
+}
+/// Read a string previously stored with widget_set_str.
+unsafe fn widget_get_str(w: &impl IsA<glib::Object>, key: &str) -> Option<String> {
+    unsafe { w.data::<String>(key).map(|p| p.as_ref().clone()) }
+}
+
+/// Pre-compute placeholder RGB from an artist name.
+fn placeholder_rgb(artist: &str) -> (f64, f64, f64) {
+    let hash: u64 = artist.bytes().fold(0xcbf29ce484222325u64, |acc, b| {
+        (acc ^ (b as u64)).wrapping_mul(0x100000001b3)
+    });
+    let h = ((hash & 0xFF) as f64) / 255.0;
+    let s = 0.35_f64;
+    let l = 0.55_f64;
+    let c = (1.0_f64 - (2.0_f64 * l - 1.0_f64).abs()) * s;
+    let x = c * (1.0_f64 - ((h * 6.0_f64) % 2.0_f64 - 1.0_f64).abs());
+    let m = l - c / 2.0_f64;
+    let (r1, g1, b1) = if h < 1.0 / 6.0 { (c, x, 0.0) }
+        else if h < 2.0 / 6.0 { (x, c, 0.0) }
+        else if h < 3.0 / 6.0 { (0.0, c, x) }
+        else if h < 4.0 / 6.0 { (0.0, x, c) }
+        else if h < 5.0 / 6.0 { (x, 0.0, c) }
+        else { (c, 0.0, x) };
+    (r1 + m, g1 + m, b1 + m)
+}
+
+/// Data key used for storing album name on overlay widgets (for button closures).
+const WIDGET_ALBUM_KEY: &str = "g-album";
+
+/// Batch-populate a ListStore from AlbumGridItem data using StringObject indices.
+/// Adds items in batches of 16 per idle cycle for responsive loading.
+/// Uses an incrementing generation counter to cancel stale in-flight populates.
+fn batch_populate(model: &ListStore, backing: &AlbumGridData, items: Vec<AlbumGridItem>,
+                  cover_widgets: &std::rc::Rc<std::cell::RefCell<HashMap<String, gtk4::Picture>>>
+                  ) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // Cancel previous in-flight populate by incrementing generation.
+    // The generation lives on the model as widget data.
+    let cur_gen = unsafe {
+        model.data::<u64>("bp-gen")
+            .map(|p| p.as_ref().wrapping_add(1))
+            .unwrap_or(1)
+    };
+    unsafe { model.set_data("bp-gen", cur_gen); }
+
+    cover_widgets.borrow_mut().clear();
+    model.remove_all();
+    *backing.borrow_mut() = items;
+    let total = backing.borrow().len();
+    if total == 0 { return; }
+
+    let m = model.clone();
+    let pos = Rc::new(Cell::new(0usize));
+    glib::idle_add_local(move || {
+        // Abort if this populate was superseded
+        if unsafe { m.data::<u64>("bp-gen") }.map_or(true, |p| unsafe { *p.as_ref() } != cur_gen) {
+            return glib::ControlFlow::Break;
+        }
+        let start = pos.get();
+        let end = std::cmp::min(start + 16, total);
+        for i in start..end {
+            m.append(&StringObject::new(&i.to_string()));
+        }
+        pos.set(end);
+        if end >= total { glib::ControlFlow::Break } else { glib::ControlFlow::Continue }
+    });
+}
 
 type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;
 
@@ -126,12 +209,237 @@ impl App {
             let left_scroll = ScrolledWindow::new();
             left_scroll.set_vexpand(true);
             left_scroll.set_hexpand(true);
-            let album_grid = FlowBox::new();
+
+            // --- GtkGridView + factory for virtualized album grid ---
+            let album_model: ListStore = ListStore::builder()
+                .item_type(StringObject::static_type())
+                .build();
+            let album_factory = SignalListItemFactory::new();
+            let album_grid_data: AlbumGridData = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let left_stack = gtk4::Stack::new();
-            album_grid.set_min_children_per_line(1);
-            album_grid.set_homogeneous(true);
-            album_grid.set_selection_mode(gtk4::SelectionMode::Single);
-            album_grid.set_activate_on_single_click(false);
+
+            // Shared cover tracking
+            let cover_paths: std::rc::Rc<std::cell::RefCell<HashMap<String, Option<String>>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+            let cover_widgets: std::rc::Rc<std::cell::RefCell<HashMap<String, gtk4::Picture>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+
+            // Factory setup: create widget shell for each recycled list item.
+            // Both header and album widgets are created; visibility toggled in bind.
+            let setup_tx = cmd_tx.clone();
+            album_factory.connect_setup(move |_factory, item| {
+                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+                let container = Box::new(Orientation::Vertical, 0);
+                container.set_size_request(200, 250);
+                container.set_css_classes(&["album-cover-cell"]);
+
+                // Header label — hidden by default
+                let header_label = Label::new(None);
+                header_label.set_halign(gtk4::Align::Start);
+                header_label.set_valign(gtk4::Align::Center);
+                header_label.set_size_request(200, 250);
+                header_label.set_css_classes(&["album-group-header"]);
+                header_label.set_visible(false);
+                container.append(&header_label);
+
+                // Album content — hidden by default
+                let album_section = Box::new(Orientation::Vertical, 0);
+                album_section.set_visible(false);
+
+                let overlay = Overlay::new();
+                let cover_area = Box::new(Orientation::Vertical, 0);
+                cover_area.set_size_request(200, 200);
+
+                let placeholder = gtk4::DrawingArea::new();
+                placeholder.set_size_request(200, 200);
+                cover_area.append(&placeholder);
+
+                let cover_image = Picture::new();
+                cover_image.set_widget_name("cover-image");
+                cover_image.set_size_request(200, 200);
+                cover_image.set_halign(gtk4::Align::Center);
+                cover_image.set_valign(gtk4::Align::Center);
+                cover_image.set_visible(false);
+                cover_area.append(&cover_image);
+
+                overlay.set_child(Some(&cover_area));
+
+                // Hover buttons — album name read from overlay at click time
+                let tx_add = setup_tx.clone();
+                let btn_add = Button::with_label("+");
+                btn_add.set_css_classes(&["album-cover-hover-btn"]);
+                btn_add.set_tooltip_text(Some("Add to queue"));
+                btn_add.connect_clicked(move |btn| {
+                    let name = btn.parent().and_then(|p| p.parent())
+                        .and_then(|p| unsafe { widget_get_str(&p, WIDGET_ALBUM_KEY) });
+                    if let Some(n) = name { let _ = tx_add.send(MpdCommand::Add(n)); }
+                });
+
+                let tx_next = setup_tx.clone();
+                let btn_next = Button::with_label("<-");
+                btn_next.set_css_classes(&["album-cover-hover-btn"]);
+                btn_next.set_tooltip_text(Some("Play next"));
+                btn_next.connect_clicked(move |btn| {
+                    let name = btn.parent().and_then(|p| p.parent())
+                        .and_then(|p| unsafe { widget_get_str(&p, WIDGET_ALBUM_KEY) });
+                    if let Some(n) = name { let _ = tx_next.send(MpdCommand::InsertNext(n)); }
+                });
+
+                let tx_play = setup_tx.clone();
+                let btn_play = Button::with_label(">");
+                btn_play.set_css_classes(&["album-cover-hover-btn"]);
+                btn_play.set_tooltip_text(Some("Clear queue and play"));
+                btn_play.connect_clicked(move |btn| {
+                    let name = btn.parent().and_then(|p| p.parent())
+                        .and_then(|p| unsafe { widget_get_str(&p, WIDGET_ALBUM_KEY) });
+                    if let Some(n) = name { let _ = tx_play.send(MpdCommand::PlayAlbum(n)); }
+                });
+
+                let btn_box = Box::new(Orientation::Horizontal, 2);
+                btn_box.set_halign(gtk4::Align::End);
+                btn_box.set_valign(gtk4::Align::End);
+                btn_box.set_margin_bottom(4);
+                btn_box.set_margin_end(4);
+                btn_box.append(&btn_add);
+                btn_box.append(&btn_next);
+                btn_box.append(&btn_play);
+                overlay.add_overlay(&btn_box);
+                btn_box.set_sensitive(false);
+
+                let btn_sense = btn_box.clone();
+                let motion = gtk4::EventControllerMotion::new();
+                let btn_sense_e = btn_sense.clone();
+                motion.connect_enter(move |_m, _x, _y| { btn_sense.set_sensitive(true); });
+                motion.connect_leave(move |_m| { btn_sense_e.set_sensitive(false); });
+                overlay.add_controller(motion);
+
+                album_section.append(&overlay);
+
+                let title_label = Label::new(None);
+                title_label.set_halign(gtk4::Align::Start);
+                title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                title_label.set_max_width_chars(18);
+                title_label.set_lines(1);
+                album_section.append(&title_label);
+
+                let artist_label = Label::new(None);
+                artist_label.set_halign(gtk4::Align::Start);
+                artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                artist_label.set_max_width_chars(18);
+                artist_label.set_lines(1);
+                album_section.append(&artist_label);
+
+                // Store album section index in container for bind to find
+                container.append(&album_section);
+                list_item.set_child(Some(&container));
+            });
+
+            // Factory bind: populate widget from model data
+            let bind_cp = cover_paths.clone();
+            let bind_cw = cover_widgets.clone();
+            let bind_data = album_grid_data.clone();
+            album_factory.connect_bind(move |_factory, item| {
+                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+                let Some(obj) = list_item.item() else { return; };
+                let Some(so) = obj.downcast_ref::<StringObject>() else { return; };
+                let idx: usize = match so.string().parse() { Ok(i) => i, Err(_) => return };
+                let binding = bind_data.borrow();
+                let Some(item_data) = binding.get(idx) else { return };
+                let container = list_item.child().and_then(|c| c.downcast::<Box>().ok());
+                let Some(container) = container else { return };
+
+                // Find header label (first child) and album_section (second child)
+                let children: Vec<gtk4::Widget> = {
+                    let mut v = Vec::new();
+                    let mut child = container.first_child();
+                    while let Some(c) = child { v.push(c.clone()); child = c.next_sibling(); }
+                    v
+                };
+                let header_w = children.first().and_then(|c| c.clone().downcast::<Label>().ok());
+                let album_w = children.get(1).and_then(|c| c.clone().downcast::<Box>().ok());
+
+                match item_data {
+                    AlbumGridItem::Header { name, count } => {
+                        if let Some(ref lbl) = header_w { lbl.set_text(&format!("{} ({})", name, count)); lbl.set_visible(true); }
+                        if let Some(ref section) = album_w { section.set_visible(false); }
+                    }
+                    AlbumGridItem::Album { artist, name, album_id: _id, pr, pg, pb } => {
+                        if let Some(ref lbl) = header_w { lbl.set_visible(false); }
+                        if let Some(ref section) = album_w {
+                            section.set_visible(true);
+                            // Store album name on overlay for button closures
+                            if let Some(overlay) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
+                                unsafe { widget_set_str(&overlay, WIDGET_ALBUM_KEY, name); }
+                            }
+                            // Update title (second child of section, after overlay)
+                            if let Some(t) = section.first_child()
+                                .and_then(|c| c.next_sibling())
+                                .and_then(|c| c.downcast::<Label>().ok()) { t.set_text(name); }
+                            // Update artist (third child of section)
+                            if let Some(a) = section.first_child()
+                                .and_then(|c| c.next_sibling())
+                                .and_then(|c| c.next_sibling())
+                                .and_then(|c| c.downcast::<Label>().ok()) {
+                                let da = if artist.is_empty() { "Unknown Artist" } else { artist.as_str() };
+                                a.set_text(da);
+                            }
+                            // Update cover area
+                            if let Some(overlay) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
+                                if let Some(ca) = overlay.child().and_then(|c| c.downcast::<Box>().ok()) {
+                                    let has_cov = bind_cp.borrow().get(name).and_then(|o| o.as_deref()).is_some();
+                                    // Placeholder (first child of cover_area)
+                                    if let Some(pl) = ca.first_child().and_then(|c| c.downcast::<gtk4::DrawingArea>().ok()) {
+                                        pl.set_visible(!has_cov);
+                                        let (rp, gp, bp) = (*pr, *pg, *pb);
+                                        pl.set_draw_func(move |_area, cr, _w, _h| {
+                                            cr.set_source_rgb(rp, gp, bp);
+                                            let _ = cr.paint();
+                                        });
+                                    }
+                                    // Cover image (second child of cover_area)
+                                    if let Some(pic) = ca.first_child()
+                                        .and_then(|c| c.next_sibling())
+                                        .and_then(|c| c.downcast::<Picture>().ok()) {
+                                        if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
+                                            pic.set_filename(Some(p));
+                                            pic.set_visible(true);
+                                        } else {
+                                            pic.set_visible(false);
+                                        }
+                                        // Register for async cover updates
+                                        bind_cw.borrow_mut().insert(name.clone(), pic.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Factory unbind: no-op — cover_widgets is cleared on each batch_populate.
+            album_factory.connect_unbind(|_, _| {});
+
+            let selection = NoSelection::new(Some(album_model.clone()));
+            let album_grid = GridView::new(Some(selection.clone()), Some(album_factory.clone()));
+            album_grid.set_min_columns(1);
+
+            // Double-click / Enter activates the item
+            let activate_data = album_grid_data.clone();
+            let activate_tx = cmd_tx.clone();
+            album_grid.connect_activate(move |grid, position| {
+                if let Some(model) = grid.model() {
+                    if let Some(item) = model.item(position) {
+                        if let Some(so) = item.downcast_ref::<StringObject>() {
+                            if let Ok(idx) = so.string().parse::<usize>() {
+                                let binding = activate_data.borrow();
+                                if let Some(AlbumGridItem::Album { name, .. }) = binding.get(idx) {
+                                    let _ = activate_tx.send(MpdCommand::PlayAlbum(name.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             // Loading / empty-state labels
             let loading_label = Label::new(Some("Connecting to MPD..."));
@@ -143,35 +451,6 @@ impl App {
             empty_label.set_valign(gtk4::Align::Center);
             empty_label.set_visible(false);
             empty_label.set_widget_name("album-grid-status");
-
-            // Compute initial columns from default window width
-            let init_width = (1200.0 * crate::constants::SHELL_SPLIT_RATIO) as i32;
-            let n = (init_width as f64 / 210.0).ceil().max(1.0) as u32;
-            album_grid.set_max_children_per_line(n);
-
-            // Shared album name store for double-click handler
-            let album_names = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
-            let dbl_tx = cmd_tx.clone();
-            let an_dbl = album_names.clone();
-            album_grid.connect_child_activated(move |_grid, child| {
-                let idx = child.index() as usize;
-                if let Ok(store) = an_dbl.lock() {
-                    if let Some(Some(name)) = store.get(idx) {
-                        let _ = dbl_tx.send(MpdCommand::PlayAlbum(name.clone()));
-                    }
-                }
-            });
-
-            // Wire selected_album_id to AppState
-            let state_sel = state.clone();
-            album_grid.connect_selected_children_changed(move |grid| {
-                let id = grid.selected_children()
-                    .first()
-                    .map(|w| w.widget_name().to_string());
-                if let Ok(mut s) = state_sel.write() {
-                    s.album_browsing.selected_album_id = id;
-                }
-            });
 
             left_stack.add_child(&loading_label);
             left_stack.add_child(&empty_label);
@@ -291,7 +570,9 @@ impl App {
             let se_index = search_index.clone();
             let se_grid = album_grid.clone();
             let se_stack = left_stack.clone();
-            let se_album_names = album_names.clone();
+            let se_model = album_model.clone();
+            let se_data = album_grid_data.clone();
+            let se_cw = cover_widgets.clone();
             search_entry.connect_search_changed(move |entry| {
                 let q = entry.text().to_string();
 
@@ -329,8 +610,10 @@ impl App {
                 let idx = se_index.clone();
                 let g = se_grid.clone();
                 let s = se_stack.clone();
-                let an = se_album_names.clone();
                 let tx = se_tx.clone();
+                let m = se_model.clone();
+                let d = se_data.clone();
+                let cw = se_cw.clone();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(150),
                     move || {
@@ -339,11 +622,19 @@ impl App {
                         let Ok(index) = idx.read() else { return; };
                         let results = index.search(&qc);
                         if !results.is_empty() {
-                            let names: Vec<Option<String>> = results.iter().map(|r: &(String, String)| Some(r.1.clone())).collect();
-                            if let Ok(mut store) = an.lock() { *store = names; }
-                            let empty_covers = std::collections::HashMap::new();
-                            let empty_widgets = CoverWidgets::new(std::collections::HashMap::new());
-                            populate_album_grid(&g, &results, &tx, &empty_covers, &empty_widgets);
+                            let items: Vec<AlbumGridItem> = results.iter()
+                                .enumerate()
+                                .map(|(i, (artist, name))| {
+                                    let (pr, pg, pb) = placeholder_rgb(artist);
+                                    AlbumGridItem::Album {
+                                        artist: artist.clone(),
+                                        name: name.clone(),
+                                        album_id: format!("search-{i}"),
+                                        pr, pg, pb,
+                                    }
+                                })
+                                .collect();
+                            batch_populate(&m, &d, items, &cw);
                             s.set_visible_child(&g);
                         } else {
                             // Fall back to MPD search
@@ -655,9 +946,12 @@ impl App {
             let ids_w = item_ids_w.clone();
             let si_c = search_index.clone();
             let toast_q = toast.clone();
-            let cover_paths: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-            let cover_widgets: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>> = std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-            let cp_np = cover_paths.clone();
+            // Reuse the factory-scoped cover_paths/cover_widgets (clone Rc for this move closure)
+            let ev_cover_paths = cover_paths.clone();
+            let ev_cover_widgets = cover_widgets.clone();
+            let cp_np = ev_cover_paths.clone();
+            let ev_model = album_model.clone();
+            let ev_data = album_grid_data.clone();
             let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
             let shutdown_app = shutdown_app.clone();
 
@@ -720,12 +1014,19 @@ impl App {
                                 empty_c.set_text("No albums found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<Option<String>> = albums.iter().map(|(_, n)| Some(n.clone())).collect();
-                                if let Ok(mut store) = album_names.lock() {
-                                    *store = names;
-                                }
-                                let cp = cover_paths.borrow().clone();
-                                populate_album_grid(&grid_c, &albums, &cmd_c, &cp, &cover_widgets);
+                                let items: Vec<AlbumGridItem> = albums.iter()
+                                    .enumerate()
+                                    .map(|(i, (artist, name))| {
+                                        let (pr, pg, pb) = placeholder_rgb(artist);
+                                        AlbumGridItem::Album {
+                                            artist: artist.clone(),
+                                            name: name.clone(),
+                                            album_id: format!("album-{i}"),
+                                            pr, pg, pb,
+                                        }
+                                    })
+                                    .collect();
+                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
                                 let covers_for_fetch = albums.clone();
                                 let _ = cmd_c.send(MpdCommand::FetchCovers(covers_for_fetch));
@@ -738,16 +1039,6 @@ impl App {
                                 empty_c.set_text("No albums found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<Option<String>> = groups.iter()
-                                    .flat_map(|(_, albums)| {
-                                        let mut items: Vec<Option<String>> = vec![None]; // group header
-                                        items.extend(albums.iter().map(|(_, n)| Some(n.clone())));
-                                        items
-                                    })
-                                    .collect();
-                                if let Ok(mut store) = album_names.lock() {
-                                    *store = names;
-                                }
                                 // Only rebuild search index if flat list changed
                                 let need_index = if let Ok(idx) = search_index.read() {
                                     idx.album_count() != flat.len()
@@ -755,10 +1046,27 @@ impl App {
                                 if need_index {
                                     if let Ok(mut idx) = search_index.write() { idx.build(&flat); }
                                 }
-                                let cp = cover_paths.borrow().clone();
-                                populate_grouped_grid(&grid_c, &groups, &cmd_c, &cp, &cover_widgets);
+                                let items: Vec<AlbumGridItem> = groups.iter()
+                                    .flat_map(|(header, albums)| {
+                                        let mut group_items: Vec<AlbumGridItem> = Vec::new();
+                                        group_items.push(AlbumGridItem::Header {
+                                            name: header.clone(),
+                                            count: albums.len() as u32,
+                                        });
+                                        for (artist, name) in albums {
+                                            let (pr, pg, pb) = placeholder_rgb(artist);
+                                            group_items.push(AlbumGridItem::Album {
+                                                artist: artist.clone(),
+                                                name: name.clone(),
+                                                album_id: format!("{}-{}", header, name),
+                                                pr, pg, pb,
+                                            });
+                                        }
+                                        group_items
+                                    })
+                                    .collect();
+                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
-                                // Only trigger cover fetch if we didn't already
                                 if need_index {
                                     let _ = cmd_c.send(MpdCommand::FetchCovers(flat));
                                 }
@@ -769,12 +1077,19 @@ impl App {
                                 empty_c.set_text("No results found");
                                 stack_c.set_visible_child(&empty_c);
                             } else {
-                                let names: Vec<Option<String>> = results.iter().map(|(_, n)| Some(n.clone())).collect();
-                                if let Ok(mut store) = album_names.lock() {
-                                    *store = names;
-                                }
-                                let cp = cover_paths.borrow().clone();
-                                populate_album_grid(&grid_c, &results, &cmd_c, &cp, &cover_widgets);
+                                let items: Vec<AlbumGridItem> = results.iter()
+                                    .enumerate()
+                                    .map(|(i, (artist, name))| {
+                                        let (pr, pg, pb) = placeholder_rgb(artist);
+                                        AlbumGridItem::Album {
+                                            artist: artist.clone(),
+                                            name: name.clone(),
+                                            album_id: format!("search-{i}"),
+                                            pr, pg, pb,
+                                        }
+                                    })
+                                    .collect();
+                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
                                 stack_c.set_visible_child(&grid_c);
                             }
                         }
@@ -871,8 +1186,8 @@ impl App {
                             *ids_w.borrow_mut() = item_ids;
                         }
                         MpdEvent::CoverPaths(paths) => {
-                            let mut cp = cover_paths.borrow_mut();
-                            let widgets = cover_widgets.borrow();
+                            let mut cp = ev_cover_paths.borrow_mut();
+                            let widgets = ev_cover_widgets.borrow();
                             for (album, path) in &paths {
                                 log::info!("[UI] cover path: '{album}' -> {:?}", path);
                                 cp.insert(album.clone(), path.clone());
@@ -947,54 +1262,6 @@ impl App {
         });
 
         application.run();
-    }
-}
-
-/// Populate the album grid with group headers and album cells.
-type CoverWidgets = std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>;
-
-fn populate_grouped_grid(grid: &FlowBox, groups: &[(String, Vec<(String, String)>)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>, cover_widgets: &CoverWidgets) {
-    while let Some(child) = grid.first_child() {
-        grid.remove(&child);
-    }
-    grid.set_homogeneous(true);
-
-    for (header, albums) in groups {
-        // Header label styled as bold, sized same as cover cells
-        let header_label = Label::new(Some(&format!("{} ({})", header, albums.len())));
-        header_label.set_halign(gtk4::Align::Start);
-        header_label.set_valign(gtk4::Align::Center);
-        header_label.set_size_request(200, 250);
-        header_label.set_css_classes(&["album-group-header"]);
-        header_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        grid.append(&header_label);
-
-        for (i, (artist, album_name)) in albums.iter().enumerate() {
-            let album_id = format!("{header}-album-{i}");
-            let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
-            let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
-            let cell = album_cover::create_album_cover(
-                &album_id, album_name, album_name, display_artist, cover_path, cover_widgets, cmd_tx.clone());
-            grid.append(&cell);
-        }
-    }
-}
-
-/// Populate the album grid from loaded album data.
-/// Each cell gets hover buttons wired to cmd_tx for MPD commands.
-fn populate_album_grid(grid: &FlowBox, albums: &[(String, String)], cmd_tx: &mpsc::Sender<MpdCommand>, cover_paths: &std::collections::HashMap<String, Option<String>>, cover_widgets: &CoverWidgets) {
-    while let Some(child) = grid.first_child() {
-        grid.remove(&child);
-    }
-    grid.set_homogeneous(true);
-
-    for (i, (artist, album_name)) in albums.iter().enumerate() {
-        let album_id = format!("album-{i}");
-        let display_artist = if artist.is_empty() { "Unknown Artist" } else { artist };
-        let cover_path = cover_paths.get(album_name).and_then(|o| o.as_deref());
-        let cell = album_cover::create_album_cover(
-            &album_id, album_name, album_name, display_artist, cover_path, cover_widgets, cmd_tx.clone());
-        grid.append(&cell);
     }
 }
 
