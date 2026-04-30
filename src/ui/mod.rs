@@ -1049,6 +1049,7 @@ impl App {
             let fc_vadj = left_scroll.vadjustment();
             let fc_vadj_grid = album_grid.clone();
             let fc_current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            let fc_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
             let fc_shutdown = shutdown_app.clone();
 
             window.add_tick_callback(move |_widget, _fc| {
@@ -1096,6 +1097,7 @@ impl App {
                         }
                         MpdEvent::StateChanged(update) => {
                             fc_current_song_pos.set(update.song.map(|s| s as i32));
+                            *fc_current_album.borrow_mut() = update.album.clone();
                             update_now_playing(NowPlayingWidgets {
     title: &fc_tl,
     artist: &fc_ar,
@@ -1331,6 +1333,31 @@ impl App {
                                         log::warn!("[UI] cover: no widget registered for '{album}'");
                                     }
                                 }
+                            }
+                        }
+                        MpdEvent::CoverRefreshed { album_id, data } => {
+                            log::info!("[UI] cover refreshed: '{album_id}' ({} bytes)", data.len());
+                            // Decode raw JPEG bytes into a GdkTexture via gdk-pixbuf.
+                            // Own the data to satisfy gdk-pixbuf's 'static + Send bound.
+                            let owned = data.to_vec();
+                            let cursor = std::io::Cursor::new(owned);
+                            if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_read(cursor) {
+                                let texture = gdk4::Texture::for_pixbuf(&pixbuf);
+                                // Update album grid widget in-place (widget registry lookup)
+                                if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
+                                    pic.set_paintable(Some(&texture));
+                                    pic.set_visible(true);
+                                    pic.queue_draw();
+                                } else {
+                                    log::warn!("[UI] cover refresh: no grid widget registered for '{album_id}'");
+                                }
+                                // Also update now-playing cover if this is the current album
+                                if fc_current_album.borrow().as_deref() == Some(&album_id) {
+                                    fc_np_cover.set_paintable(Some(&texture));
+                                    fc_np_cover.set_visible(true);
+                                }
+                            } else {
+                                log::warn!("[UI] cover refresh failed: couldn't decode image for '{album_id}'");
                             }
                         }
                         MpdEvent::LibraryChanged => {

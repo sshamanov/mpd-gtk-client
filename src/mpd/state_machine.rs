@@ -52,6 +52,8 @@ pub enum MpdEvent {
     Queue(Vec<crate::mpd::QueueEntry>),
     LibraryChanged,
     CoverPaths(std::collections::HashMap<String, Option<String>>),
+    /// Cover art data fetched by ActualRead, carrying raw JPEG bytes for direct texture decode.
+    CoverRefreshed { album_id: String, data: Vec<u8> },
     Error(String),
 }
 

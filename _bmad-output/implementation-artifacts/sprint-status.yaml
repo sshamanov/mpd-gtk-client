@@ -109,5 +109,5 @@ development_status:
   13-1-coverprovider-cache-read: done
   13-2-actualread-background-fetch: done
   13-3-scroll-aware-cover-loading: done
-  13-4-widget-registry-in-place-updates: backlog
+  13-4-widget-registry-in-place-updates: done
   13-5-online-cover-lookup: backlog

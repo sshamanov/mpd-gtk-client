@@ -143,9 +143,10 @@ impl ActualRead {
             }
         }
 
-        // New data — write cache and emit
+        // New data — write cache and emit both CoverPaths (path-based) and CoverRefreshed (raw bytes)
         self.write_cache(album_name, data, &md5, None);
         self.emit_cover_path(album_name, &md5, event_tx);
+        self.emit_cover_refreshed(album_name, data, event_tx);
         provider.update_entry(album_name, &md5, None);
         true
     }
@@ -176,9 +177,10 @@ impl ActualRead {
             }
         }
 
-        // New data — write cache and emit
+        // New data — write cache and emit both CoverPaths (path-based) and CoverRefreshed (raw bytes)
         self.write_cache(album_name, data, &md5, Some(mtime));
         self.emit_cover_path(album_name, &md5, event_tx);
+        self.emit_cover_refreshed(album_name, data, event_tx);
         provider.update_entry(album_name, &md5, Some(mtime));
     }
 
@@ -213,11 +215,21 @@ impl ActualRead {
                 Some(jpeg_path.to_string_lossy().to_string()),
             );
         } else {
-            // Cache write failed, but we still want to signal the UI
-            // In future stories (13.4), CoverRefreshed with raw bytes will handle this
             covers.insert(album_name.to_string(), None);
         }
         let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
+    }
+
+    /// Emit a CoverRefreshed event for the given album, carrying raw JPEG bytes.
+    ///
+    /// The UI thread decodes the raw bytes into a GdkTexture via gdk-pixbuf for
+    /// direct widget updates — no path-based handoff needed. This complements
+    /// `emit_cover_path` which carries the file path for backward compat.
+    fn emit_cover_refreshed(&self, album_name: &str, data: &[u8], event_tx: &EventSender) {
+        let _ = event_tx.try_send(MpdEvent::CoverRefreshed {
+            album_id: album_name.to_string(),
+            data: data.to_vec(),
+        });
     }
 
     /// Update the index.json sidecar file with a new or updated entry.
