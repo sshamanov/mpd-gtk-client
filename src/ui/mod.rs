@@ -754,8 +754,22 @@ impl App {
                 fs_browser2.borrow().container.set_visible(true);
             });
 
+            // Pinned group header (visible during scroll in grouped views)
+            let pinned_header = Label::new(None);
+            pinned_header.set_css_classes(&["album-group-header", "pinned-group-header"]);
+            pinned_header.set_visible(false);
+
+            // Wrap the scroll area in an overlay for the pinned group header
+            let album_overlay = gtk4::Overlay::new();
+            album_overlay.set_child(Some(&left_scroll));
+            pinned_header.set_halign(gtk4::Align::Start);
+            pinned_header.set_valign(gtk4::Align::Start);
+            pinned_header.set_margin_start(8);
+            pinned_header.set_margin_top(4);
+            album_overlay.add_overlay(&pinned_header);
+
             album_content.append(&search_entry);
-            album_content.append(&left_scroll);
+            album_content.append(&album_overlay);
             paned.set_start_child(Some(&left_pane_box));
 
             // --- Right rail ---
@@ -1099,6 +1113,38 @@ impl App {
             // add_tick_callback fires once per display refresh (vsync-aligned).
             // Replaces the fixed 30ms timer that could fire mid-frame or during
             // layout passes, which starved the GTK main loop under heavy load.
+            // --- Pinned group header: track which group is at the top of the viewport ---
+            let ph_backing = album_grid_data.clone();
+            let ph_grid = album_grid.clone();
+            let ph_label = pinned_header.clone();
+            let ph_adj = left_scroll.vadjustment();
+            ph_adj.connect_value_changed(move |adj| {
+                let binding = ph_backing.borrow();
+                // Only show pinned header when there are Header items (grouped view)
+                let has_headers = binding.iter().any(|item| matches!(item, AlbumGridItem::Header { .. }));
+                if !has_headers {
+                    ph_label.set_visible(false);
+                    return;
+                }
+                // Estimate first visible item from scroll position
+                let first_visible = (adj.value() / (adj.page_size().max(1.0) / binding.len().max(1) as f64)).max(0.0) as usize;
+                let idx = first_visible.min(binding.len().saturating_sub(1));
+                // Walk backward to find the nearest preceding Header
+                let header = (0..=idx).rev().find_map(|i| {
+                    if let AlbumGridItem::Header { name, .. } = &binding[i] {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(name) = header {
+                    ph_label.set_text(&name);
+                    ph_label.set_visible(true);
+                } else {
+                    ph_label.set_visible(false);
+                }
+            });
+
             let fc_rx = event_rx.clone();
             let fc_ci = conn_indicator.clone();
             let fc_tl = track_title.clone();
@@ -1535,6 +1581,7 @@ impl App {
                  .album-cover-hover-btn { opacity: 0; transition: opacity 150ms ease-in-out; min-width: 24px; min-height: 24px; padding: 2px; }
                  .album-cover-cell:hover .album-cover-hover-btn { opacity: 1; }
                  .album-group-header { font-weight: bold; font-size: 1.1em; padding: 4px 8px; }
+                 .pinned-group-header { background-color: @theme_base_color; border-bottom: 1px solid @borders; }
                  .group-select-btn:checked { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }
                  #album-grid-status { color: gray; font-style: italic; padding: 24px; }
                  .breadcrumb-current { font-weight: bold; }
