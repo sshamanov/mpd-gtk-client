@@ -9,14 +9,21 @@ pub struct Config {
     pub mpd_host: String,
     #[serde(default = "default_port")]
     pub mpd_port: u16,
+    #[serde(default = "default_split_ratio")]
+    pub split_ratio: f64,
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
+fn default_split_ratio() -> f64 { 0.7 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { mpd_host: default_host(), mpd_port: default_port() }
+        Self {
+            mpd_host: default_host(),
+            mpd_port: default_port(),
+            split_ratio: default_split_ratio(),
+        }
     }
 }
 

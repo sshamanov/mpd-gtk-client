@@ -222,6 +222,7 @@ impl App {
         application.connect_activate(move |window_app| {
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
             let shutdown_app = window_app.clone();
+            let cfg = Config::load();
 
             let window = ApplicationWindow::builder()
                 .application(window_app)
@@ -786,12 +787,13 @@ impl App {
             settings_btn.set_halign(gtk4::Align::End);
             settings_btn.set_margin_end(4);
             settings_btn.set_margin_top(2);
-            let cfg = Config::load();
             let sw = window.clone();
             let btn_clone = settings_btn.clone();
             let cp_save = conn_params.clone();
             let stx = cmd_tx.clone();
+            let settings_paned = paned.clone();
             settings_btn.connect_clicked(move |_| {
+                let scfg = Config::load();
                 let d = gtk4::Window::new();
                 d.set_title(Some("Settings"));
                 d.set_transient_for(Some(&sw));
@@ -800,9 +802,9 @@ impl App {
                 content.set_margin_start(12); content.set_margin_end(12);
                 content.set_margin_top(8); content.set_margin_bottom(8);
                 let host_entry = gtk4::Entry::new();
-                host_entry.set_text(&cfg.mpd_host);
+                host_entry.set_text(&scfg.mpd_host);
                 let port_entry = gtk4::Entry::new();
-                port_entry.set_text(&cfg.mpd_port.to_string());
+                port_entry.set_text(&scfg.mpd_port.to_string());
                 content.append(&Label::new(Some("MPD Host:")));
                 content.append(&host_entry);
                 content.append(&Label::new(Some("MPD Port:")));
@@ -811,6 +813,14 @@ impl App {
                 port_error.set_css_classes(&["error-label"]);
                 port_error.set_visible(false);
                 content.append(&port_error);
+
+                content.append(&Label::new(Some("Split Ratio:")));
+                let split_adj = gtk4::Adjustment::new(scfg.split_ratio, 0.5, 0.9, 0.025, 0.1, 0.0);
+                let split_scale = gtk4::Scale::new(gtk4::Orientation::Horizontal, Some(&split_adj));
+                split_scale.set_draw_value(true);
+                split_scale.set_hexpand(true);
+                content.append(&split_scale);
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");
@@ -821,14 +831,18 @@ impl App {
                 let perr = port_error.clone();
                 let cp = cp_save.clone();
                 let tx = stx.clone();
+                let sa = split_adj.clone();
+                let sp = settings_paned.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.mpd_host = he.text().to_string();
+                    c.split_ratio = sa.value();
                     match pe.text().parse::<u16>() {
                         Ok(p) if p > 0 => {
                             c.mpd_port = p;
                             perr.set_visible(false);
                             let _ = c.save();
+                            sp.set_position((sp.width() as f64 * c.split_ratio) as i32);
                             // Update shared host/port and trigger reconnect
                             if let Ok(mut params) = cp.lock() {
                                 *params = (c.mpd_host.clone(), c.mpd_port);
@@ -1062,7 +1076,7 @@ impl App {
             window.set_child(Some(&main_overlay));
 
             let default_w = window.default_width().max(800) as f64;
-            paned.set_position((default_w * crate::constants::SHELL_SPLIT_RATIO) as i32);
+            paned.set_position((default_w * cfg.split_ratio) as i32);
 
             // Grid populates on startup via set_active(true) on the "Albums" button above
             let _ = cmd_tx.send(MpdCommand::ListQueue);
