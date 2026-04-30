@@ -15,6 +15,8 @@ use std::sync::mpsc;
 use md5::{Digest, Md5};
 
 use crate::coverart::CoverProvider;
+#[cfg(feature = "online-cover-art")]
+use crate::coverart::CoverOnlineProvider;
 use crate::mpd::MpdAdapter;
 use crate::mpd::state_machine::MpdEvent;
 
@@ -27,6 +29,9 @@ pub struct ActualRead {
     queue: VecDeque<(String, String)>,
     /// Cache directory path.
     cache_dir: PathBuf,
+    /// Online cover lookup provider (feature-gated, disabled by default).
+    #[cfg(feature = "online-cover-art")]
+    online: CoverOnlineProvider,
 }
 
 impl ActualRead {
@@ -35,6 +40,8 @@ impl ActualRead {
         Self {
             queue: VecDeque::new(),
             cache_dir,
+            #[cfg(feature = "online-cover-art")]
+            online: CoverOnlineProvider::new(),
         }
     }
 
@@ -63,16 +70,19 @@ impl ActualRead {
     /// 1. Pops the front album from the queue.
     /// 2. Primary: `adapter.albumart(uri)` — MD5 hash, compare against CoverProvider cache.
     /// 3. Fallback: `adapter.readpicture(uri)` — compare timestamp against cache.
-    /// 4. If new data: write cache file, update index.json, emit `CoverPaths`, invalidate CoverProvider.
-    /// 5. If unchanged: skip silently (no emission).
-    /// 6. If both fail: log at debug level, no emission.
+    /// 4. (optional) Online lookup (feature-gated, disabled by default).
+    /// 5. If new data: write cache file, update index.json, emit `CoverPaths`, invalidate CoverProvider.
+    /// 6. If unchanged: skip silently (no emission).
+    /// 7. If all fail: log at debug level, no emission.
     pub fn process_one(
         &mut self,
         adapter: &mut MpdAdapter,
         provider: &CoverProvider,
         event_tx: &EventSender,
     ) {
-        let Some((_artist, album_name)) = self.queue.pop_front() else {
+        // When online-cover-art is disabled, `artist` is unused; suppress the warning.
+        #[allow(unused_variables)]
+        let Some((artist, album_name)) = self.queue.pop_front() else {
             return;
         };
 
@@ -119,6 +129,10 @@ impl ActualRead {
                 log::debug!("[actual_read] readpicture failed for '{album_name}': {e}");
             }
         }
+
+        // Step 4: Fallback — online lookup (feature-gated, disabled by default)
+        #[cfg(feature = "online-cover-art")]
+        self.try_online_lookup(&artist, &album_name, provider, event_tx);
     }
 
     /// Handle albumart data: MD5 hash, compare with cache, write if new.
@@ -230,6 +244,36 @@ impl ActualRead {
             album_id: album_name.to_string(),
             data: data.to_vec(),
         });
+    }
+
+    /// Try to fetch cover art from online sources when MPD albumart + readpicture fail.
+    ///
+    /// This is gated behind the `online-cover-art` feature flag and only compiled when
+    /// the feature is enabled. On success, writes to cache + emits events like any other
+    /// cover source. On failure, silently returns (placeholder stays).
+    #[cfg(feature = "online-cover-art")]
+    fn try_online_lookup(
+        &mut self,
+        artist: &str,
+        album_name: &str,
+        provider: &CoverProvider,
+        event_tx: &EventSender,
+    ) {
+        let data = match self.online.lookup(artist, album_name) {
+            Some(d) => d,
+            None => return,
+        };
+
+        log::info!(
+            "[actual_read] Online cover fetched for '{album_name}' ({} bytes)",
+            data.len()
+        );
+
+        let md5 = format!("{:x}", Md5::digest(&data));
+        self.write_cache(album_name, &data, &md5, None);
+        self.emit_cover_path(album_name, &md5, event_tx);
+        self.emit_cover_refreshed(album_name, &data, event_tx);
+        provider.update_entry(album_name, &md5, None);
     }
 
     /// Update the index.json sidecar file with a new or updated entry.

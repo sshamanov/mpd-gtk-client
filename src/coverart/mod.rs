@@ -3,6 +3,10 @@
 
 pub mod actual_read;
 pub mod provider;
+#[cfg(feature = "online-cover-art")]
+pub mod online;
 
 pub use actual_read::ActualRead;
+#[cfg(feature = "online-cover-art")]
+pub use online::CoverOnlineProvider;
 pub use provider::{CachedCover, CoverProvider};
