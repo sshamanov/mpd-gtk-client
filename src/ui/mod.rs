@@ -97,6 +97,63 @@ fn batch_populate(model: &ListStore, backing: &AlbumGridData, items: Vec<AlbumGr
     });
 }
 
+/// Calculate which albums are in the visible viewport (plus a buffer of ±1 row)
+/// of the album grid, based on scroll position and estimated cell size.
+///
+/// Falls back to all albums when the layout hasn't settled yet (page_size == 0),
+/// which happens during initial population before the first allocation pass.
+fn calculate_visible_albums(
+    backing: &AlbumGridData,
+    vadj: &gtk4::Adjustment,
+    grid: &GridView,
+) -> Vec<(String, String)> {
+    let scroll_top = vadj.value();
+    let page_size = vadj.page_size();
+    let total_items = backing.borrow().len();
+    if total_items == 0 {
+        return vec![];
+    }
+
+    // Layout not yet settled — return all albums (safe fallback)
+    if page_size <= 0.0 {
+        let binding = backing.borrow();
+        return binding.iter().filter_map(|item| {
+            if let AlbumGridItem::Album { artist, name, .. } = item {
+                Some((artist.clone(), name.clone()))
+            } else {
+                None
+            }
+        }).collect();
+    }
+
+    // Estimate items per row from the grid's allocated width.
+    // Cell minimum width is 200px per size_request in factory setup.
+    let grid_width = grid.width() as f64;
+    let items_per_row = if grid_width > 0.0 {
+        std::cmp::max(1, (grid_width / 200.0_f64).floor() as usize)
+    } else {
+        // Unknown grid width — use a reasonable default for a typical window
+        4usize
+    };
+
+    // Cell minimum height is 250px per size_request.
+    let row_height = 250.0_f64;
+    let first_row = (scroll_top / row_height).floor() as usize;
+    let visible_rows = (page_size / row_height).ceil() as usize + 2; // +2 for buffer rows (±1)
+
+    let start_idx = first_row.saturating_mul(items_per_row);
+    let end_idx = (first_row + visible_rows).saturating_mul(items_per_row);
+
+    let binding = backing.borrow();
+    let mut visible = Vec::new();
+    for i in start_idx..end_idx.min(binding.len()) {
+        if let AlbumGridItem::Album { artist, name, .. } = &binding[i] {
+            visible.push((artist.clone(), name.clone()));
+        }
+    }
+    visible
+}
+
 type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;
 
 pub struct App {
@@ -929,6 +986,39 @@ impl App {
 
             window.present();
 
+            // --- Scroll-aware cover loading: debounce timer + vadjustment handler ---
+            let scroll_timer: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
+                std::rc::Rc::new(std::cell::Cell::new(None));
+
+            let sv_adj = left_scroll.vadjustment();
+            let sv_backing = album_grid_data.clone();
+            let sv_grid = album_grid.clone();
+            let sv_cmd = cmd_tx.clone();
+            let sv_timer = scroll_timer.clone();
+            sv_adj.connect_value_changed(move |adj| {
+                // Cancel previous debounce timer
+                if let Some(id) = sv_timer.take() {
+                    id.remove();
+                }
+                // Start a new 300ms debounce timer; resets on each scroll event
+                let backing = sv_backing.clone();
+                let grid = sv_grid.clone();
+                let cmd = sv_cmd.clone();
+                let adj_clone = adj.clone();
+                let id = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+                    let albums = calculate_visible_albums(&backing, &adj_clone, &grid);
+                    if !albums.is_empty() {
+                        log::debug!(
+                            "[ui] scroll stop: enqueuing {} visible albums for cover fetch",
+                            albums.len()
+                        );
+                        let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                    }
+                    glib::ControlFlow::Break
+                });
+                sv_timer.set(Some(id));
+            });
+
             // --- Frame clock tick callback for MPD events (replaces 30ms timer) ---
             // add_tick_callback fires once per display refresh (vsync-aligned).
             // Replaces the fixed 30ms timer that could fire mid-frame or during
@@ -956,6 +1046,8 @@ impl App {
             let fc_cp_np = fc_ev_cover_paths.clone();
             let fc_ev_model = album_model.clone();
             let fc_ev_data = album_grid_data.clone();
+            let fc_vadj = left_scroll.vadjustment();
+            let fc_vadj_grid = album_grid.clone();
             let fc_current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
             let fc_shutdown = shutdown_app.clone();
 
@@ -1036,8 +1128,22 @@ impl App {
                                     .collect();
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
-                                let covers_for_fetch = albums.clone();
-                                let _ = fc_cmd.send(MpdCommand::FetchCovers(covers_for_fetch));
+                                // Scroll-aware: only fetch covers for visible (±1 row) albums
+                                let backing = fc_ev_data.clone();
+                                let vadj = fc_vadj.clone();
+                                let grid = fc_vadj_grid.clone();
+                                let cmd = fc_cmd.clone();
+                                glib::idle_add_local(move || {
+                                    let albums = calculate_visible_albums(&backing, &vadj, &grid);
+                                    if !albums.is_empty() {
+                                        log::debug!(
+                                            "[ui] initial: enqueuing {} visible albums for cover fetch",
+                                            albums.len()
+                                        );
+                                        let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                    }
+                                    glib::ControlFlow::Break
+                                });
                             }
                         }
                         MpdEvent::AlbumsGrouped(groups) => {
@@ -1076,7 +1182,22 @@ impl App {
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
                                 if need_index {
-                                    let _ = fc_cmd.send(MpdCommand::FetchCovers(flat));
+                                    // Scroll-aware: only fetch covers for visible (±1 row) albums
+                                    let backing = fc_ev_data.clone();
+                                    let vadj = fc_vadj.clone();
+                                    let grid = fc_vadj_grid.clone();
+                                    let cmd = fc_cmd.clone();
+                                    glib::idle_add_local(move || {
+                                        let albums = calculate_visible_albums(&backing, &vadj, &grid);
+                                        if !albums.is_empty() {
+                                            log::debug!(
+                                                "[ui] grouped: enqueuing {} visible albums for cover fetch",
+                                                albums.len()
+                                            );
+                                            let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                        }
+                                        glib::ControlFlow::Break
+                                    });
                                 }
                             }
                         }

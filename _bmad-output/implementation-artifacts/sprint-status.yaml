@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-04-29"
+last_updated: "2026-04-30"
 project: mpd-client
 project_key: NOKEY
 tracking_system: file-system
@@ -108,6 +108,6 @@ development_status:
   epic-13: in-progress
   13-1-coverprovider-cache-read: done
   13-2-actualread-background-fetch: done
-  13-3-scroll-aware-cover-loading: backlog
+  13-3-scroll-aware-cover-loading: done
   13-4-widget-registry-in-place-updates: backlog
   13-5-online-cover-lookup: backlog
