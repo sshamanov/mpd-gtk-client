@@ -446,21 +446,23 @@ fn connected_loop(
                     MpdCommand::InsertNext(album) => {
                         match adapter.find_album_uris(&album) {
                             Ok(uris) => {
+                                if uris.is_empty() { break; }
                                 let current_pos = adapter.status()
                                     .ok()
                                     .and_then(|s| s.get("song").cloned())
                                     .and_then(|s| s.parse::<i32>().ok())
                                     .unwrap_or(-1);
+                                if current_pos < 0 { break; }
+                                // Batch all addid calls with position parameter to avoid per-item
+                                // round-trips and eliminate the race between addid and moveid.
+                                let mut cmds = Vec::with_capacity(uris.len());
                                 for (i, uri) in uris.iter().enumerate() {
-                                    match adapter.addid(uri) {
-                                        Ok(id) => {
-                                            let target = (current_pos + 1 + i as i32).max(0);
-                                            if let Err(e) = adapter.send_command(&format!("moveid {} {}", id, target)) {
-                                                log::error!("InsertNext moveid failed: {e}");
-                                            }
-                                        }
-                                        Err(e) => log::error!("InsertNext addid failed: {e}"),
-                                    }
+                                    let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+                                    let target = current_pos + 1 + i as i32;
+                                    cmds.push(format!("addid \"{escaped}\" {target}"));
+                                }
+                                if let Err(e) = adapter.send_batch(&cmds) {
+                                    log::error!("InsertNext batch failed: {e}");
                                 }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
                                     let pv = update.playlist_version.clone();
