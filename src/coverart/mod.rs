@@ -1,5 +1,9 @@
 //! Cover art subsystem — MPD albumart command with disk cache. Thread: background.
 
+pub mod provider;
+
+pub use provider::{CachedCover, CoverProvider};
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;

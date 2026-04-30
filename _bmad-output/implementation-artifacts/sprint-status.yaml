@@ -105,8 +105,8 @@ development_status:
   12-1-async-grid-population: done
   12-2-frame-clock-integration: done
 
-  epic-13: backlog
-  13-1-coverprovider-cache-read: backlog
+  epic-13: in-progress
+  13-1-coverprovider-cache-read: done
   13-2-actualread-background-fetch: backlog
   13-3-scroll-aware-cover-loading: backlog
   13-4-widget-registry-in-place-updates: backlog
