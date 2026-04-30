@@ -871,6 +871,12 @@ impl App {
             time_display.set_halign(gtk4::Align::Start);
             time_display.set_css_classes(&["time-display"]);
 
+            let seek_adjustment = gtk4::Adjustment::new(0.0, 0.0, 0.0, 1.0, 5.0, 0.0);
+            let seekbar = gtk4::Scale::new(gtk4::Orientation::Horizontal, Some(&seek_adjustment));
+            seekbar.set_hexpand(true);
+            seekbar.set_draw_value(false);
+            seekbar.set_css_classes(&["seekbar"]);
+
             let format_badge = Label::new(None);
             format_badge.set_halign(gtk4::Align::Start);
             format_badge.set_css_classes(&["format-badge"]);
@@ -881,6 +887,7 @@ impl App {
             now_playing.append(&track_artist);
             now_playing.append(&track_album);
             now_playing.append(&time_display);
+            now_playing.append(&seekbar);
             now_playing.append(&format_badge);
             right_pane.append(&now_playing);
 
@@ -1028,8 +1035,16 @@ impl App {
             let fc_tl = track_title.clone();
             let fc_ar = track_artist.clone();
             let fc_al = track_album.clone();
+            let fc_seekbar_cmd = cmd_tx.clone();
+            seekbar.connect_change_value(move |_, _, value| {
+                let pos = value as i64;
+                let _ = fc_seekbar_cmd.send(MpdCommand::Seek(pos));
+                glib::Propagation::Stop
+            });
+
             let fc_pi = playback_icon.clone();
             let fc_td = time_display.clone();
+            let fc_seekbar = seekbar.clone();
             let fc_fmt = format_badge.clone();
             let fc_np_cover = np_cover.clone();
             let fc_grid = album_grid.clone();
@@ -1104,6 +1119,7 @@ impl App {
     album: &fc_al,
     icon: &fc_pi,
     time_display: &fc_td,
+    seekbar: &fc_seekbar,
     format_badge: &fc_fmt,
     cover: &fc_np_cover,
     cover_paths: &fc_cp_np,
@@ -1426,6 +1442,7 @@ struct NowPlayingWidgets<'a> {
     album: &'a Label,
     icon: &'a Label,
     time_display: &'a Label,
+    seekbar: &'a gtk4::Scale,
     format_badge: &'a Label,
     cover: &'a Picture,
     cover_paths: &'a std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
@@ -1461,9 +1478,14 @@ fn update_now_playing(
     match (update.elapsed, update.duration) {
         (Some(el), Some(dur)) => {
             w.time_display.set_text(&format!("{}:{:02} / {}:{:02}", el as u64 / 60, el as u64 % 60, dur as u64 / 60, dur as u64 % 60));
+            let adj = w.seekbar.adjustment();
+            adj.set_upper(dur);
+            adj.set_value(el);
         }
         _ => {
             w.time_display.set_text("--:-- / --:--");
+            w.seekbar.adjustment().set_upper(0.0);
+            w.seekbar.adjustment().set_value(0.0);
         }
     }
     if let Some(ref fmt) = update.format {
