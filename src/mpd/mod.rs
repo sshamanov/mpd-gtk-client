@@ -668,6 +668,20 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         entries
     }
 
+    /// Search filenames/paths by query. Returns (file_path, display_name) pairs.
+    pub fn search_files(&mut self, query: &str) -> Result<Vec<(String, String)>, Error> {
+        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        let lines = self.send_command(&format!("search filename \"{}\"", escaped))?;
+        let mut results = Vec::new();
+        for line in &lines {
+            if let Some(file) = line.strip_prefix("file: ") {
+                let name = file.rsplit('/').next().unwrap_or(file).to_string();
+                results.push((file.to_string(), name));
+            }
+        }
+        Ok(results)
+    }
+
     /// Search albums by query, returns deduplicated (artist, album_name) pairs.
     pub fn search_albums(&mut self, query: &str) -> Result<Vec<(String, String)>, Error> {
         let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");

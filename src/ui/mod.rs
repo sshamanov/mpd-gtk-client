@@ -526,6 +526,22 @@ impl App {
 
             let folder_browser = std::rc::Rc::new(std::cell::RefCell::new(
                 widgets::folder_tree::FolderBrowser::new(cmd_tx.clone())));
+            // Folder mode search entry + results overlay
+            let folder_search = gtk4::SearchEntry::new();
+            folder_search.set_placeholder_text(Some("Search files..."));
+            folder_search.set_margin_start(4);
+            folder_search.set_margin_end(4);
+            folder_search.set_margin_bottom(4);
+
+            let folder_search_list = gtk4::ListBox::new();
+            folder_search_list.set_selection_mode(gtk4::SelectionMode::Single);
+            let folder_search_results = gtk4::ScrolledWindow::new();
+            folder_search_results.set_child(Some(&folder_search_list));
+            folder_search_results.set_vexpand(true);
+            folder_search_results.set_visible(false);
+
+            folder_content.append(&folder_search);
+            folder_content.append(&folder_search_results);
             folder_content.append(&folder_browser.borrow().container.clone());
 
             // Show album mode by default
@@ -577,7 +593,7 @@ impl App {
             // Album content: group bar + search + grid
             album_content.append(&group_bar);
 
-            // Search bar with 150ms debounce
+            // Album search entry
             let search_entry = gtk4::SearchEntry::new();
             search_entry.set_placeholder_text(Some("Search albums..."));
             search_entry.set_margin_start(4);
@@ -585,10 +601,21 @@ impl App {
             search_entry.set_margin_bottom(4);
             search_entry.set_size_request(-1, 32);
 
-            // Ctrl+F focuses the search entry
+            // Ctrl+F focuses the mode-appropriate search entry
             let search_action = gtk4::gio::SimpleAction::new("search", None);
-            let se_focus = search_entry.clone();
-            search_action.connect_activate(move |_, _| { se_focus.grab_focus(); });
+            let se_focus_album = search_entry.clone();
+            let se_focus_folder = folder_search.clone();
+            let mode_for_search = state.clone();
+            search_action.connect_activate(move |_, _| {
+                if let Ok(m) = mode_for_search.read() {
+                    match m.mode {
+                        crate::state::Mode::Folder => { se_focus_folder.grab_focus(); }
+                        _ => { se_focus_album.grab_focus(); }
+                    }
+                } else {
+                    se_focus_album.grab_focus();
+                }
+            });
             app_clone.add_action(&search_action);
             app_clone.set_accels_for_action("app.search", &["<Ctrl>F"]);
 
@@ -699,6 +726,32 @@ impl App {
                         }
                     },
                 );
+            });
+
+            // --- Folder search handler ---
+            let fs_cmd = cmd_tx.clone();
+            let fs_browser = folder_browser.clone();
+            let fs_results = folder_search_results.clone();
+            let fs_results2 = folder_search_results.clone();
+            let fs_browser2 = folder_browser.clone();
+            folder_search.connect_search_changed(move |entry| {
+                let q = entry.text().to_string();
+                if q.is_empty() {
+                    fs_results.set_visible(false);
+                    fs_browser.borrow().container.set_visible(true);
+                    return;
+                }
+                let cmd = fs_cmd.clone();
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(150),
+                    move || {
+                        let _ = cmd.send(MpdCommand::SearchFiles(q));
+                    },
+                );
+            });
+            folder_search.connect_stop_search(move |_| {
+                fs_results2.set_visible(false);
+                fs_browser2.borrow().container.set_visible(true);
             });
 
             album_content.append(&search_entry);
@@ -1070,6 +1123,8 @@ impl App {
             let fc_empty = empty_label.clone();
             let fc_cmd = cmd_tx.clone();
             let fc_fb = folder_browser.clone();
+            let fc_fs_list = folder_search_list.clone();
+            let fc_fs_container = folder_search_results.clone();
             let fc_ql = queue_list.clone();
             let fc_ids = item_ids_w.clone();
             let fc_si = search_index.clone();
@@ -1267,6 +1322,24 @@ impl App {
                                     .collect();
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
+                            }
+                        }
+                        MpdEvent::FileSearchResults(results) => {
+                            // Populate folder search results
+                            while let Some(child) = fc_fs_list.first_child() {
+                                fc_fs_list.remove(&child);
+                            }
+                            for (path, name) in &results {
+                                let row = gtk4::ListBoxRow::new();
+                                let lbl = gtk4::Label::new(Some(&format!("{name}\n{path}")));
+                                lbl.set_halign(gtk4::Align::Start);
+                                lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                                row.set_child(Some(&lbl));
+                                fc_fs_list.append(&row);
+                            }
+                            if !results.is_empty() {
+                                fc_fs_container.set_visible(true);
+                                fc_fb.borrow().container.set_visible(false);
                             }
                         }
                         MpdEvent::DirectoryListing(path, entries) => {

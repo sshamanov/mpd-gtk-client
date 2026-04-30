@@ -22,6 +22,7 @@ pub enum MpdCommand {
     ListAlbums,
     ListAlbumsGrouped(String),
     Search(String),
+    SearchFiles(String),
     ListDirectory(String),
     PlayFile(String),
     ListQueue,
@@ -50,6 +51,7 @@ pub enum MpdEvent {
     Albums(Vec<(String, String)>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
     SearchResults(Vec<(String, String)>),
+    FileSearchResults(Vec<(String, String)>),
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
     LibraryChanged,
@@ -381,6 +383,11 @@ fn connected_loop(
                     MpdCommand::Search(query) => {
                         if let Ok(results) = adapter.search_albums(&query) {
                             let _ = event_tx.try_send(MpdEvent::SearchResults(results));
+                        }
+                    }
+                    MpdCommand::SearchFiles(query) => {
+                        if let Ok(results) = adapter.search_files(&query) {
+                            let _ = event_tx.try_send(MpdEvent::FileSearchResults(results));
                         }
                     }
                     MpdCommand::ListDirectory(path) => {
