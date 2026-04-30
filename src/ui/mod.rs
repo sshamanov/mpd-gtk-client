@@ -1472,21 +1472,30 @@ impl App {
                                 let tx_pop = q_tx.clone();
                                 let ipos = item.position;
                                 let iid = item.id;
+                                let current_song = fc_current_song_pos.get();
                                 rclick.connect_pressed(move |gest, _n, _x, _y| {
                                     let pop = gtk4::Popover::new();
                                     let popbox = Box::new(Orientation::Vertical, 0);
                                     let btn_play = gtk4::Button::with_label("Play Now");
+                                    let btn_next = gtk4::Button::with_label("Play Next");
                                     let btn_rem = gtk4::Button::with_label("Remove");
                                     let tp = tx_pop.clone();
                                     let ip = ipos;
                                     btn_play.connect_clicked(move |_| {
                                         let _ = tp.send(MpdCommand::PlayPosition(ip));
                                     });
+                                    let tn = tx_pop.clone();
+                                    let id_next = iid;
+                                    let target = current_song.map(|p| p + 1).unwrap_or(0);
+                                    btn_next.connect_clicked(move |_| {
+                                        let _ = tn.send(MpdCommand::MoveId(id_next, target));
+                                    });
                                     let tr = tx_pop.clone();
                                     btn_rem.connect_clicked(move |_| {
                                         let _ = tr.send(MpdCommand::DeleteId(iid));
                                     });
                                     popbox.append(&btn_play);
+                                    popbox.append(&btn_next);
                                     popbox.append(&btn_rem);
                                     pop.set_child(Some(&popbox));
                                     if let Some(ref w) = gest.widget() { pop.set_parent(w); }
