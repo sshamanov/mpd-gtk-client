@@ -456,6 +456,20 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
             return Ok(vec![("All Albums".into(), flat)]);
         }
         let lines = self.send_command(&format!("list album group {group}"))?;
+
+        // For non-Artist groupings, fetch the flat album list to build an artist lookup map.
+        // MPD's `list album group {group}` does not include Artist metadata for Date/Genre
+        // groupings, so we backfill from the flat list grouped by Artist.
+        let flat_albums: Option<Vec<(String, String)>> = if group != "Artist" {
+            Some(self.list_albums()?)
+        } else {
+            None
+        };
+        let artist_lookup: std::collections::HashMap<&str, &str> = flat_albums
+            .as_ref()
+            .map(|albums| albums.iter().map(|(a, b)| (b.as_str(), a.as_str())).collect())
+            .unwrap_or_default();
+
         let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
         let mut current_header = String::new();
         let mut current_items: Vec<(String, String)> = Vec::new();
@@ -467,9 +481,17 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
                 }
                 current_header = name.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
-                // For Artist grouping the header IS the artist; for Date/Genre it's unavailable
-                let artist = if group == "Artist" { &current_header } else { "" };
-                current_items.push((artist.to_string(), album.to_string()));
+                // Artist grouping: header IS the artist
+                // Date/Genre grouping: look up artist from the flat album list
+                let artist = if group == "Artist" {
+                    current_header.clone()
+                } else {
+                    artist_lookup
+                        .get(album)
+                        .unwrap_or(&"Unknown Artist")
+                        .to_string()
+                };
+                current_items.push((artist, album.to_string()));
             }
         }
         if !current_header.is_empty() {
@@ -490,10 +512,17 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
             "Genre" => "Unknown Genre",
             _ => "Unknown",
         };
-        let untagged: Vec<(String, String)> = self.list_albums()?
-            .into_iter()
-            .filter(|(_, name)| !grouped_albums.contains(name))
-            .collect();
+        let untagged: Vec<(String, String)> = if let Some(albums) = flat_albums {
+            albums
+                .into_iter()
+                .filter(|(_, name)| !grouped_albums.contains(name))
+                .collect()
+        } else {
+            self.list_albums()?
+                .into_iter()
+                .filter(|(_, name)| !grouped_albums.contains(name))
+                .collect()
+        };
         if !untagged.is_empty() {
             groups.push((unknown_label.into(), untagged));
         }
