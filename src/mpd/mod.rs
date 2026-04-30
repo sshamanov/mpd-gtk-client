@@ -367,8 +367,22 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
                 // AlbumArtist takes priority over per-track Artist
                 current_artist = artist.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
-                album_artist.entry(album.to_string())
-                    .or_insert_with(|| current_artist.clone());
+                let album = album.to_string();
+                if !current_artist.is_empty() {
+                    // Insert or update: replace empty placeholder with real artist
+                    album_artist.entry(album)
+                        .and_modify(|e| { if e.is_empty() { *e = current_artist.clone(); } })
+                        .or_insert_with(|| current_artist.clone());
+                } else {
+                    // No artist yet — insert empty placeholder (may be updated later or set to Unknown Artist)
+                    album_artist.entry(album).or_insert_with(String::new);
+                }
+            }
+        }
+        // Replace any remaining empty artists with "Unknown Artist"
+        for (_, artist) in album_artist.iter_mut() {
+            if artist.is_empty() {
+                *artist = "Unknown Artist".to_string();
             }
         }
         // Second pass: build results in order

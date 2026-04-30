@@ -94,12 +94,12 @@ development_status:
   6-6-graceful-mpd-shutdown: done
   6-7-queue-key-race-condition: done
 
-  epic-9: in-progress
+  epic-9: done
   9-3-fix-grouped-double-click: done
   9-4-cue-dsd-row-playback: done
   9-5-albumartist-search: done
   9-6-list-albums-grouped-artist-loss: done
-  9-7-search-albums-stale-artist: backlog
+  9-7-search-albums-stale-artist: done
 
   epic-12: backlog
   12-1-async-grid-population: backlog

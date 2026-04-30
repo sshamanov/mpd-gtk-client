@@ -156,7 +156,7 @@ fn get_response(command: &str) -> Vec<String> {
         c if c.starts_with("deleteid ") => vec![],
         c if c.starts_with("moveid ") => vec![],
         c if c.starts_with("addid ") => vec!["Id: 99".into()],
-        c if c.starts_with("search ") => make_search_response(),
+        c if c.starts_with("search ") => make_search_response(c),
         c if c == "list album" || c.starts_with("list album group") => make_list_albums_response(),
         c if c.starts_with("find album ") => make_find_album_response(),
         c if c.starts_with("lsinfo") => make_lsinfo_response(command),
@@ -192,7 +192,18 @@ fn make_playlistinfo_response() -> Vec<String> {
     ]
 }
 
-fn make_search_response() -> Vec<String> {
+fn make_search_response(command: &str) -> Vec<String> {
+    // Dispatch on query text so tests can request specific edge-case responses
+    if command.contains("missing-artist") {
+        return make_search_missing_artist_response();
+    }
+    if command.contains("no-artist") {
+        return make_search_no_artist_response();
+    }
+    if command.contains("albumartist") {
+        return make_search_albumartist_response();
+    }
+    // Default response: all tracks have Artist tags
     vec![
         "file: test/01-test.flac".into(),
         "Artist: Test Artist".into(),
@@ -200,6 +211,44 @@ fn make_search_response() -> Vec<String> {
         "file: test/02-second.flac".into(),
         "Artist: Second Artist".into(),
         "Album: Second Album".into(),
+    ]
+}
+
+/// Search response where some tracks in the same album are missing Artist tags.
+fn make_search_missing_artist_response() -> Vec<String> {
+    vec![
+        "file: test/01-first.flac".into(),
+        "Album: Split Album".into(),                // No Artist before this Album
+        "file: test/02-second.flac".into(),
+        "Artist: Real Artist".into(),
+        "Album: Split Album".into(),                // Later track has the artist
+        "file: test/03-third.flac".into(),
+        "Artist: Other Artist".into(),
+        "Album: Other Album".into(),
+    ]
+}
+
+/// Search response where NO tracks have Artist tags.
+fn make_search_no_artist_response() -> Vec<String> {
+    vec![
+        "file: test/01-track.flac".into(),
+        "Album: Artistless Album".into(),           // No Artist: at all
+        "file: test/02-track.flac".into(),
+        "Album: Another Artistless".into(),         // No Artist: at all
+    ]
+}
+
+/// Search response where AlbumArtist is used instead of Artist.
+fn make_search_albumartist_response() -> Vec<String> {
+    vec![
+        "file: test/01-comp.flac".into(),
+        "AlbumArtist: Various Artists".into(),
+        "Title: Track One".into(),
+        "Album: Compilation Album".into(),
+        "file: test/02-comp.flac".into(),
+        "AlbumArtist: Various Artists".into(),
+        "Title: Track Two".into(),
+        "Album: Compilation Album".into(),
     ]
 }
 

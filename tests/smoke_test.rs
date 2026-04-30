@@ -66,6 +66,45 @@ fn test_search_albums() {
 }
 
 #[test]
+fn test_search_albums_missing_artist() {
+    let (server, mut client) = common::with_mpd_server();
+    // The mock returns a response where Split Album's first track has no Artist but later track does
+    let results = client.search_albums("missing-artist").unwrap();
+    // Expect 2 albums, in file-order: "Split Album" then "Other Album"
+    assert_eq!(results.len(), 2);
+    // "Split Album" comes first (file order) — first track had no artist, second track fills it in
+    assert_eq!(results[0].1, "Split Album");
+    assert_eq!(results[0].0, "Real Artist");
+    assert_eq!(results[1].1, "Other Album");
+    assert_eq!(results[1].0, "Other Artist");
+    server.assert_received("search");
+}
+
+#[test]
+fn test_search_albums_all_missing_artist() {
+    let (server, mut client) = common::with_mpd_server();
+    let results = client.search_albums("no-artist").unwrap();
+    // Both albums have no Artist tags — should show "Unknown Artist", in file order
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].1, "Artistless Album");
+    assert_eq!(results[0].0, "Unknown Artist");
+    assert_eq!(results[1].1, "Another Artistless");
+    assert_eq!(results[1].0, "Unknown Artist");
+    server.assert_received("search");
+}
+
+#[test]
+fn test_search_albums_albumartist() {
+    let (server, mut client) = common::with_mpd_server();
+    let results = client.search_albums("albumartist").unwrap();
+    // Album has only AlbumArtist tag — should use it
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].1, "Compilation Album");
+    assert_eq!(results[0].0, "Various Artists");
+    server.assert_received("search");
+}
+
+#[test]
 fn test_list_albums() {
     let (server, mut client) = common::with_mpd_server();
     let albums = client.list_albums().unwrap();
