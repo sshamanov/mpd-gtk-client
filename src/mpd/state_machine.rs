@@ -260,6 +260,7 @@ fn connected_loop(
     let mut last_song_pos: Option<u32>;
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
+    let mut local_queue: Vec<crate::mpd::QueueEntry> = Vec::new();
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("mpd-client")
@@ -392,41 +393,37 @@ fn connected_loop(
                         ];
                         if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayFile failed: {e}"); }
                         if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
                             let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                         }
-                        if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                         last_status = Instant::now();
                     }
                     MpdCommand::ListQueue => {
-                        if let Ok(queue) = adapter.list_queue() {
-                            let _ = event_tx.try_send(MpdEvent::Queue(queue));
-                        }
+                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
                     }
                     MpdCommand::PlayPosition(pos) => {
                         if let Err(e) = adapter.send_command(&format!("play {}", pos)) {
                             log::error!("PlayPosition failed: {e}");
                         }
                         if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
                             let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                         }
-                        if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                         last_status = Instant::now();
                     }
                     MpdCommand::DeleteId(id) => {
                         if let Err(e) = adapter.send_command(&format!("deleteid {}", id)) {
                             log::error!("DeleteId failed: {e}");
                         }
-                        if let Ok(queue) = adapter.list_queue() {
-                            let _ = event_tx.try_send(MpdEvent::Queue(queue));
-                        }
+                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
                     }
                     MpdCommand::MoveId(id, to_pos) => {
                         if let Err(e) = adapter.send_command(&format!("moveid {} {}", id, to_pos)) {
                             log::error!("MoveId failed: {e}");
                         }
-                        if let Ok(queue) = adapter.list_queue() {
-                            let _ = event_tx.try_send(MpdEvent::Queue(queue));
-                        }
+                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
                     }
                     MpdCommand::Add(album) => {
                         match adapter.find_album_uris(&album) {
@@ -437,9 +434,10 @@ fn connected_loop(
                                     .collect();
                                 if let Err(e) = adapter.send_batch(&cmds) { log::error!("Add album failed: {e}"); }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let pv = update.playlist_version.clone();
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                                 }
-                                if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                                 last_status = Instant::now();
                             }
                             Err(e) => log::error!("Add album failed: {e}"),
@@ -465,9 +463,10 @@ fn connected_loop(
                                     }
                                 }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let pv = update.playlist_version.clone();
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                                 }
-                                if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                                 last_status = Instant::now();
                             }
                             Err(e) => log::error!("InsertNext find failed: {e}"),
@@ -484,9 +483,10 @@ fn connected_loop(
                                 cmds.push("play 0".to_string());
                                 if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayAlbum failed: {e}"); }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let pv = update.playlist_version.clone();
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                                 }
-                                if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                                 last_status = Instant::now();
                             }
                             Err(e) => log::error!("PlayAlbum failed: {e}"),
@@ -495,9 +495,10 @@ fn connected_loop(
                     MpdCommand::Clear => {
                         if let Err(e) = adapter.send_command("clear") { log::error!("Clear failed: {e}"); }
                         if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
                             let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
                         }
-                        if let Ok(queue) = adapter.list_queue() { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
                         last_status = Instant::now();
                     }
                     MpdCommand::Reconnect => {
@@ -516,7 +517,7 @@ fn connected_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Process one pending cover fetch per idle cycle to avoid blocking
                 if actual_read.has_pending() {
-                    actual_read.process_one(&mut adapter, &cover_provider.read().unwrap(), &event_tx);
+                    actual_read.process_one(&mut adapter, &cover_provider.read().unwrap(), event_tx);
                 }
                 // Fall through to status poll check below
             }
@@ -532,9 +533,10 @@ fn connected_loop(
                 consecutive_failures = 0;
                 let new_song = update.song;
                 let song_changed = new_song != last_song_pos;
-                let playlist_changed = update.playlist_version != last_playlist_version;
-                if playlist_changed && update.playlist_version.is_some() {
-                    last_playlist_version = update.playlist_version.clone();
+                let current_version = update.playlist_version.clone();
+                let playlist_changed = current_version != last_playlist_version;
+                if playlist_changed && current_version.is_some() {
+                    last_playlist_version = current_version.clone();
                     let _ = event_tx.try_send(MpdEvent::LibraryChanged);
                 }
                 match event_tx.try_send(MpdEvent::StateChanged(update)) {
@@ -552,9 +554,7 @@ fn connected_loop(
                     }
                 }
                 if song_changed && last_song_pos == new_song {
-                    if let Ok(queue) = adapter.list_queue() {
-                        let _ = event_tx.try_send(MpdEvent::Queue(queue));
-                    }
+                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, current_version.as_deref());
                 }
             } else {
                 consecutive_failures += 1;
@@ -565,6 +565,40 @@ fn connected_loop(
                 }
             }
         }
+    }
+}
+
+/// Sync the local queue copy from MPD when the playlist version has changed.
+/// Skips the round-trip when the version matches (`last_version == current_version`).
+/// When `current_version` is `None`, fetches status to determine the version.
+fn sync_queue(
+    adapter: &mut MpdAdapter,
+    event_tx: &mpsc::SyncSender<MpdEvent>,
+    local_queue: &mut Vec<crate::mpd::QueueEntry>,
+    last_version: &mut Option<String>,
+    current_version: Option<&str>,
+) {
+    let version = current_version
+        .map(|v| v.to_string())
+        .or_else(|| {
+            adapter.status().ok()
+                .and_then(|s| s.get("playlist").cloned())
+        });
+
+    let Some(ref ver) = version else { return };
+
+    // Skip if version hasn't changed since last sync
+    if last_version.as_deref() == Some(ver.as_str()) {
+        return;
+    }
+
+    match adapter.list_queue() {
+        Ok(queue) => {
+            *local_queue = queue;
+            *last_version = Some(ver.clone());
+            let _ = event_tx.try_send(MpdEvent::Queue(local_queue.clone()));
+        }
+        Err(e) => log::error!("queue sync failed: {e}"),
     }
 }
 

@@ -399,12 +399,25 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
     /// List all items in the playback queue via `playlistinfo`.
     pub fn list_queue(&mut self) -> Result<Vec<QueueEntry>, Error> {
         let lines = self.send_command("playlistinfo")?;
+        Ok(Self::parse_queue_response(&lines))
+    }
+
+    /// Fetch queue changes since a given playlist version.
+    /// Returns entries added or changed since that version.
+    /// Does NOT report deletions — callers must cross-reference with playlist length from status.
+    pub fn plchanges(&mut self, version: &str) -> Result<Vec<QueueEntry>, Error> {
+        let lines = self.send_command(&format!("plchanges {version}"))?;
+        Ok(Self::parse_queue_response(&lines))
+    }
+
+    /// Parse an MPD queue response (from `playlistinfo` or `plchanges`) into QueueEntry values.
+    fn parse_queue_response(lines: &[String]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
         let mut current = QueueEntry {
             position: 0, id: 0, title: None, artist: None,
             album: None, duration: None, file: String::new(),
         };
-        for line in &lines {
+        for line in lines {
             if let Some(val) = line.strip_prefix("file: ") {
                 if !current.file.is_empty() {
                     entries.push(std::mem::replace(&mut current, QueueEntry {
@@ -430,7 +443,7 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         if !current.file.is_empty() {
             entries.push(current);
         }
-        Ok(entries)
+        entries
     }
 
     /// Search albums by query, returns deduplicated (artist, album_name) pairs.
