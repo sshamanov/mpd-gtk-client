@@ -927,92 +927,100 @@ impl App {
                 glib::ControlFlow::Continue
             });
 
-            // --- Idle callback for MPD events ---
-            let rx_c = event_rx.clone();
-            let ci_c = conn_indicator.clone();
-            let tl_c = track_title.clone();
-            let ar_c = track_artist.clone();
-            let al_c = track_album.clone();
-            let pi_c = playback_icon.clone();
-            let td_c = time_display.clone();
-            let fmt_c = format_badge.clone();
-            let np_cover_c = np_cover.clone();
-            let grid_c = album_grid.clone();
-            let stack_c = left_stack.clone();
-            let empty_c = empty_label.clone();
-            let cmd_c = cmd_tx.clone();
-            let fb_c = folder_browser.clone();
-            let ql_c = queue_list.clone();
-            let ids_w = item_ids_w.clone();
-            let si_c = search_index.clone();
-            let toast_q = toast.clone();
-            // Reuse the factory-scoped cover_paths/cover_widgets (clone Rc for this move closure)
-            let ev_cover_paths = cover_paths.clone();
-            let ev_cover_widgets = cover_widgets.clone();
-            let cp_np = ev_cover_paths.clone();
-            let ev_model = album_model.clone();
-            let ev_data = album_grid_data.clone();
-            let current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
-            let shutdown_app = shutdown_app.clone();
+            window.present();
 
-            glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            // --- Frame clock tick callback for MPD events (replaces 30ms timer) ---
+            // add_tick_callback fires once per display refresh (vsync-aligned).
+            // Replaces the fixed 30ms timer that could fire mid-frame or during
+            // layout passes, which starved the GTK main loop under heavy load.
+            let fc_rx = event_rx.clone();
+            let fc_ci = conn_indicator.clone();
+            let fc_tl = track_title.clone();
+            let fc_ar = track_artist.clone();
+            let fc_al = track_album.clone();
+            let fc_pi = playback_icon.clone();
+            let fc_td = time_display.clone();
+            let fc_fmt = format_badge.clone();
+            let fc_np_cover = np_cover.clone();
+            let fc_grid = album_grid.clone();
+            let fc_stack = left_stack.clone();
+            let fc_empty = empty_label.clone();
+            let fc_cmd = cmd_tx.clone();
+            let fc_fb = folder_browser.clone();
+            let fc_ql = queue_list.clone();
+            let fc_ids = item_ids_w.clone();
+            let fc_si = search_index.clone();
+            let fc_toast = toast.clone();
+            let fc_ev_cover_paths = cover_paths.clone();
+            let fc_ev_cover_widgets = cover_widgets.clone();
+            let fc_cp_np = fc_ev_cover_paths.clone();
+            let fc_ev_model = album_model.clone();
+            let fc_ev_data = album_grid_data.clone();
+            let fc_current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            let fc_shutdown = shutdown_app.clone();
+
+            window.add_tick_callback(move |_widget, _fc| {
                 // Check for shutdown request from SIGINT/SIGTERM signal handlers.
-                // This runs within the GTK main loop, so we can call app.quit() directly.
                 if crate::SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel) {
-                    shutdown_app.quit();
+                    fc_shutdown.quit();
                     return glib::ControlFlow::Break;
                 }
 
-                let mut guard = match rx_c.lock() {
+                let mut guard = match fc_rx.lock() {
                     Ok(g) => g,
                     Err(poisoned) => {
                         log::error!("MPD event receiver mutex poisoned: {poisoned}");
+                        fc_shutdown.quit();
                         return glib::ControlFlow::Break;
                     }
                 };
-                // Process at most 64 events per tick to yield to GTK main loop
+                // Process at most 64 events per tick to yield to GTK main loop.
+                // Frame clock fires once per display refresh (~16ms at 60Hz),
+                // so this processing is vsync-aligned, not mid-frame.
                 let mut batch = 0u32;
                 while batch < 64 {
                     let event = match guard.try_recv() {
                         Ok(e) => e,
                         Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return glib::ControlFlow::Break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            drop(guard);
+                            return glib::ControlFlow::Break;
+                        }
                     };
                     batch += 1;
                     drop(guard);
                     match event {
                         MpdEvent::Connected => {
-                            ci_c.set_css_classes(&["connection-indicator", "connected"]);
-                            // Reset local search index — MPD library may have changed while disconnected
-                            if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
-                            let _ = cmd_c.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
-                            let _ = cmd_c.send(MpdCommand::ListQueue);
+                            fc_ci.set_css_classes(&["connection-indicator", "connected"]);
+                            if let Ok(mut idx) = fc_si.write() { *idx = SearchIndex::new(); }
+                            let _ = fc_cmd.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
+                            let _ = fc_cmd.send(MpdCommand::ListQueue);
                         }
                         MpdEvent::Connecting => {
-                            ci_c.set_css_classes(&["connection-indicator", "connecting"]);
+                            fc_ci.set_css_classes(&["connection-indicator", "connecting"]);
                         }
                         MpdEvent::Disconnected => {
-                            ci_c.set_css_classes(&["connection-indicator", "disconnected"]);
+                            fc_ci.set_css_classes(&["connection-indicator", "disconnected"]);
                         }
                         MpdEvent::StateChanged(update) => {
-                            current_song_pos.set(update.song.map(|s| s as i32));
+                            fc_current_song_pos.set(update.song.map(|s| s as i32));
                             update_now_playing(NowPlayingWidgets {
-    title: &tl_c,
-    artist: &ar_c,
-    album: &al_c,
-    icon: &pi_c,
-    time_display: &td_c,
-    format_badge: &fmt_c,
-    cover: &np_cover_c,
-    cover_paths: &cp_np,
+    title: &fc_tl,
+    artist: &fc_ar,
+    album: &fc_al,
+    icon: &fc_pi,
+    time_display: &fc_td,
+    format_badge: &fc_fmt,
+    cover: &fc_np_cover,
+    cover_paths: &fc_cp_np,
 }, &update);
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
-                            if let Ok(mut idx) = search_index.write() { idx.build(&albums); }
+                            if let Ok(mut idx) = fc_si.write() { idx.build(&albums); }
                             if albums.is_empty() {
-                                empty_c.set_text("No albums found");
-                                stack_c.set_visible_child(&empty_c);
+                                fc_empty.set_text("No albums found");
+                                fc_stack.set_visible_child(&fc_empty);
                             } else {
                                 let items: Vec<AlbumGridItem> = albums.iter()
                                     .enumerate()
@@ -1026,25 +1034,25 @@ impl App {
                                         }
                                     })
                                     .collect();
-                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
-                                stack_c.set_visible_child(&grid_c);
+                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
+                                fc_stack.set_visible_child(&fc_grid);
                                 let covers_for_fetch = albums.clone();
-                                let _ = cmd_c.send(MpdCommand::FetchCovers(covers_for_fetch));
+                                let _ = fc_cmd.send(MpdCommand::FetchCovers(covers_for_fetch));
                             }
                         }
                         MpdEvent::AlbumsGrouped(groups) => {
                             let flat: Vec<(String, String)> = groups.iter()
                                 .flat_map(|(_, a)| a.clone()).collect();
                             if groups.is_empty() {
-                                empty_c.set_text("No albums found");
-                                stack_c.set_visible_child(&empty_c);
+                                fc_empty.set_text("No albums found");
+                                fc_stack.set_visible_child(&fc_empty);
                             } else {
                                 // Only rebuild search index if flat list changed
-                                let need_index = if let Ok(idx) = search_index.read() {
+                                let need_index = if let Ok(idx) = fc_si.read() {
                                     idx.album_count() != flat.len()
                                 } else { true };
                                 if need_index {
-                                    if let Ok(mut idx) = search_index.write() { idx.build(&flat); }
+                                    if let Ok(mut idx) = fc_si.write() { idx.build(&flat); }
                                 }
                                 let items: Vec<AlbumGridItem> = groups.iter()
                                     .flat_map(|(header, albums)| {
@@ -1065,17 +1073,17 @@ impl App {
                                         group_items
                                     })
                                     .collect();
-                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
-                                stack_c.set_visible_child(&grid_c);
+                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
+                                fc_stack.set_visible_child(&fc_grid);
                                 if need_index {
-                                    let _ = cmd_c.send(MpdCommand::FetchCovers(flat));
+                                    let _ = fc_cmd.send(MpdCommand::FetchCovers(flat));
                                 }
                             }
                         }
                         MpdEvent::SearchResults(results) => {
                             if results.is_empty() {
-                                empty_c.set_text("No results found");
-                                stack_c.set_visible_child(&empty_c);
+                                fc_empty.set_text("No results found");
+                                fc_stack.set_visible_child(&fc_empty);
                             } else {
                                 let items: Vec<AlbumGridItem> = results.iter()
                                     .enumerate()
@@ -1089,21 +1097,21 @@ impl App {
                                         }
                                     })
                                     .collect();
-                                batch_populate(&ev_model, &ev_data, items, &ev_cover_widgets);
-                                stack_c.set_visible_child(&grid_c);
+                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
+                                fc_stack.set_visible_child(&fc_grid);
                             }
                         }
                         MpdEvent::DirectoryListing(path, entries) => {
-                            if let Ok(mut fb) = fb_c.try_borrow_mut() {
+                            if let Ok(mut fb) = fc_fb.try_borrow_mut() {
                                 fb.set_entries(&path, entries);
                             }
                         }
                         MpdEvent::Queue(queue) => {
-                            while let Some(child) = ql_c.first_child() {
-                                ql_c.remove(&child);
+                            while let Some(child) = fc_ql.first_child() {
+                                fc_ql.remove(&child);
                             }
-                            let csp = current_song_pos.get();
-                            let q_tx = cmd_c.clone();
+                            let csp = fc_current_song_pos.get();
+                            let q_tx = fc_cmd.clone();
                             let mut item_ids = HashMap::new();
                             let mut current_row: Option<gtk4::ListBoxRow> = None;
                             for (row_idx, item) in queue.iter().enumerate() {
@@ -1176,18 +1184,18 @@ impl App {
                                     if let Some(ref w) = gest.widget() { pop.set_parent(w); }
                                     pop.popup();
                                 });
-                                ql_c.append(&row);
+                                fc_ql.append(&row);
                             }
                             // Select the current track's row in the list
                             if let Some(ref cr) = current_row {
-                                ql_c.select_row(Some(cr));
+                                fc_ql.select_row(Some(cr));
                             }
                             // Refresh shared item_ids for key-based delete/move lookup
-                            *ids_w.borrow_mut() = item_ids;
+                            *fc_ids.borrow_mut() = item_ids;
                         }
                         MpdEvent::CoverPaths(paths) => {
-                            let mut cp = ev_cover_paths.borrow_mut();
-                            let widgets = ev_cover_widgets.borrow();
+                            let mut cp = fc_ev_cover_paths.borrow_mut();
+                            let widgets = fc_ev_cover_widgets.borrow();
                             for (album, path) in &paths {
                                 log::info!("[UI] cover path: '{album}' -> {:?}", path);
                                 cp.insert(album.clone(), path.clone());
@@ -1205,18 +1213,19 @@ impl App {
                             }
                         }
                         MpdEvent::LibraryChanged => {
-                            if let Ok(mut idx) = si_c.write() { *idx = SearchIndex::new(); }
-                            let _ = cmd_c.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
+                            if let Ok(mut idx) = fc_si.write() { *idx = SearchIndex::new(); }
+                            let _ = fc_cmd.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
                         }
                         MpdEvent::Error(msg) => {
-                            ci_c.set_css_classes(&["connection-indicator", "error"]);
-                            toast_q.borrow().show_toast(&format!("MPD Error: {msg}"));
+                            fc_ci.set_css_classes(&["connection-indicator", "error"]);
+                            fc_toast.borrow().show_toast(&format!("MPD Error: {msg}"));
                         }
                     }
-                    guard = match rx_c.lock() {
+                    guard = match fc_rx.lock() {
                         Ok(g) => g,
                         Err(poisoned) => {
                             log::error!("MPD event receiver mutex poisoned: {poisoned}");
+                            fc_shutdown.quit();
                             return glib::ControlFlow::Break;
                         }
                     };
@@ -1226,8 +1235,6 @@ impl App {
                 }
                 glib::ControlFlow::Continue
             });
-
-            window.present();
 
             // Load CSS
             let css = gtk4::CssProvider::new();

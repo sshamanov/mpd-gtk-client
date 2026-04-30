@@ -103,7 +103,7 @@ development_status:
 
   epic-12: in-progress
   12-1-async-grid-population: done
-  12-2-frame-clock-integration: backlog
+  12-2-frame-clock-integration: done
 
   epic-13: backlog
   13-1-coverprovider-cache-read: backlog
