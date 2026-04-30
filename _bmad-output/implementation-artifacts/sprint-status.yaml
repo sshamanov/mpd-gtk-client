@@ -86,7 +86,7 @@ development_status:
   5b-1-settings-dialog: done
   5b-2-keyboard-navigation: done
 
-  epic-6: in-progress
+  epic-6: done
   6-1-dead-connection-detection: done
   6-2-toast-timer-management: done
   6-4-search-index-on-library-change: done
@@ -101,11 +101,11 @@ development_status:
   9-6-list-albums-grouped-artist-loss: done
   9-7-search-albums-stale-artist: done
 
-  epic-12: in-progress
+  epic-12: done
   12-1-async-grid-population: done
   12-2-frame-clock-integration: done
 
-  epic-13: in-progress
+  epic-13: done
   13-1-coverprovider-cache-read: done
   13-2-actualread-background-fetch: done
   13-3-scroll-aware-cover-loading: done

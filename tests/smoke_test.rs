@@ -187,3 +187,34 @@ fn test_close_command() {
     let result = client.send_command("status");
     assert!(result.is_err(), "status after close should fail");
 }
+
+#[test]
+fn test_send_batch() {
+    let (server, mut client) = common::with_mpd_server();
+
+    // Send a batch of independent commands
+    let cmds = vec!["clear".to_string(), "play 0".to_string()];
+    let result = client.send_batch(&cmds);
+    assert!(result.is_ok(), "send_batch should succeed, got: {:?}", result.err());
+
+    server.assert_received("clear");
+    server.assert_received("play");
+
+    // Send a larger batch (simulates adding multiple tracks)
+    let add_cmds: Vec<String> = (0..5)
+        .map(|i| format!("addid \"track-{i}.flac\""))
+        .collect();
+    let result = client.send_batch(&add_cmds);
+    assert!(result.is_ok(), "batch of addids should succeed, got: {:?}", result.err());
+    // Each addid should have been received
+    server.assert_received("addid");
+}
+
+#[test]
+fn test_send_batch_empty() {
+    let (_server, mut client) = common::with_mpd_server();
+
+    // Empty batch — just command_list_begin/end, should return OK
+    let result = client.send_batch(&[]);
+    assert!(result.is_ok(), "empty batch should succeed, got: {:?}", result.err());
+}

@@ -112,6 +112,45 @@ impl MpdAdapter {
         Ok(Self { reader, stream })
     }
 
+    /// Send multiple commands as a single MPD command list (command_list_begin/end).
+    /// All commands execute atomically — MPD aborts the entire list on any failure.
+    /// Returns the accumulated response lines or an error.
+    pub fn send_batch(&mut self, commands: &[String]) -> Result<Vec<String>, Error> {
+        let t0 = std::time::Instant::now();
+        self.stream.write_all(b"command_list_begin\n")?;
+        for cmd in commands {
+            self.stream.write_all(cmd.as_bytes())?;
+            self.stream.write_all(b"\n")?;
+        }
+        self.stream.write_all(b"command_list_end\n")?;
+        self.stream.flush()?;
+
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 {
+                log::error!("[adapter] send_batch({} cmds) — connection closed after {:?}", commands.len(), t0.elapsed());
+                return Err(Error::Protocol("Connection closed".into()));
+            }
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("OK") {
+                break;
+            }
+            if trimmed.starts_with("ACK") {
+                log::error!("[adapter] send_batch({} cmds) — ACK error after {:?}: {trimmed}", commands.len(), t0.elapsed());
+                return Err(Error::MpdError(trimmed.to_string()));
+            }
+            lines.push(trimmed.to_string());
+        }
+        let elapsed = t0.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            log::warn!("[adapter] send_batch({} cmds) took {:?}, {} lines", commands.len(), elapsed, lines.len());
+        }
+        Ok(lines)
+    }
+
     pub fn send_command(&mut self, command: &str) -> Result<Vec<String>, Error> {
         let t0 = std::time::Instant::now();
         let cmd = format!("{}\n", command);

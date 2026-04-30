@@ -99,23 +99,46 @@ fn handle_client(stream: TcpStream, received: &Arc<Mutex<Vec<String>>>) {
 
     let _ = writeln!(writer, "OK MPD 0.24.0");
 
+    let mut batch_mode = false;
+    let mut batch_responses: Vec<String> = Vec::new();
+
     for line_result in reader.lines() {
         match line_result {
             Ok(line) => {
-                let trimmed = line.trim();
+                let trimmed = line.trim().to_string();
                 if trimmed.is_empty() || trimmed == "close" {
                     if trimmed == "close" {
                         received.lock().unwrap().push("close".to_string());
                     }
                     break;
                 }
-                let cmd = trimmed.split_whitespace().next().unwrap_or(trimmed);
-                received.lock().unwrap().push(cmd.to_string());
-                let response = get_response(trimmed);
-                for resp_line in response {
-                    let _ = writeln!(writer, "{resp_line}");
+                if trimmed == "command_list_begin" {
+                    batch_mode = true;
+                    batch_responses.clear();
+                    continue;
                 }
-                let _ = writeln!(writer, "OK");
+                if trimmed == "command_list_end" {
+                    for resp_line in &batch_responses {
+                        let _ = writeln!(writer, "{resp_line}");
+                    }
+                    let _ = writeln!(writer, "OK");
+                    batch_mode = false;
+                    batch_responses.clear();
+                    continue;
+                }
+                let cmd = trimmed.split_whitespace().next().unwrap_or(&trimmed).to_string();
+                received.lock().unwrap().push(cmd);
+                let response = get_response(&trimmed);
+                if batch_mode {
+                    for resp_line in response {
+                        batch_responses.push(resp_line);
+                    }
+                } else {
+                    for resp_line in response {
+                        let _ = writeln!(writer, "{resp_line}");
+                    }
+                    let _ = writeln!(writer, "OK");
+                }
             }
             Err(_) => break,
         }

@@ -385,9 +385,12 @@ fn connected_loop(
                     }
                     MpdCommand::PlayFile(path) => {
                         let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
-                        if let Err(e) = adapter.send_command("clear") { log::error!("PlayFile clear failed: {e}"); }
-                        if let Err(e) = adapter.send_command(&format!("add \"{}\"", escaped)) { log::error!("PlayFile add failed: {e}"); }
-                        if let Err(e) = adapter.send_command("play 0") { log::error!("PlayFile play failed: {e}"); }
+                        let cmds = vec![
+                            "clear".to_string(),
+                            format!("add \"{escaped}\""),
+                            "play 0".to_string(),
+                        ];
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayFile failed: {e}"); }
                         if let Some(update) = fetch_full_update(&mut adapter) {
                             let _ = event_tx.try_send(MpdEvent::StateChanged(update));
                         }
@@ -428,7 +431,11 @@ fn connected_loop(
                     MpdCommand::Add(album) => {
                         match adapter.find_album_uris(&album) {
                             Ok(uris) => {
-                                for uri in &uris { if let Err(e) = adapter.addid(uri) { log::error!("Add addid failed: {e}"); } }
+                                if uris.is_empty() { break; }
+                                let cmds: Vec<String> = uris.iter()
+                                    .map(|uri| format!("addid \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
+                                    .collect();
+                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("Add album failed: {e}"); }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
                                 }
@@ -469,11 +476,13 @@ fn connected_loop(
                     MpdCommand::PlayAlbum(album) => {
                         match adapter.find_album_uris(&album) {
                             Ok(uris) => {
-                                if let Err(e) = adapter.send_command("clear") { log::error!("PlayAlbum clear failed: {e}"); }
+                                let mut cmds = vec!["clear".to_string()];
                                 for uri in &uris {
-                                    if let Err(e) = adapter.addid(uri) { log::error!("PlayAlbum addid failed: {e}"); }
+                                    let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+                                    cmds.push(format!("addid \"{escaped}\""));
                                 }
-                                if let Err(e) = adapter.send_command("play 0") { log::error!("PlayAlbum play failed: {e}"); }
+                                cmds.push("play 0".to_string());
+                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayAlbum failed: {e}"); }
                                 if let Some(update) = fetch_full_update(&mut adapter) {
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
                                 }
