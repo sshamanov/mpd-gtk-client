@@ -77,6 +77,7 @@ impl ActualRead {
     pub fn process_one(
         &mut self,
         adapter: &mut MpdAdapter,
+        caps: &crate::mpd::MpdCapabilities,
         provider: &CoverProvider,
         event_tx: &EventSender,
     ) {
@@ -105,28 +106,32 @@ impl ActualRead {
         };
 
         // Step 2: Primary — albumart
-        match adapter.albumart(&album_name) {
-            Ok(Some(data)) => {
-                if self.handle_albumart_data(&album_name, &data, provider, event_tx) {
-                    return; // Handled successfully (emitted or skipped)
+        if caps.albumart {
+            match adapter.albumart(&album_name) {
+                Ok(Some(data)) => {
+                    if self.handle_albumart_data(&album_name, &data, provider, event_tx) {
+                        return; // Handled successfully (emitted or skipped)
+                    }
                 }
-            }
-            Ok(None) => { /* albumart returned no data, try readpicture */ }
-            Err(e) => {
-                log::debug!("[actual_read] albumart failed for '{album_name}': {e}");
+                Ok(None) => { /* albumart returned no data, try readpicture */ }
+                Err(e) => {
+                    log::debug!("[actual_read] albumart failed for '{album_name}': {e}");
+                }
             }
         }
 
         // Step 3: Fallback — readpicture
-        match adapter.readpicture(&uri) {
-            Ok(Some((data, mtime))) => {
-                self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
-            }
-            Ok(None) => {
-                log::debug!("[actual_read] No cover found for '{album_name}' (albumart + readpicture both empty)");
-            }
-            Err(e) => {
-                log::debug!("[actual_read] readpicture failed for '{album_name}': {e}");
+        if caps.readpicture {
+            match adapter.readpicture(&uri) {
+                Ok(Some((data, mtime))) => {
+                    self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
+                }
+                Ok(None) => {
+                    log::debug!("[actual_read] No cover found for '{album_name}' (albumart + readpicture both empty)");
+                }
+                Err(e) => {
+                    log::debug!("[actual_read] readpicture failed for '{album_name}': {e}");
+                }
             }
         }
 

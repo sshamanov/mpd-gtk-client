@@ -86,10 +86,14 @@ fn try_unix_socket_connect() -> Result<MpdAdapter, Error> {
                             log::warn!("[adapter] Unix socket {}: bad greeting, trying next", path.display());
                             continue;
                         }
-                        log::info!("[adapter] MPD greeting via Unix socket: {}", greeting.trim());
+                        let ver_str = greeting.trim().to_string();
+                        let version = MpdVersion::parse(&ver_str);
+                        log::info!("[adapter] MPD greeting via Unix socket: {} (version {version})", greeting.trim());
                         let adap = MpdAdapter {
                             reader,
                             stream: MpdStream::Unix(stream),
+                            protocol_version: Some(version.to_string()),
+                            capabilities: MpdCapabilities::from_version(&version),
                         };
                         return Ok(adap);
                     }
@@ -173,9 +177,81 @@ pub enum Error {
     MpdError(String),
 }
 
+/// Parsed MPD protocol version from the greeting banner.
+#[derive(Debug, Clone, Default)]
+pub struct MpdVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl std::fmt::Display for MpdVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl MpdVersion {
+    fn parse(greeting: &str) -> Self {
+        // Greeting format: "OK MPD {major}.{minor}.{patch}" or "OK {major}.{minor}.{patch}"
+        let s = greeting
+            .strip_prefix("OK ")
+            .and_then(|s| s.strip_prefix("MPD ").or(Some(s)))
+            .unwrap_or("");
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() >= 3 {
+            Self {
+                major: parts[0].parse().unwrap_or(0),
+                minor: parts[1].parse().unwrap_or(0),
+                patch: parts[2].parse().unwrap_or(0),
+            }
+        } else if parts.len() == 2 {
+            Self {
+                major: parts[0].parse().unwrap_or(0),
+                minor: parts[1].parse().unwrap_or(0),
+                patch: 0,
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    fn supports_readpicture(&self) -> bool {
+        self.major >= 1 || (self.major == 0 && self.minor >= 24)
+    }
+
+    fn supports_albumart(&self) -> bool {
+        self.major >= 1 || (self.major == 0 && self.minor >= 21)
+    }
+}
+
 pub struct MpdAdapter {
     reader: BufReader<MpdStream>,
     stream: MpdStream,
+    pub protocol_version: Option<String>,
+    pub capabilities: MpdCapabilities,
+}
+
+/// Feature capability matrix computed from MPD protocol version.
+#[derive(Debug, Clone)]
+pub struct MpdCapabilities {
+    pub readpicture: bool,
+    pub albumart: bool,
+}
+
+impl MpdCapabilities {
+    fn from_version(version: &MpdVersion) -> Self {
+        Self {
+            readpicture: version.supports_readpicture(),
+            albumart: version.supports_albumart(),
+        }
+    }
+}
+
+impl Default for MpdCapabilities {
+    fn default() -> Self {
+        Self { readpicture: false, albumart: true }
+    }
 }
 
 impl MpdAdapter {
@@ -207,7 +283,7 @@ impl MpdAdapter {
         let mut reader = BufReader::new(MpdStream::Tcp(reader_stream));
         // Read and validate the MPD protocol greeting line
         let mut greeting = String::new();
-        match reader.read_line(&mut greeting) {
+        let protocol_version = match reader.read_line(&mut greeting) {
             Ok(0) => return Err(Error::Protocol("MPD closed connection during greeting".into())),
             Err(e) => return Err(Error::Connection(e)),
             Ok(_) => {
@@ -218,9 +294,17 @@ impl MpdAdapter {
                         greeting.trim()
                     )));
                 }
+                greeting.trim().to_string()
             }
-        }
-        Ok(Self { reader, stream: MpdStream::Tcp(stream) })
+        };
+        let version = MpdVersion::parse(&protocol_version);
+        log::info!("[adapter] MPD protocol version: {version}");
+        Ok(Self {
+            reader,
+            stream: MpdStream::Tcp(stream),
+            protocol_version: Some(version.to_string()),
+            capabilities: MpdCapabilities::from_version(&version),
+        })
     }
 
     /// Send multiple commands as a single MPD command list (command_list_begin/end).

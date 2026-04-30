@@ -517,7 +517,8 @@ fn connected_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Process one pending cover fetch per idle cycle to avoid blocking
                 if actual_read.has_pending() {
-                    actual_read.process_one(&mut adapter, &cover_provider.read().unwrap(), event_tx);
+                    let caps = adapter.capabilities.clone();
+                    actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
                 }
                 // Fall through to status poll check below
             }
