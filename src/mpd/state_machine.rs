@@ -258,8 +258,12 @@ fn connected_loop(
     let mut last_song_pos: Option<u32>;
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
-    let mut cover_fetcher = crate::coverart::CoverFetcher::new();
-    let mut pending_covers: Vec<(String, String)> = Vec::new();
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("mpd-client")
+        .join("covers");
+    let cover_provider = std::sync::Arc::new(std::sync::RwLock::new(crate::coverart::CoverProvider::new()));
+    let mut actual_read = crate::coverart::ActualRead::new(cache_dir);
     let mut cached_flat_albums: Vec<(String, String)> = Vec::new();
 
     // Initial status fetch
@@ -364,8 +368,8 @@ fn connected_loop(
                         }
                     }
                     MpdCommand::FetchCovers(albums) => {
-                        // Store pending cover fetches; processed one per idle cycle below
-                        pending_covers = albums;
+                        // Enqueue covers for background fetch; processed one per idle cycle below
+                        actual_read.enqueue(albums);
                     }
                     MpdCommand::Search(query) => {
                         if let Ok(results) = adapter.search_albums(&query) {
@@ -500,15 +504,8 @@ fn connected_loop(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Process one pending cover fetch per idle cycle to avoid blocking
-                if !pending_covers.is_empty() {
-                    let (_, album_name) = pending_covers.remove(0);
-                    log::debug!("[MPD] fetching cover for '{album_name}' ({}/{} left)",
-                        pending_covers.len(), pending_covers.len() + 1);
-                    if let Some(path) = cover_fetcher.fetch_cover(&album_name, &mut adapter) {
-                        let mut covers = std::collections::HashMap::new();
-                        covers.insert(album_name, Some(path.to_string_lossy().to_string()));
-                        let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
-                    }
+                if actual_read.has_pending() {
+                    actual_read.process_one(&mut adapter, &cover_provider.read().unwrap(), &event_tx);
                 }
                 // Fall through to status poll check below
             }

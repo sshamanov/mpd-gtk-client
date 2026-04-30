@@ -107,7 +107,7 @@ development_status:
 
   epic-13: in-progress
   13-1-coverprovider-cache-read: done
-  13-2-actualread-background-fetch: backlog
+  13-2-actualread-background-fetch: done
   13-3-scroll-aware-cover-loading: backlog
   13-4-widget-registry-in-place-updates: backlog
   13-5-online-cover-lookup: backlog

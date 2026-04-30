@@ -30,12 +30,12 @@ pub struct CachedCover {
 
 /// Internal index entry stored in index.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct IndexEntry {
+pub(crate) struct IndexEntry {
     /// Hex-encoded MD5 hash; also the filename stem: `{md5}.jpg`.
-    md5: String,
+    pub(crate) md5: String,
     /// Optional mtime timestamp from readpicture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    timestamp: Option<u64>,
+    pub(crate) timestamp: Option<u64>,
 }
 
 /// Fast synchronous cache reader for cover art.
@@ -44,8 +44,8 @@ struct IndexEntry {
 /// Internal index is behind `std::sync::RwLock`, allowing concurrent reads and
 /// infrequent writes (invalidate). Share via `Arc<CoverProvider>`.
 pub struct CoverProvider {
-    cache_dir: PathBuf,
-    index: RwLock<HashMap<String, IndexEntry>>,
+    pub(crate) cache_dir: PathBuf,
+    pub(crate) index: RwLock<HashMap<String, IndexEntry>>,
 }
 
 impl CoverProvider {
@@ -143,6 +143,26 @@ impl CoverProvider {
             if index.remove(album_id).is_some() {
                 log::debug!("[cover_provider] Invalidated index entry for '{album_id}'");
             }
+        }
+    }
+
+    /// Update or insert an entry in the in-memory index.
+    ///
+    /// Used by ActualRead after writing a new cache entry, so that the next
+    /// `get()` call returns the updated data without an extra disk scan.
+    /// Unlike `invalidate()`, this preserves the entry for dedup comparisons.
+    pub(crate) fn update_entry(&self, album_id: &str, md5: &str, timestamp: Option<u64>) {
+        if let Ok(mut index) = self.index.write() {
+            index.insert(
+                album_id.to_string(),
+                IndexEntry {
+                    md5: md5.to_string(),
+                    timestamp,
+                },
+            );
+            log::debug!(
+                "[cover_provider] Updated index entry for '{album_id}' -> {md5}"
+            );
         }
     }
 

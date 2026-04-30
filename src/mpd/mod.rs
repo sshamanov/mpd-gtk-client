@@ -230,6 +230,12 @@ fn parse_albumart_size(raw: &[u8]) -> Option<usize> {
     s.lines().find_map(|l| l.strip_prefix("size: ").and_then(|v| v.parse().ok()))
 }
 
+/// Parse the mtime timestamp from a readpicture response.
+fn parse_albumart_mtime(raw: &[u8]) -> Option<u64> {
+    let s = String::from_utf8_lossy(raw);
+    s.lines().find_map(|l| l.strip_prefix("mtime: ").and_then(|v| v.parse().ok()))
+}
+
 /// Parse the binary data chunk from an albumart response.
 fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
     let header = b"binary: ";
@@ -281,6 +287,45 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         if data.is_empty() { return Ok(None); }
         log::info!("[adapter] albumart: got {}/{} bytes for '{album}'", data.len(), total_size);
         Ok(Some(data))
+    }
+
+    /// Fetch embedded album art via MPD's `readpicture` command. Returns raw JPEG/PNG bytes
+    /// plus the mtime timestamp. Requires MPD >= 0.24.
+    /// Issues multiple commands with increasing offsets to reassemble large images.
+    pub fn readpicture(&mut self, uri: &str) -> Result<Option<(Vec<u8>, u64)>, Error> {
+        let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+        let cmd = format!("readpicture \"{}\" 0\n", escaped);
+        self.stream.write_all(cmd.as_bytes())?;
+        self.stream.flush()?;
+        let raw = self.read_albumart_response()?;
+        if raw.is_empty() { return Ok(None); }
+
+        let total_size = Self::parse_albumart_size(&raw);
+        let mtime = Self::parse_albumart_mtime(&raw);
+        let Some(size) = total_size else { return Ok(None); };
+        let Some(mtime_val) = mtime else {
+            log::warn!("[adapter] readpicture: no mtime in response for '{uri}'");
+            return Ok(None);
+        };
+
+        // Collect first chunk
+        let mut data = Self::parse_albumart_chunk(&raw);
+
+        // Fetch remaining chunks
+        while data.len() < size {
+            let cmd = format!("readpicture \"{}\" {}\n", escaped, data.len());
+            self.stream.write_all(cmd.as_bytes())?;
+            self.stream.flush()?;
+            let raw = self.read_albumart_response()?;
+            if raw.is_empty() { break; }
+            let chunk = Self::parse_albumart_chunk(&raw);
+            if chunk.is_empty() { break; }
+            data.extend_from_slice(&chunk);
+        }
+
+        if data.is_empty() { return Ok(None); }
+        log::info!("[adapter] readpicture: got {}/{} bytes for '{uri}'", data.len(), size);
+        Ok(Some((data, mtime_val)))
     }
 
     /// Find all track URIs for an album.
