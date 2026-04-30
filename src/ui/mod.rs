@@ -891,6 +891,22 @@ impl App {
             now_playing.append(&format_badge);
             right_pane.append(&now_playing);
 
+            // Current album track window
+            let track_win_label = Label::new(Some("Album Tracks"));
+            track_win_label.set_halign(gtk4::Align::Start);
+            track_win_label.set_margin_start(12);
+            track_win_label.set_margin_top(8);
+            track_win_label.set_css_classes(&["queue-header"]);
+            right_pane.append(&track_win_label);
+
+            let track_win_list = ListBox::new();
+            track_win_list.set_selection_mode(gtk4::SelectionMode::Single);
+            let track_win_scroll = ScrolledWindow::new();
+            track_win_scroll.set_child(Some(&track_win_list));
+            track_win_scroll.set_max_content_height(180);
+            track_win_scroll.set_propagate_natural_height(true);
+            right_pane.append(&track_win_scroll);
+
             // Queue display in right rail
             let queue_label = Label::new(Some("Queue"));
             queue_label.set_halign(gtk4::Align::Start);
@@ -1047,6 +1063,8 @@ impl App {
             let fc_seekbar = seekbar.clone();
             let fc_fmt = format_badge.clone();
             let fc_np_cover = np_cover.clone();
+            let fc_track_win = track_win_list.clone();
+            let fc_track_cmd = cmd_tx.clone();
             let fc_grid = album_grid.clone();
             let fc_stack = left_stack.clone();
             let fc_empty = empty_label.clone();
@@ -1112,7 +1130,18 @@ impl App {
                         }
                         MpdEvent::StateChanged(update) => {
                             fc_current_song_pos.set(update.song.map(|s| s as i32));
+                            let album_changed = fc_current_album.borrow().as_deref() != update.album.as_deref();
                             *fc_current_album.borrow_mut() = update.album.clone();
+                            if album_changed {
+                                if let Some(ref album) = update.album {
+                                    let _ = fc_track_cmd.send(MpdCommand::ListAlbumTracks(album.clone()));
+                                } else {
+                                    // Clear the track window
+                                    while let Some(child) = fc_track_win.first_child() {
+                                        fc_track_win.remove(&child);
+                                    }
+                                }
+                            }
                             update_now_playing(NowPlayingWidgets {
     title: &fc_tl,
     artist: &fc_ar,
@@ -1243,6 +1272,27 @@ impl App {
                         MpdEvent::DirectoryListing(path, entries) => {
                             if let Ok(mut fb) = fc_fb.try_borrow_mut() {
                                 fb.set_entries(&path, entries);
+                            }
+                        }
+                        MpdEvent::AlbumTracks(tracks) => {
+                            while let Some(child) = fc_track_win.first_child() {
+                                fc_track_win.remove(&child);
+                            }
+                            for (title, _file, duration) in tracks {
+                                let row = gtk4::ListBoxRow::new();
+                                let hbox = Box::new(Orientation::Horizontal, 6);
+                                let title_lbl = Label::new(Some(&title));
+                                title_lbl.set_halign(gtk4::Align::Start);
+                                title_lbl.set_hexpand(true);
+                                title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                                hbox.append(&title_lbl);
+                                if duration > 0.0 {
+                                    let dur_lbl = Label::new(Some(&format!("{}:{:02}", duration as u64 / 60, duration as u64 % 60)));
+                                    dur_lbl.set_css_classes(&["time-label"]);
+                                    hbox.append(&dur_lbl);
+                                }
+                                row.set_child(Some(&hbox));
+                                fc_track_win.append(&row);
                             }
                         }
                         MpdEvent::Queue(queue) => {
@@ -1423,7 +1473,9 @@ impl App {
                  .queue-current { background-color: @theme_selected_bg_color; }
                  .queue-artist { font-size: 0.85em; color: gray; }
                  .shortcut-key { font-weight: bold; }
-                 .error-label { color: #f44336; font-size: 0.85em; }"
+                 .error-label { color: #f44336; font-size: 0.85em; }
+                 .format-badge { font-size: 0.85em; color: gray; padding: 2px 0; }
+                 .seekbar { margin: 4px 0; min-height: 12px; }"
             );
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),

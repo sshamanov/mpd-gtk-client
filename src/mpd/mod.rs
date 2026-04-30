@@ -572,6 +572,33 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
             .collect())
     }
 
+    /// Find all tracks for an album with metadata. Returns (title, file, duration).
+    pub fn find_album_tracks(&mut self, album: &str) -> Result<Vec<(String, String, f64)>, Error> {
+        let escaped = album.replace('\\', "\\\\").replace('"', "\\\"");
+        let lines = self.send_command(&format!("find album \"{}\"", escaped))?;
+        let mut tracks = Vec::new();
+        let mut current_file = String::new();
+        let mut current_title = String::new();
+        let mut current_duration = 0.0_f64;
+        for line in &lines {
+            if let Some(file) = line.strip_prefix("file: ") {
+                if !current_file.is_empty() {
+                    tracks.push((std::mem::take(&mut current_title), std::mem::take(&mut current_file), current_duration));
+                    current_duration = 0.0;
+                }
+                current_file = file.to_string();
+            } else if let Some(title) = line.strip_prefix("Title: ") {
+                current_title = title.to_string();
+            } else if let Some(dur) = line.strip_prefix("Duration: ").and_then(|s| s.parse::<f64>().ok()) {
+                current_duration = dur;
+            }
+        }
+        if !current_file.is_empty() {
+            tracks.push((current_title, current_file, current_duration));
+        }
+        Ok(tracks)
+    }
+
     /// List all album names in the library.
     pub fn list_album_names(&mut self) -> Result<Vec<String>, Error> {
         let lines = self.send_command("list album")?;

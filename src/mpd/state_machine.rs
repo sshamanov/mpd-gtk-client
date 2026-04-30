@@ -34,6 +34,8 @@ pub enum MpdCommand {
     Clear,
     Reconnect,
     FetchCovers(Vec<(String, String)>),
+    /// Fetch all tracks for a given album name.
+    ListAlbumTracks(String),
     /// Send the MPD `close` command and exit the connected loop gracefully.
     Close,
 }
@@ -54,6 +56,8 @@ pub enum MpdEvent {
     CoverPaths(std::collections::HashMap<String, Option<String>>),
     /// Cover art data fetched by ActualRead, carrying raw JPEG bytes for direct texture decode.
     CoverRefreshed { album_id: String, data: Vec<u8> },
+    /// Tracks of the currently playing album: Vec<(title, file, duration)>.
+    AlbumTracks(Vec<(String, String, f64)>),
     Error(String),
 }
 
@@ -382,6 +386,11 @@ fn connected_loop(
                     MpdCommand::ListDirectory(path) => {
                         if let Ok(entries) = adapter.lsinfo(&path) {
                             let _ = event_tx.try_send(MpdEvent::DirectoryListing(path, entries));
+                        }
+                    }
+                    MpdCommand::ListAlbumTracks(album) => {
+                        if let Ok(tracks) = adapter.find_album_tracks(&album) {
+                            let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks));
                         }
                     }
                     MpdCommand::PlayFile(path) => {
