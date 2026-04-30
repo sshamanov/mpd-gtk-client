@@ -7,9 +7,104 @@ pub mod state_machine;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
+
+/// Unified stream type supporting both TCP and Unix sockets.
+enum MpdStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Read for MpdStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            MpdStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            MpdStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for MpdStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            MpdStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            MpdStream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            MpdStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            MpdStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+impl MpdStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            MpdStream::Tcp(s) => s.set_read_timeout(timeout),
+            #[cfg(unix)]
+            MpdStream::Unix(_) => Ok(()), // Unix sockets don't need timeouts
+        }
+    }
+
+}
+
+/// Try connecting to MPD via Unix socket at common paths.
+/// Returns the first successful connection, or None if all paths fail.
+#[cfg(unix)]
+fn try_unix_socket_connect() -> Result<MpdAdapter, Error> {
+    let paths = [
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| std::path::PathBuf::from(d).join("mpd/socket"))
+            .ok(),
+        Some(std::path::PathBuf::from("/run/mpd/socket")),
+    ];
+
+    for path in paths.into_iter().flatten() {
+        match UnixStream::connect(&path) {
+            Ok(stream) => {
+                log::info!("[adapter] connected via Unix socket at {}", path.display());
+                let clone = MpdStream::Unix(stream.try_clone()?);
+                let mut reader = BufReader::new(clone);
+                let mut greeting = String::new();
+                match reader.read_line(&mut greeting) {
+                    Ok(0) | Err(_) => {
+                        log::warn!("[adapter] Unix socket {}: no greeting, trying next", path.display());
+                        continue;
+                    }
+                    Ok(_) => {
+                        if !greeting.trim().starts_with("OK ") {
+                            log::warn!("[adapter] Unix socket {}: bad greeting, trying next", path.display());
+                            continue;
+                        }
+                        log::info!("[adapter] MPD greeting via Unix socket: {}", greeting.trim());
+                        let adap = MpdAdapter {
+                            reader,
+                            stream: MpdStream::Unix(stream),
+                        };
+                        return Ok(adap);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("[adapter] Unix socket {}: {e}, trying next", path.display());
+            }
+        }
+    }
+    Err(Error::Connection(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no Unix socket found",
+    )))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Album {
@@ -79,12 +174,27 @@ pub enum Error {
 }
 
 pub struct MpdAdapter {
-    reader: BufReader<TcpStream>,
-    stream: TcpStream,
+    reader: BufReader<MpdStream>,
+    stream: MpdStream,
 }
 
 impl MpdAdapter {
+    /// Connect to MPD via TCP host:port or Unix socket path.
+    /// If `host` is "auto" or empty, attempts Unix socket auto-detection
+    /// with fallback chain: $XDG_RUNTIME_DIR/mpd/socket → /run/mpd/socket → localhost:6600.
     pub fn connect(host: &str, port: u16) -> Result<Self, Error> {
+        if host.is_empty() || host == "auto" {
+            #[cfg(unix)]
+            if let Ok(adapter) = try_unix_socket_connect() {
+                return Ok(adapter);
+            }
+            // Fallback to TCP
+            return Self::connect_tcp("localhost", 6600);
+        }
+        Self::connect_tcp(host, port)
+    }
+
+    fn connect_tcp(host: &str, port: u16) -> Result<Self, Error> {
         let stream = TcpStream::connect_timeout(
             &(host, port).to_socket_addrs()?.next().ok_or_else(|| {
                 Error::Connection(std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve host"))
@@ -93,7 +203,8 @@ impl MpdAdapter {
         )?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-        let mut reader = BufReader::new(stream.try_clone()?);
+        let reader_stream = stream.try_clone()?;
+        let mut reader = BufReader::new(MpdStream::Tcp(reader_stream));
         // Read and validate the MPD protocol greeting line
         let mut greeting = String::new();
         match reader.read_line(&mut greeting) {
@@ -109,7 +220,7 @@ impl MpdAdapter {
                 }
             }
         }
-        Ok(Self { reader, stream })
+        Ok(Self { reader, stream: MpdStream::Tcp(stream) })
     }
 
     /// Send multiple commands as a single MPD command list (command_list_begin/end).
