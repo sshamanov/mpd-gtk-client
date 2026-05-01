@@ -155,10 +155,10 @@ development_status:
   19-1-auto-start-support: done
 
   epic-20: backlog
-  20-1-install-desktop-file: in-progress
+  20-1-install-desktop-file: done
 
   epic-21: backlog
-  21-1-performance-profiling: backlog
+  21-1-performance-profiling: in-progress
 
   epic-22: backlog
   22-1-libadwaita-integration: backlog
