@@ -69,7 +69,12 @@ pub struct Config {
     /// Window geometry for session restoral (saved on graceful shutdown).
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+    /// High contrast mode for accessibility.
+    #[serde(default = "default_false")]
+    pub high_contrast: bool,
 }
+
+fn default_false() -> bool { false }
 
 /// A named MPD connection profile — either a Unix socket path or TCP host:port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +119,7 @@ impl Default for Config {
             last_profile: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             window_geometry: None,
+            high_contrast: false,
         }
     }
 }

@@ -145,3 +145,10 @@ development_status:
   17-1-populate-sharedstate-currentcontext: done
   17-2-mpris-propertieschanged-emission: done
   17-3-dbus-session-bus-reconnection: done
+
+  epic-18: in-progress
+  18-1-high-contrast-mode: ready-for-dev
+  18-2-keyboard-navigation-audit: ready-for-dev
+
+  epic-19: in-progress
+  19-1-auto-start-support: ready-for-dev

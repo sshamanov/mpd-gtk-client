@@ -167,6 +167,35 @@ fn calculate_visible_albums(
 
 type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;
 
+/// High-contrast CSS overrides for WCAG 2.1 AA compliance.
+/// Applied at PRIORITY_APPLICATION + 1 to override the base theme.
+const HC_CSS: &str = "\
+@define-color theme_bg_color #000000;
+@define-color theme_fg_color #ffffff;
+@define-color theme_base_color #000000;
+@define-color theme_text_color #ffffff;
+@define-color theme_selected_bg_color #4A90D9;
+@define-color theme_selected_fg_color #ffffff;
+@define-color theme_unfocused_bg_color #000000;
+@define-color theme_unfocused_fg_color #ffffff;
+@define-color theme_unfocused_base_color #000000;
+@define-color theme_unfocused_text_color #ffffff;
+@define-color borders #ffffff;
+@define-color theme_link_color #7AB5F5;
+@define-color error_color #FF6B6B;
+@define-color warning_color #FFD93D;
+@define-color success_color #6BCB77;
+#connection-indicator.disconnected { background-color: #FF6B6B; }
+#connection-indicator.connected { background-color: #6BCB77; }
+#connection-indicator.connecting { background-color: #FFD93D; }
+.queue-artist { color: #CCCCCC; }
+.format-badge { color: #CCCCCC; }
+.error-label { color: #FF6B6B; }
+#album-grid-status { color: #CCCCCC; }
+.breadcrumb-sep { color: #CCCCCC; }
+.queue-current { background-color: #4A90D9; }
+";
+
 pub struct App {
     state: SharedState,
     event_rx: Arc<Mutex<mpsc::Receiver<MpdEvent>>>,
@@ -999,6 +1028,12 @@ impl App {
                 split_scale.set_hexpand(true);
                 content.append(&split_scale);
 
+                // High contrast toggle
+                let hc_check = gtk4::CheckButton::with_label("High Contrast Mode");
+                hc_check.set_active(scfg.high_contrast);
+                hc_check.set_margin_top(8);
+                content.append(&hc_check);
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");
@@ -1013,9 +1048,11 @@ impl App {
                 let sp = settings_paned.clone();
                 let pd_profile = profile_dropdown.clone();
                 let pd_names = profile_names.clone();
+                let hc_checkbox = hc_check.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.split_ratio = sa.value();
+                    c.high_contrast = hc_checkbox.is_active();
 
                     // Apply selected profile first (overrides host/port)
                     if pd_names.len() > 1 {
@@ -2262,6 +2299,22 @@ impl App {
                 &css,
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+
+            // High contrast CSS support (accessibility)
+            let hc_css_cell: std::cell::Cell<Option<gtk4::CssProvider>> = std::cell::Cell::new(None);
+            let should_enable_hc = cfg.high_contrast
+                || std::env::var("GTK_THEME").as_deref() == Ok("HighContrast")
+                || std::env::var("GTK_THEME").as_deref() == Ok("Adwaita:highcontrast");
+            if should_enable_hc {
+                let hc_provider = gtk4::CssProvider::new();
+                hc_provider.load_from_string(HC_CSS);
+                gtk4::style_context_add_provider_for_display(
+                    &gtk4::prelude::WidgetExt::display(&window),
+                    &hc_provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+                hc_css_cell.set(Some(hc_provider));
+            }
         });
 
         application.run();
