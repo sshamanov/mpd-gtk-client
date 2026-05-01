@@ -1,6 +1,6 @@
 # Story 23.1: Centralized Keybinding Service
 
-Status: backlog
+Status: done
 
 ## Story
 

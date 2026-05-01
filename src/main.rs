@@ -5,6 +5,7 @@ pub mod constants;
 pub mod coverart;
 pub mod errors;
 pub mod ipc;
+pub mod keybindings;
 pub mod logging;
 pub mod profiling;
 pub mod mpd;
