@@ -221,10 +221,19 @@ fn main() {
         })
         .expect("Failed to spawn IPC listener thread");
 
+    // MPRIS update channel (live only when feature is enabled, but the App always holds the sender)
+    #[cfg(feature = "mpris")]
+    let (mpris_update_tx, mpris_update_rx) = std::sync::mpsc::channel::<mpd::state_machine::PlaybackUpdate>();
+    #[cfg(not(feature = "mpris"))]
+    let (mpris_update_tx, _) = std::sync::mpsc::channel::<mpd::state_machine::PlaybackUpdate>();
+
     // Initialize D-Bus services (feature-gated, opt-in via config)
     #[cfg(feature = "mpris")]
     let _notif_handle = {
-        let _mpris_conn = mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled);
+        let _mpris_conn = mpris::init(
+            cmd_tx.clone(), state.clone(), config.mpris.enabled,
+            mpris_update_rx,
+        );
         notifications::spawn(state.clone(), config.notifications.libnotify)
     };
     #[cfg(not(feature = "mpris"))]
@@ -249,7 +258,7 @@ fn main() {
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();
-    let app = App::new(state, event_rx, cmd_tx, conn_params);
+    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx);
     app.run();
 
     info!("Shutting down MPD connection");

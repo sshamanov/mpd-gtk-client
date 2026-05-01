@@ -10,13 +10,14 @@
 
 #![cfg(feature = "mpris")]
 
-use crate::mpd::state_machine::MpdCommand;
+use crate::mpd::state_machine::{MpdCommand, PlaybackUpdate};
 use crate::state::{AppState, PlaybackState, SharedState};
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::thread;
 use zbus::blocking::Connection;
 use zbus::fdo;
-use zbus::zvariant::Value;
+use zbus::zvariant::{ObjectPath, Value};
 
 /// Encode a filesystem path to a percent-encoded `file://` URI.
 fn file_uri(path: &std::path::Path) -> String {
@@ -336,12 +337,16 @@ impl MprisPlayer {
 /// and `org.mpris.MediaPlayer2.Player` interfaces at `/org/mpris/MediaPlayer2`,
 /// and requests the bus name.
 ///
+/// If `update_rx` is provided, spawns a listener thread that emits
+/// `PropertiesChanged` D-Bus signals when playback state updates are received.
+///
 /// Returns `Some(Connection)` on success. The connection must be kept alive for
 /// the lifetime of the application (dropping it disconnects from D-Bus).
 pub fn init(
     cmd_tx: mpsc::Sender<MpdCommand>,
     state: SharedState,
     enabled: bool,
+    update_rx: mpsc::Receiver<PlaybackUpdate>,
 ) -> Option<Connection> {
     if !enabled {
         return None;
@@ -373,11 +378,70 @@ pub fn init(
     match conn.request_name("org.mpris.MediaPlayer2.mpdclient") {
         Ok(()) => {
             log::info!("MPRIS: registered as org.mpris.MediaPlayer2.mpdclient");
-            Some(conn)
         }
         Err(e) => {
             log::warn!("MPRIS: failed to request bus name: {e}");
-            None
+            return None;
+        }
+    }
+
+    // Spawn update listener thread for PropertiesChanged signal emission
+    let emit_conn = conn.clone();
+    thread::Builder::new()
+        .name("mpris-updates".into())
+        .spawn(move || emit_loop(emit_conn, update_rx))
+        .expect("MPRIS: failed to spawn update listener thread");
+
+    Some(conn)
+}
+
+/// Background loop: receives `PlaybackUpdate` messages and emits
+/// `org.freedesktop.DBus.Properties.PropertiesChanged` for `org.mpris.MediaPlayer2.Player`.
+fn emit_loop(conn: Connection, rx: mpsc::Receiver<PlaybackUpdate>) {
+    let path: ObjectPath<'_> = match "/org/mpris/MediaPlayer2".try_into() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    while let Ok(update) = rx.recv() {
+        let mut changed: Vec<&str> = Vec::new();
+
+        if update.state == "play" || update.state == "pause" || update.state == "stop" {
+            changed.push("PlaybackStatus");
+        }
+        if update.song.is_some() || update.title.is_some() || update.album.is_some() {
+            changed.push("Metadata");
+        }
+        if update.elapsed.is_some() {
+            changed.push("Position");
+        }
+
+        if !changed.is_empty() {
+            // Emit PropertiesChanged signal via zbus blocking API
+            // Signal interface: org.freedesktop.DBus.Properties
+            // Signal name: PropertiesChanged
+            // Signature: (STRING interface, DICT<STRING,VARIANT> changed, ARRAY<STRING> invalidated)
+            let changed_properties: HashMap<&str, Value<'_>> = changed
+                .iter()
+                .map(|&name| (name, Value::new("")))
+                .collect();
+
+            let args = (
+                "org.mpris.MediaPlayer2.Player",
+                changed_properties,
+                Vec::<String>::new(),
+            );
+
+            match conn.emit_signal(
+                None::<&str>,
+                &path,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &args,
+            ) {
+                Ok(()) => log::trace!("MPRIS: PropertiesChanged for {changed:?}"),
+                Err(e) => log::debug!("MPRIS: emit_signal failed: {e}"),
+            }
         }
     }
 }

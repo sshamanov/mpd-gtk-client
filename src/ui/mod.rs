@@ -172,6 +172,8 @@ pub struct App {
     event_rx: Arc<Mutex<mpsc::Receiver<MpdEvent>>>,
     cmd_tx: mpsc::Sender<MpdCommand>,
     conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
+    /// Sender for MPRIS PropertiesChanged signal emissions (drops unused when !mpris feature).
+    mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
 }
 
 impl App {
@@ -180,12 +182,14 @@ impl App {
         event_rx: mpsc::Receiver<MpdEvent>,
         cmd_tx: mpsc::Sender<MpdCommand>,
         conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
+        mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
     ) -> Self {
         Self {
             state,
             event_rx: Arc::new(Mutex::new(event_rx)),
             cmd_tx,
             conn_params,
+            mpris_update_tx,
         }
     }
 
@@ -229,6 +233,8 @@ impl App {
         application.set_menubar(Some(&menubar));
 
         // Mode switching actions — application.add_action will be called inside connect_activate
+
+        let mpris_update_tx = self.mpris_update_tx.clone();
 
         application.connect_activate(move |window_app| {
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
@@ -1704,6 +1710,7 @@ impl App {
 
             // Mini grid captures and mode-aware queue stack switching
             let fc_state = state.clone();
+            let fc_mpris_update = mpris_update_tx.clone();
             let fc_mini_model = mini_grid_model.clone();
             let fc_mini_data = mini_grid_data.clone();
             let fc_mini_current = mini_current_album.clone();
@@ -1821,6 +1828,9 @@ impl App {
                                     });
                                 }
                             }
+
+                            // Forward PlaybackUpdate to MPRIS PropertiesChanged emitter
+                            let _ = fc_mpris_update.send(update);
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
