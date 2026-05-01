@@ -137,6 +137,6 @@ development_status:
   15-2-profile-selector-ui: done
 
   epic-16: backlog
-  16-1-config-schema-corruption: in-progress
+  16-1-config-schema-corruption: done
   16-2-rotating-log-file: backlog
   16-3-window-geometry-persistence: backlog

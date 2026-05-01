@@ -5,6 +5,7 @@ pub mod constants;
 pub mod coverart;
 pub mod errors;
 pub mod ipc;
+pub mod logging;
 pub mod mpd;
 #[cfg(feature = "mpris")]
 pub mod mpris;
@@ -139,7 +140,7 @@ fn main() {
         }
     };
 
-    env_logger::init();
+    logging::init();
     info!("Starting MPD client");
 
     // Load config — use with_profile if --profile was passed
