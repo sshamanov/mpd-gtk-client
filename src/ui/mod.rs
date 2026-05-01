@@ -2292,7 +2292,9 @@ impl App {
                  .mini-queue-label { font-size: 0.8em; padding: 2px 0; }
                  .queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }
                  .drag-remove-zone { background-color: rgba(244, 67, 54, 0.08); }
-                 .drop-indicator-row { border-top: 3px solid @theme_selected_bg_color; }"
+                 .drop-indicator-row { border-top: 3px solid @theme_selected_bg_color; }
+                 .album-cover-cell:focus-visible { outline: 2px solid @theme_selected_bg_color; outline-offset: 2px; }
+                 .album-cover-hover-btn:focus-visible { opacity: 1; outline: 2px solid @theme_selected_bg_color; }"
             );
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),

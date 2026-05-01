@@ -1,8 +1,9 @@
 //! Album cover widget helpers — grid cells with cover art, hover buttons, labels. Thread: UI (GTK main loop).
 
 use crate::mpd::state_machine::MpdCommand;
+use gtk4::gdk::Key;
 use gtk4::prelude::*;
-use gtk4::{Box, Button, DrawingArea, Label, Orientation, Overlay, Picture};
+use gtk4::{Box, Button, DrawingArea, EventControllerKey, Label, Orientation, Overlay, Picture};
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -58,12 +59,13 @@ pub fn create_album_cover(
 
     overlay.set_child(Some(&cover_area));
 
-    // Hover buttons: bottom-right, hidden by default, shown on cell hover
+    // Hover buttons: bottom-right, hidden by default, keyboard-accessible via focus
     let an = album_name.to_string();
     let tx_add = cmd_tx.clone();
     let btn_add = Button::with_label("+");
     btn_add.set_css_classes(&["album-cover-hover-btn"]);
     btn_add.set_tooltip_text(Some("Add to queue"));
+    btn_add.set_can_focus(true);
     btn_add.connect_clicked(move |_| {
         let _ = tx_add.send(MpdCommand::Add(an.clone()));
     });
@@ -73,6 +75,7 @@ pub fn create_album_cover(
     let btn_next = Button::with_label("←");
     btn_next.set_css_classes(&["album-cover-hover-btn"]);
     btn_next.set_tooltip_text(Some("Play next"));
+    btn_next.set_can_focus(true);
     btn_next.connect_clicked(move |_| {
         let _ = tx_next.send(MpdCommand::InsertNext(an.clone()));
     });
@@ -82,6 +85,7 @@ pub fn create_album_cover(
     let btn_play = Button::with_label(">");
     btn_play.set_css_classes(&["album-cover-hover-btn"]);
     btn_play.set_tooltip_text(Some("Clear queue and play"));
+    btn_play.set_can_focus(true);
     btn_play.connect_clicked(move |_| {
         let _ = tx_play.send(MpdCommand::PlayAlbum(an.clone()));
     });
@@ -104,6 +108,21 @@ pub fn create_album_cover(
     motion.connect_enter(move |_motion, _x, _y| { btn_sense.set_sensitive(true); });
     motion.connect_leave(move |_motion| { btn_sense_e.set_sensitive(false); });
     container.add_controller(motion);
+
+    // Keyboard activation: Enter/Space on the container triggers play
+    container.set_can_focus(true);
+    let key_an = album_name.to_string();
+    let key_tx = cmd_tx.clone();
+    let key_ctrl = EventControllerKey::new();
+    key_ctrl.connect_key_pressed(move |_ctrl, key, _code, _mods| {
+        if key == Key::Return || key == Key::KP_Enter || key == Key::space {
+            let _ = key_tx.send(MpdCommand::PlayAlbum(key_an.clone()));
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    container.add_controller(key_ctrl);
 
     container.append(&overlay);
 
