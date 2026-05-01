@@ -839,7 +839,6 @@ impl App {
             let grid_model = album_model.clone();
             let grid_cw = cover_widgets.clone();
             let grid_vadj = left_scroll.vadjustment();
-            let grid_cmd = cmd_tx.clone();
             let grid_target = DropTarget::new(String::static_type(), DragAction::MOVE);
             grid_target.connect_drop(move |target, value, x, y| {
                 // Only allow reorder in plain Albums view (single "All Albums" header, not multi-group)
@@ -872,8 +871,9 @@ impl App {
                                 return true; // No move needed
                             }
                             let item = data.remove(src);
+                            // After removal at src, items shift left: adjust target when inserting below
                             let insert_at = if target_idx > src {
-                                target_idx.min(data.len())
+                                target_idx.saturating_sub(1).min(data.len())
                             } else {
                                 target_idx.min(data.len())
                             };
