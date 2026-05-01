@@ -1790,6 +1790,37 @@ impl App {
     cover: &fc_np_cover,
     cover_paths: &fc_cp_np,
 }, &update);
+
+                            // Populate SharedState CurrentContext for MPRIS and other consumers
+                            if let Ok(mut app_state) = fc_state.write() {
+                                if update.state == "stop" {
+                                    app_state.current.track = None;
+                                    app_state.current.album = None;
+                                } else {
+                                    let dur = update.duration
+                                        .map(std::time::Duration::from_secs_f64);
+                                    let track_name = update.title.clone().unwrap_or_default();
+                                    let album_name = update.album.clone().unwrap_or_default();
+                                    let artist_name = update.artist.clone().unwrap_or_default();
+                                    app_state.current.track = Some(crate::mpd::Track {
+                                        id: update.song.map(|s| s.to_string()).unwrap_or_default(),
+                                        title: track_name,
+                                        album_id: album_name.clone(),
+                                        path: std::path::PathBuf::new(),
+                                        duration: dur,
+                                        format: None,
+                                    });
+                                    app_state.current.album = Some(crate::mpd::Album {
+                                        id: album_name.clone(),
+                                        title: album_name,
+                                        artist: artist_name,
+                                        year: None,
+                                        genre: None,
+                                        cover_path: None,
+                                        tracks: vec![],
+                                    });
+                                }
+                            }
                         }
                         MpdEvent::Albums(albums) => {
                             // Build local search index
