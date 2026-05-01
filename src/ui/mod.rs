@@ -8,7 +8,8 @@ use crate::search::SearchIndex;
 use crate::state::SharedState;
 use gtk4::prelude::*;
 use gtk4::gio::ListStore;
-use gtk4::{Application, ApplicationWindow, Box, Button, EventControllerKey, GridView, Label, ListBox, NoSelection, Orientation, Overlay, Paned, Picture, ScrolledWindow, SignalListItemFactory, StringObject};
+use gtk4::{Application, ApplicationWindow, Box, Button, DragSource, DropTarget, EventControllerKey, GridView, Label, ListBox, NoSelection, Orientation, Overlay, Paned, Picture, ScrolledWindow, SignalListItemFactory, StringObject};
+use gtk4::gdk::{ContentProvider, DragAction};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -399,6 +400,23 @@ impl App {
 
                 // Store album section index in container for bind to find
                 container.append(&album_section);
+
+                // GtkDragSource for dragging album covers to queue
+                let drag_source = DragSource::new();
+                drag_source.set_actions(DragAction::COPY);
+                drag_source.connect_prepare(move |source, _x, _y| {
+                    let Some(container) = source.widget().and_then(|w| w.downcast::<Box>().ok()) else {
+                        return None::<ContentProvider>;
+                    };
+                    let album = (unsafe { widget_get_str(&container, WIDGET_ALBUM_KEY) }).unwrap_or_default();
+                    if album.is_empty() {
+                        return None::<ContentProvider>;
+                    }
+                    let value = glib::Value::from(&album);
+                    Some(ContentProvider::for_value(&value))
+                });
+                container.add_controller(drag_source);
+
                 list_item.set_child(Some(&container));
             });
 
@@ -430,6 +448,8 @@ impl App {
                     AlbumGridItem::Header { name, count } => {
                         if let Some(ref lbl) = header_w { lbl.set_text(&format!("{} ({})", name, count)); lbl.set_visible(true); }
                         if let Some(ref section) = album_w { section.set_visible(false); }
+                        // Clear album data so header cells cannot be dragged as albums
+                        unsafe { container.set_data(WIDGET_ALBUM_KEY, String::new()); }
                     }
                     AlbumGridItem::Album { artist, name, album_id: _id, pr, pg, pb } => {
                         if let Some(ref lbl) = header_w { lbl.set_visible(false); }
@@ -439,6 +459,8 @@ impl App {
                             if let Some(overlay) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
                                 unsafe { widget_set_str(&overlay, WIDGET_ALBUM_KEY, name); }
                             }
+                            // Also store on container for DragSource access
+                            unsafe { widget_set_str(&container, WIDGET_ALBUM_KEY, name); }
                             // Update title (second child of section, after overlay)
                             if let Some(t) = section.first_child()
                                 .and_then(|c| c.next_sibling())
@@ -1170,6 +1192,29 @@ impl App {
             queue_stack.set_visible_child(&mini_scroll); // Album Mode by default
             right_pane.append(&queue_stack);
 
+            // GtkDropTarget for receiving album drops from the grid
+            let dt_cmd = cmd_tx.clone();
+            let drop_target = DropTarget::new(String::static_type(), DragAction::COPY);
+            drop_target.connect_drop(move |_target, value, _x, _y| {
+                if let Ok(s) = value.get::<String>() {
+                    let _ = dt_cmd.send(MpdCommand::Add(s));
+                    return true;
+                }
+                false
+            });
+            drop_target.connect_enter(move |target, _x, _y| {
+                if let Some(w) = target.widget() {
+                    w.add_css_class("queue-drop-highlight");
+                }
+                DragAction::COPY
+            });
+            drop_target.connect_leave(move |target| {
+                if let Some(w) = target.widget() {
+                    w.remove_css_class("queue-drop-highlight");
+                }
+            });
+            queue_stack.add_controller(drop_target);
+
             // Shared item_ids for Delete key — updated by Queue event handler
             let item_ids_w: SharedIds = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
             let ql_del = queue_list.clone();
@@ -1834,7 +1879,8 @@ impl App {
                  .mini-queue-cell { padding: 4px; border-radius: 4px; }
                  .mini-queue-current { border: 2px solid @theme_selected_bg_color; border-radius: 4px; }
                  .mini-queue-cover { border-radius: 2px; }
-                 .mini-queue-label { font-size: 0.8em; padding: 2px 0; }"
+                 .mini-queue-label { font-size: 0.8em; padding: 2px 0; }
+                 .queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }"
             );
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),
