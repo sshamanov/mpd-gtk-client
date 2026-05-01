@@ -8,6 +8,8 @@ pub mod ipc;
 pub mod mpd;
 #[cfg(feature = "mpris")]
 pub mod mpris;
+#[cfg(feature = "mpris")]
+pub mod notifications;
 pub mod search;
 pub mod state;
 pub mod ui;
@@ -220,9 +222,12 @@ fn main() {
         })
         .expect("Failed to spawn IPC listener thread");
 
-    // Initialize MPRIS D-Bus interface (feature-gated, opt-in via config)
+    // Initialize D-Bus services (feature-gated, opt-in via config)
     #[cfg(feature = "mpris")]
-    let _mpris_conn = mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled);
+    let _notif_handle = {
+        let _mpris_conn = mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled);
+        notifications::spawn(state.clone(), config.notifications.libnotify)
+    };
     #[cfg(not(feature = "mpris"))]
     if config.mpris.enabled {
         log::warn!("MPRIS: enabled in config but not compiled (rebuild with --features mpris)");

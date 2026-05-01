@@ -40,6 +40,8 @@ pub struct Config {
     pub split_ratio: f64,
     #[serde(default)]
     pub mpris: MprisConfig,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -49,6 +51,14 @@ pub struct MprisConfig {
 }
 
 fn default_mpris_enabled() -> bool { false }
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    #[serde(default = "default_notif_enabled")]
+    pub libnotify: bool,
+}
+
+fn default_notif_enabled() -> bool { false }
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
@@ -61,6 +71,7 @@ impl Default for Config {
             mpd_port: default_port(),
             split_ratio: default_split_ratio(),
             mpris: MprisConfig { enabled: false },
+            notifications: NotificationsConfig { libnotify: false },
         }
     }
 }
