@@ -545,51 +545,83 @@ impl App {
             folder_content.append(&folder_search_results);
             folder_content.append(&folder_browser.borrow().container.clone());
 
-            // Show album mode by default
-            album_content.set_visible(true);
-            folder_content.set_visible(false);
+            // Mode stack with Crossfade transition animation for album/folder switching
+            let mode_stack = gtk4::Stack::new();
+            mode_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+            mode_stack.set_transition_duration(300);
+            mode_stack.add_child(&album_content);
+            mode_stack.add_child(&folder_content);
+            mode_stack.set_visible_child(&album_content);
 
-            // Mode switching: toggle visibility, save/restore scroll positions, update AppState
+            // Mode switching: use stack transitions, save/restore scroll positions, update AppState
+            let ms = mode_stack.clone();
             let ac = album_content.clone();
-            let fc = folder_content.clone();
             let mode_state = state.clone();
             let ls_album = left_scroll.clone();
+            let fb_save = folder_browser.clone();
+            let fs_container_save = folder_search_results.clone();
             let album_mode_act = gtk4::gio::SimpleAction::new("album-mode", None);
             album_mode_act.connect_activate(move |_, _| {
-                fc.set_visible(false);
+                // Save folder browsing state before switching
+                if let Ok(fb) = fb_save.try_borrow() {
+                    if let Ok(mut s) = mode_state.write() {
+                        s.folder_browsing.expanded_paths =
+                            vec![std::path::PathBuf::from(fb.shared_path.borrow().clone())];
+                        // Capture actual folder scroll position from the ScrolledWindow child of container
+                        let pos = fb.container.first_child()
+                            .and_then(|first| first.next_sibling())
+                            .and_then(|sibling| sibling.downcast::<gtk4::ScrolledWindow>().ok())
+                            .map(|sw| sw.vadjustment().value())
+                            .unwrap_or(0.0);
+                        s.folder_browsing.scroll_position = pos;
+                    }
+                }
+                // Hide folder search overlay when switching away
+                fs_container_save.set_visible(false);
                 // Restore album scroll position
                 if let Ok(s) = mode_state.read() {
                     let pos = s.album_browsing.scroll_position.1;
                     let adj = ls_album.vadjustment();
                     adj.set_value(pos.clamp(0.0, adj.upper() - adj.page_size()));
                 }
-                ac.set_visible(true);
+                ms.set_visible_child(&ac);
                 if let Ok(mut s) = mode_state.write() { s.mode = crate::state::Mode::Album; }
             });
             app_clone.add_action(&album_mode_act);
             app_clone.set_accels_for_action("app.album-mode", &["<Ctrl>1"]);
 
-            let ac2 = album_content.clone();
-            let fc2 = folder_content.clone();
+            let ms2 = mode_stack.clone();
+            let fc = folder_content.clone();
             let mode_state2 = state.clone();
             let cmd_tx2 = cmd_tx.clone();
             let ls_save = left_scroll.clone();
+            let fsc2 = folder_search_results.clone();
+            let fbb2 = folder_browser.clone();
             let folder_mode_act = gtk4::gio::SimpleAction::new("folder-mode", None);
             folder_mode_act.connect_activate(move |_, _| {
                 // Save album scroll position before hiding
                 if let Ok(mut s) = mode_state2.write() {
                     s.album_browsing.scroll_position.1 = ls_save.vadjustment().value();
                 }
-                ac2.set_visible(false);
-                fc2.set_visible(true);
-                let _ = cmd_tx2.send(MpdCommand::ListDirectory(String::new()));
+                ms2.set_visible_child(&fc);
+                // Restore folder browsing state
+                let folder_path = if let Ok(s) = mode_state2.read() {
+                    s.folder_browsing.expanded_paths.last()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                } else { String::new() };
+                let _ = cmd_tx2.send(MpdCommand::ListDirectory(folder_path));
+                // Reset folder search overlay when switching to folder mode
+                fsc2.set_visible(false);
+                if let Ok(fbb) = fbb2.try_borrow() {
+                    fbb.container.set_visible(true);
+                }
                 if let Ok(mut s) = mode_state2.write() { s.mode = crate::state::Mode::Folder; }
             });
             app_clone.add_action(&folder_mode_act);
             app_clone.set_accels_for_action("app.folder-mode", &["<Ctrl>2"]);
 
-            left_pane_box.append(&album_content);
-            left_pane_box.append(&folder_content);
+            left_pane_box.append(&mode_stack);
 
             // Album content: group bar + search + grid
             album_content.append(&group_bar);
