@@ -829,7 +829,7 @@ impl App {
                         if !results.is_empty() {
                             let items: Vec<AlbumGridItem> = results.iter()
                                 .enumerate()
-                                .map(|(i, (artist, name))| {
+                                .map(|(i, (artist, name, _score))| {
                                     let (pr, pg, pb) = placeholder_rgb(artist);
                                     AlbumGridItem::Album {
                                         artist: artist.clone(),
