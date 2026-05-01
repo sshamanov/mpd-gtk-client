@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-01"
+last_updated: "2026-05-02"
 
 
 project: mpd-client
@@ -114,29 +114,29 @@ development_status:
   13-4-widget-registry-in-place-updates: done
   13-5-online-cover-lookup: done
 
-  epic-10: in-progress
+  epic-10: done
   10-1-configurable-layout-values: done
   10-2-smooth-mode-transitions: done
   10-3-album-mini-grid-queue: done
   10-4-play-next-in-context-menu: done
 
-  epic-11: in-progress
+  epic-11: done
   11-1-drag-albums-from-grid-to-queue: done
   11-2-reorder-queue-items-via-drag: done
   11-3-remove-items-via-drag-off: done
   11-4-album-reorder-in-plain-albums-view: done
 
-  epic-14: in-progress
+  epic-14: done
   14-1-cli-argument-parsing: done
   14-2-mpris-dbus-integration: done
   14-3-second-instance-detection: done
   14-4-libnotify-notification: done
 
-  epic-15: backlog
-  15-1-multi-profile-connection-config: in-progress
+  epic-15: done
+  15-1-multi-profile-connection-config: done
   15-2-profile-selector-ui: done
 
-  epic-16: backlog
+  epic-16: done
   16-1-config-schema-corruption: done
   16-2-rotating-log-file: done
   16-3-window-geometry-persistence: done
