@@ -1679,7 +1679,7 @@ impl App {
             let ph_label = pinned_header.clone();
             let ph_adj = left_scroll.vadjustment();
             ph_adj.connect_value_changed(move |adj| {
-                let binding = ph_backing.borrow();
+                let binding = match ph_backing.try_borrow() { Ok(b) => b, Err(_) => return, };
                 // Only show pinned header when there are Header items (grouped view)
                 let has_headers = binding.iter().any(|item| matches!(item, AlbumGridItem::Header { .. }));
                 if !has_headers {
