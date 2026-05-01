@@ -141,7 +141,7 @@ development_status:
   16-2-rotating-log-file: done
   16-3-window-geometry-persistence: done
 
-  epic-17: in-progress
-  17-1-populate-sharedstate-currentcontext: ready-for-dev
-  17-2-mpris-propertieschanged-emission: ready-for-dev
-  17-3-dbus-session-bus-reconnection: ready-for-dev
+  epic-17: done
+  17-1-populate-sharedstate-currentcontext: done
+  17-2-mpris-propertieschanged-emission: done
+  17-3-dbus-session-bus-reconnection: done
