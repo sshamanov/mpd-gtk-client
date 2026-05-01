@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Commands sent from the UI thread to the MPD background thread.
+#[derive(Debug)]
 pub enum MpdCommand {
     Play,
     Pause,

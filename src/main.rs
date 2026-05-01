@@ -1,4 +1,4 @@
-//! Application entry point — initializes env_logger, creates state, starts GTK main loop. Thread: UI (startup then GTK main loop).
+//! Application entry point — CLI parsing, initializes env_logger, creates state, starts GTK main loop. Thread: UI (startup then GTK main loop).
 
 pub mod config;
 pub mod constants;
@@ -9,6 +9,7 @@ pub mod search;
 pub mod state;
 pub mod ui;
 
+use config::CliOverrides;
 use log::info;
 use mpd::state_machine::{MpdCommand, MpdEvent, MpdEventLoop};
 use state::create_initial_state;
@@ -20,12 +21,143 @@ use ui::App;
 /// Set by SIGINT/SIGTERM signal handlers to request a graceful GTK main loop exit.
 pub(crate) static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Print usage information to stdout.
+fn print_usage() {
+    println!(
+        "\
+Usage: mpd-client [OPTIONS]
+
+Session overrides (not persisted):
+  --mpd-host <HOST>        MPD server hostname (default: 127.0.0.1)
+  --mpd-port <PORT>        MPD server port (default: 6600)
+  --profile <NAME>         Connection profile name (reserved, not yet implemented)
+  --mode <album|folder>    Startup UI mode (default: album)
+
+Media actions (dispatched after connection):
+  --start-playing          Start playback
+  --toggle-playback        Toggle play/pause
+  --next                   Skip to next track
+  --prev                   Skip to previous track
+
+Info:
+  --help, -h               Show this help and exit
+  --version, -V            Print version and exit\
+"
+    );
+}
+
+/// Parse CLI arguments into overrides and an optional action command.
+///
+/// Returns `Err(String)` for unrecognized flags or missing values (caller prints to stderr
+/// and exits non-zero). Returns `Ok((overrides, action))` on success.
+///
+/// Accepts an iterator for testability. The public wrapper `parse_cli_args` passes
+/// `std::env::args().skip(1)`.
+fn parse_args<I>(args: I) -> Result<(CliOverrides, Option<MpdCommand>), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut overrides = CliOverrides::default();
+    let mut action: Option<MpdCommand> = None;
+
+    let mut args = args.into_iter().peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("mpd-client v{}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--mpd-host" => {
+                let val = args.next().ok_or_else(|| "--mpd-host requires a value".to_string())?;
+                overrides.mpd_host = Some(val);
+            }
+            "--mpd-port" => {
+                let val = args.next().ok_or_else(|| "--mpd-port requires a value".to_string())?;
+                let port: u16 = val.parse().map_err(|_| format!("Invalid port value: {val}"))?;
+                overrides.mpd_port = Some(port);
+            }
+            "--profile" => {
+                let val = args.next().ok_or_else(|| "--profile requires a value".to_string())?;
+                overrides.profile = Some(val);
+            }
+            "--mode" => {
+                let val = args.next().ok_or_else(|| "--mode requires a value".to_string())?;
+                match val.as_str() {
+                    "album" | "folder" => overrides.mode = Some(val),
+                    _ => return Err(format!("Invalid mode: {val}. Expected 'album' or 'folder'")),
+                }
+            }
+            "--start-playing" => {
+                action = Some(MpdCommand::Play);
+            }
+            "--toggle-playback" => {
+                action = Some(MpdCommand::Pause);
+            }
+            "--next" => {
+                action = Some(MpdCommand::Next);
+            }
+            "--prev" => {
+                action = Some(MpdCommand::Previous);
+            }
+            unknown => {
+                return Err(format!(
+                    "Unknown flag: {unknown}\nTry 'mpd-client --help' for usage."
+                ));
+            }
+        }
+    }
+
+    Ok((overrides, action))
+}
+
+/// Parse CLI arguments from `std::env::args()`, skipping argv[0].
+///
+/// Calls `parse_args` internally. Exits via `std::process::exit` for `--help`/`--version`.
+fn parse_cli_args() -> Result<(CliOverrides, Option<MpdCommand>), String> {
+    parse_args(std::env::args().skip(1))
+}
+
 fn main() {
+    // Parse CLI args before any other initialization
+    let (overrides, action) = match parse_cli_args() {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     env_logger::init();
     info!("Starting MPD client");
 
-    let config = config::Config::load();
+    // Load config — use with_profile if --profile was passed
+    let mut config = if let Some(ref profile) = overrides.profile {
+        config::Config::with_profile(profile)
+    } else {
+        config::Config::load()
+    };
+
+    // Apply CLI overrides to config (host, port)
+    overrides.apply_to_config(&mut config);
+
+    info!("Config: {}:{}", config.mpd_host, config.mpd_port);
+
     let state = create_initial_state();
+
+    // Apply mode override (--mode) to initial state
+    if let Some(ref mode_str) = overrides.mode {
+        if let Ok(mut s) = state.write() {
+            s.mode = match mode_str.as_str() {
+                "folder" => crate::state::Mode::Folder,
+                _ => crate::state::Mode::Album,
+            };
+        }
+    }
 
     // Shared host/port for live reconnect (Settings writes, background thread reads)
     let conn_params: Arc<Mutex<(String, u16)>> = Arc::new(Mutex::new((
@@ -48,6 +180,16 @@ fn main() {
     // was removed in glib 0.22). The SHUTDOWN_REQUESTED flag is set by Ctrl+Q
     // (registered in App::run). On window close, the GTK main loop exits normally
     // and the shutdown sequence below runs.
+
+    // Dispatch deferred action commands after event loop is running.
+    // Commands sit in the mpsc channel until connected_loop begins processing them,
+    // making this robust against connection delays or retries.
+    if let Some(cmd) = action {
+        info!("Dispatching deferred action command");
+        if let Err(e) = cmd_tx.send(cmd) {
+            log::error!("Failed to send deferred action command: {e}");
+        }
+    }
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();
@@ -80,4 +222,191 @@ fn main() {
         thread::park_timeout(Duration::from_millis(100));
     }
     info!("Exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_args_empty() {
+        let (overrides, action) = parse_args(std::iter::empty::<String>()).unwrap();
+        assert!(overrides.mpd_host.is_none());
+        assert!(overrides.mpd_port.is_none());
+        assert!(overrides.profile.is_none());
+        assert!(overrides.mode.is_none());
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_parse_args_mpd_host() {
+        let (overrides, action) = parse_args(["--mpd-host", "192.168.1.100"].map(String::from)).unwrap();
+        assert_eq!(overrides.mpd_host.as_deref(), Some("192.168.1.100"));
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_parse_args_mpd_port() {
+        let (overrides, _) = parse_args(["--mpd-port", "6601"].map(String::from)).unwrap();
+        assert_eq!(overrides.mpd_port, Some(6601));
+    }
+
+    #[test]
+    fn test_parse_args_mpd_port_invalid() {
+        let err = parse_args(["--mpd-port", "not-a-number"].map(String::from)).unwrap_err();
+        assert!(err.contains("Invalid port"));
+    }
+
+    #[test]
+    fn test_parse_args_mpd_port_out_of_range() {
+        let err = parse_args(["--mpd-port", "99999"].map(String::from)).unwrap_err();
+        assert!(err.contains("Invalid port"));
+    }
+
+    #[test]
+    fn test_parse_args_profile() {
+        let (overrides, _) = parse_args(["--profile", "home"].map(String::from)).unwrap();
+        assert_eq!(overrides.profile.as_deref(), Some("home"));
+    }
+
+    #[test]
+    fn test_parse_args_mode_album() {
+        let (overrides, _) = parse_args(["--mode", "album"].map(String::from)).unwrap();
+        assert_eq!(overrides.mode.as_deref(), Some("album"));
+    }
+
+    #[test]
+    fn test_parse_args_mode_folder() {
+        let (overrides, _) = parse_args(["--mode", "folder"].map(String::from)).unwrap();
+        assert_eq!(overrides.mode.as_deref(), Some("folder"));
+    }
+
+    #[test]
+    fn test_parse_args_mode_invalid() {
+        let err = parse_args(["--mode", "invalid"].map(String::from)).unwrap_err();
+        assert!(err.contains("Invalid mode"));
+    }
+
+    #[test]
+    fn test_parse_args_start_playing() {
+        let (_, action) = parse_args(["--start-playing"].map(String::from)).unwrap();
+        assert!(matches!(action, Some(MpdCommand::Play)));
+    }
+
+    #[test]
+    fn test_parse_args_toggle_playback() {
+        let (_, action) = parse_args(["--toggle-playback"].map(String::from)).unwrap();
+        assert!(matches!(action, Some(MpdCommand::Pause)));
+    }
+
+    #[test]
+    fn test_parse_args_next() {
+        let (_, action) = parse_args(["--next"].map(String::from)).unwrap();
+        assert!(matches!(action, Some(MpdCommand::Next)));
+    }
+
+    #[test]
+    fn test_parse_args_prev() {
+        let (_, action) = parse_args(["--prev"].map(String::from)).unwrap();
+        assert!(matches!(action, Some(MpdCommand::Previous)));
+    }
+
+    #[test]
+    fn test_parse_args_unknown_flag() {
+        let err = parse_args(["--bogus"].map(String::from)).unwrap_err();
+        assert!(err.contains("Unknown flag"));
+    }
+
+    #[test]
+    fn test_parse_args_missing_value() {
+        let err = parse_args(["--mpd-host"].map(String::from)).unwrap_err();
+        assert!(err.contains("requires a value"));
+    }
+
+    #[test]
+    fn test_parse_args_missing_mode_value() {
+        let err = parse_args(["--mode"].map(String::from)).unwrap_err();
+        assert!(err.contains("requires a value"));
+    }
+
+    #[test]
+    fn test_parse_args_missing_profile_value() {
+        let err = parse_args(["--profile"].map(String::from)).unwrap_err();
+        assert!(err.contains("requires a value"));
+    }
+
+    #[test]
+    fn test_parse_args_combined_config_overrides() {
+        let (overrides, _) = parse_args(
+            ["--mpd-host", "10.0.0.1", "--mpd-port", "6600", "--profile", "office"]
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(overrides.mpd_host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(overrides.mpd_port, Some(6600));
+        assert_eq!(overrides.profile.as_deref(), Some("office"));
+    }
+
+    #[test]
+    fn test_parse_args_combined_action_and_config() {
+        let (overrides, action) = parse_args(
+            ["--mode", "folder", "--start-playing", "--mpd-host", "localhost"]
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(overrides.mode.as_deref(), Some("folder"));
+        assert_eq!(overrides.mpd_host.as_deref(), Some("localhost"));
+        assert!(matches!(action, Some(MpdCommand::Play)));
+    }
+
+    #[test]
+    fn test_parse_args_multiple_actions_last_wins() {
+        // Multiple action flags — only the last one is kept (since action is overridden)
+        let (_, action) = parse_args(
+            ["--next", "--start-playing", "--prev"].map(String::from),
+        )
+        .unwrap();
+        assert!(matches!(action, Some(MpdCommand::Previous)));
+    }
+
+    #[test]
+    fn test_apply_to_config_overrides_host_and_port() {
+        let mut cfg = config::Config::default();
+        assert_eq!(cfg.mpd_host, "127.0.0.1");
+        assert_eq!(cfg.mpd_port, 6600);
+
+        let overrides = CliOverrides {
+            mpd_host: Some("10.0.0.1".into()),
+            mpd_port: Some(7700),
+            profile: None,
+            mode: None,
+        };
+        overrides.apply_to_config(&mut cfg);
+        assert_eq!(cfg.mpd_host, "10.0.0.1");
+        assert_eq!(cfg.mpd_port, 7700);
+    }
+
+    #[test]
+    fn test_apply_to_config_partial_override() {
+        let mut cfg = config::Config::default();
+        let overrides = CliOverrides {
+            mpd_host: Some("other".into()),
+            mpd_port: None,
+            profile: None,
+            mode: None,
+        };
+        overrides.apply_to_config(&mut cfg);
+        assert_eq!(cfg.mpd_host, "other");
+        // Port should remain default
+        assert_eq!(cfg.mpd_port, 6600);
+    }
+
+    #[test]
+    fn test_apply_to_config_empty_override_does_nothing() {
+        let mut cfg = config::Config::default();
+        let overrides = CliOverrides::default();
+        overrides.apply_to_config(&mut cfg);
+        assert_eq!(cfg.mpd_host, "127.0.0.1");
+        assert_eq!(cfg.mpd_port, 6600);
+    }
 }

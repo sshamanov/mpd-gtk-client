@@ -1,7 +1,34 @@
 //! Configuration — TOML settings load/save. Thread: UI.
+//! Also defines [`CliOverrides`] for session-only CLI flag overrides.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Session-only overrides parsed from CLI flags — not persisted to config file.
+#[derive(Debug, Default, Clone)]
+pub struct CliOverrides {
+    /// Override for `mpd_host` (--mpd-host).
+    pub mpd_host: Option<String>,
+    /// Override for `mpd_port` (--mpd-port).
+    pub mpd_port: Option<u16>,
+    /// Profile name for config section selection (--profile).
+    pub profile: Option<String>,
+    /// Startup mode override (--mode album|folder).
+    pub mode: Option<String>,
+}
+
+impl CliOverrides {
+    /// Apply session-only overrides to a mutable Config reference.
+    /// Profile and mode are not config fields and are handled separately.
+    pub fn apply_to_config(&self, cfg: &mut Config) {
+        if let Some(ref host) = self.mpd_host {
+            cfg.mpd_host = host.clone();
+        }
+        if let Some(port) = self.mpd_port {
+            cfg.mpd_port = port;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -45,6 +72,13 @@ impl Config {
         } else {
             Self::default()
         }
+    }
+
+    /// Load config for a specific named profile.
+    /// Currently a stub — falls back to `load()` until multi-profile support lands (epic 15).
+    pub fn with_profile(name: &str) -> Self {
+        log::info!("Profile '{name}' requested but multi-profile is not yet implemented; using defaults");
+        Self::load()
     }
 
     pub fn save(&self) -> std::io::Result<()> {
