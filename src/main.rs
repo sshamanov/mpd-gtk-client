@@ -143,6 +143,11 @@ fn main() {
     logging::init();
     info!("Starting MPD client");
 
+    // Install desktop entry file for application menu integration
+    if let Err(e) = config::Config::install_desktop_file() {
+        log::warn!("Failed to install desktop entry: {e}");
+    }
+
     // Load config — use with_profile if --profile was passed
     let mut config = if let Some(ref profile) = overrides.profile {
         config::Config::with_profile(profile)

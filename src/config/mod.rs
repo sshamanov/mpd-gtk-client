@@ -292,4 +292,28 @@ impl Config {
         let path = autostart_dir.join("mpd-client.desktop");
         let _ = std::fs::remove_file(path);
     }
+
+    /// Install XDG desktop entry file for application menu integration.
+    /// Installs at `~/.local/share/applications/mpd-client.desktop`.
+    pub fn install_desktop_file() -> std::io::Result<()> {
+        let exe = std::env::current_exe()
+            .map_err(|e| std::io::Error::other(format!("Cannot get exe path: {e}")))?;
+        let apps_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("applications");
+        std::fs::create_dir_all(&apps_dir)?;
+        let path = apps_dir.join("mpd-client.desktop");
+        let content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=mpd-client\n\
+             Exec={}\n\
+             Icon=mpd-client\n\
+             Terminal=false\n\
+             Categories=Audio;Music;Player;\n\
+             MimeType=audio/flac;audio/mpeg;audio/ogg;audio/wav;audio/x-flac;\n",
+            exe.display()
+        );
+        std::fs::write(&path, content)
+    }
 }

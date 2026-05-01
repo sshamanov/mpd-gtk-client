@@ -1,6 +1,6 @@
 # Story 20.1: Install Desktop File with Proper Categories
 
-Status: ready-for-dev
+Status: done
 
 ## Story
 
