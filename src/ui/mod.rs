@@ -1192,16 +1192,22 @@ impl App {
             queue_stack.set_visible_child(&mini_scroll); // Album Mode by default
             right_pane.append(&queue_stack);
 
-            // GtkDropTarget for receiving album drops from the grid
+            // GtkDropTarget for receiving album drops from the grid (COPY) and acting as
+            // safety buffer for queue reorder drops (MOVE) — prevents propagation to removal target
             let dt_cmd = cmd_tx.clone();
-            let drop_target = DropTarget::new(String::static_type(), DragAction::COPY);
-            drop_target.connect_drop(move |_target, value, _x, _y| {
+            let drop_target = DropTarget::new(String::static_type(), DragAction::COPY | DragAction::MOVE);
+            drop_target.connect_drop(move |target, value, _x, _y| {
+                // Clear highlight on drop (in case leave doesn't fire)
+                if let Some(w) = target.widget() {
+                    w.remove_css_class("queue-drop-highlight");
+                }
                 if let Ok(s) = value.get::<String>() {
-                    // Skip queue reorder drops (format "id:position") — those go to queue_list DropTarget
-                    if !s.contains(':') {
-                        let _ = dt_cmd.send(MpdCommand::Add(s));
+                    if s.contains(':') {
+                        // Reorder drop on queue_stack margins (not on queue_list) — safe no-op
                         return true;
                     }
+                    let _ = dt_cmd.send(MpdCommand::Add(s));
+                    return true;
                 }
                 false
             });
@@ -1209,7 +1215,7 @@ impl App {
                 if let Some(w) = target.widget() {
                     w.add_css_class("queue-drop-highlight");
                 }
-                DragAction::COPY
+                DragAction::COPY | DragAction::MOVE
             });
             drop_target.connect_leave(move |target| {
                 if let Some(w) = target.widget() {
@@ -1217,6 +1223,43 @@ impl App {
                 }
             });
             queue_stack.add_controller(drop_target);
+
+            // GtkDropTarget for drag-off removal: drops on right_pane outside queue_list
+            let removal_target = DropTarget::new(String::static_type(), DragAction::COPY | DragAction::MOVE);
+            removal_target.connect_enter(|target, _x, _y| {
+                if let Some(w) = target.widget() {
+                    w.add_css_class("drag-remove-zone");
+                }
+                DragAction::COPY | DragAction::MOVE
+            });
+            removal_target.connect_leave(|target| {
+                if let Some(w) = target.widget() {
+                    w.remove_css_class("drag-remove-zone");
+                }
+            });
+            let rmv_cmd = cmd_tx.clone();
+            let rmv_widget = right_pane.clone();
+            removal_target.connect_drop(move |target, value, _x, _y| {
+                // Clear removal zone on drop (in case leave doesn't fire)
+                rmv_widget.remove_css_class("drag-remove-zone");
+                if let Ok(s) = value.get::<String>() {
+                    if s.trim().is_empty() {
+                        return false;
+                    }
+                    // Queue row drag ("id:pos") → remove item
+                    if let Some((id_str, _pos_str)) = s.split_once(':') {
+                        if let Ok(drag_id) = id_str.parse::<i32>() {
+                            let _ = rmv_cmd.send(MpdCommand::DeleteId(drag_id));
+                            return true;
+                        }
+                    }
+                    // Album drop from grid that missed queue_stack → Add
+                    let _ = rmv_cmd.send(MpdCommand::Add(s));
+                    return true;
+                }
+                false
+            });
+            right_pane.add_controller(removal_target);
 
             // Shared item_ids for Delete key — updated by Queue event handler
             let item_ids_w: SharedIds = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
@@ -1995,6 +2038,7 @@ impl App {
                  .mini-queue-cover { border-radius: 2px; }
                  .mini-queue-label { font-size: 0.8em; padding: 2px 0; }
                  .queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }
+                 .drag-remove-zone { background-color: rgba(244, 67, 54, 0.08); }
                  .drop-indicator-row { border-top: 3px solid @theme_selected_bg_color; }"
             );
             gtk4::style_context_add_provider_for_display(
