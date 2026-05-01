@@ -324,6 +324,21 @@ impl App {
                 let _ = gtx.send(MpdCommand::ListAlbumsGrouped(tag.to_string()));
             });
 
+            // Sort mode selector
+            let sort_modes = ["Artist", "Album Name", "Artist (Z-A)", "Album Name (Z-A)"];
+            let sort_dropdown = gtk4::DropDown::from_strings(&sort_modes);
+            sort_dropdown.set_selected(0);
+            sort_dropdown.set_valign(gtk4::Align::Center);
+            // On sort change, re-fetch the current group to trigger re-sort
+            let sort_gtx = cmd_tx.clone();
+            let sort_stack = group_stack.clone();
+            sort_dropdown.connect_selected_notify(move |_| {
+                let name = sort_stack.visible_child_name().unwrap_or_default();
+                let tag = group_pages.iter().find(|(d, _)| *d == name)
+                    .map(|(_, t)| *t)
+                    .unwrap_or("Albums");
+                let _ = sort_gtx.send(MpdCommand::ListAlbumsGrouped(tag.to_string()));
+            });
             let left_scroll = ScrolledWindow::new();
             left_scroll.set_vexpand(true);
             left_scroll.set_hexpand(true);
@@ -706,6 +721,7 @@ impl App {
 
             // Album content: group bar + search + grid
             album_content.append(&group_switcher);
+            album_content.append(&sort_dropdown);
 
             // Album search entry
             let search_entry = gtk4::SearchEntry::new();
@@ -1740,6 +1756,7 @@ impl App {
             let fc_mini_scroll_ref = mini_scroll.clone();
             let fc_queue_scroll_ref = queue_scroll.clone();
             let fc_prev_mode: std::cell::Cell<crate::state::Mode> = std::cell::Cell::new(crate::state::Mode::Album);
+            let fc_sort_mode = sort_dropdown.clone();
 
             window.add_tick_callback(move |_widget, _fc| {
                 // Check for shutdown request from SIGINT/SIGTERM signal handlers.
@@ -1861,7 +1878,16 @@ impl App {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                let mut items: Vec<AlbumGridItem> = albums.iter()
+                                // Apply sort mode to album list
+                                let mut sorted = albums.clone();
+                                let sort_idx = fc_sort_mode.selected() as usize;
+                                match sort_idx {
+                                    1 => sorted.sort_by(|a, b| a.1.cmp(&b.1)), // Album Name
+                                    2 => sorted.sort_by(|a, b| b.0.cmp(&a.0)), // Artist (Z-A)
+                                    3 => sorted.sort_by(|a, b| b.1.cmp(&a.1)), // Album Name (Z-A)
+                                    _ => sorted.sort_by(|a, b| a.0.cmp(&b.0)), // Artist (default)
+                                }
+                                let mut items: Vec<AlbumGridItem> = sorted.iter()
                                     .enumerate()
                                     .map(|(i, (artist, name))| {
                                         let (pr, pg, pb) = placeholder_rgb(artist);

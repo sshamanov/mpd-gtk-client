@@ -1,6 +1,6 @@
 # Story 24.1: User-Selectable Sort Modes
 
-Status: backlog
+Status: done
 
 ## Story
 
