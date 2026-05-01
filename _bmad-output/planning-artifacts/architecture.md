@@ -497,7 +497,7 @@ last_profile = "local"
 - API churn risk — adw crate evolves rapidly (0.5 → 0.8 in ~18 months)
 - Requires Adwaita runtime on non-GNOME desktops
 
-**Status: NOT IMPLEMENTED — deferred post-v1.** Custom GTK4 widgets used throughout. libadwaita integration would replace Toast overlay, navigation stack, responsive sidebar, and mode switcher, but adds a dependency and ~3MB binary size. Decision: keep custom GTK4 widgets for v1, evaluate libadwaita for v2.
+**Status: NOT IMPLEMENTED — in-scope for V1.** Custom GTK4 widgets used throughout. libadwaita integration would replace Toast overlay, navigation stack, responsive sidebar, and mode switcher. Adds dependency but reduces custom widget maintenance.
 
 
 
@@ -915,7 +915,7 @@ The following three-tier design is documented for future implementation but is *
 - Global shortcuts (like Space for play/pause) must not conflict with GTK's built-in widget shortcuts (e.g., Space toggles buttons)
 - `GdkKey` values are hardware-dependent — keyboard layout differences handled by GTK's key event normalization
 
-**Status: PARTIALLY IMPLEMENTED.** All shortcuts work (Ctrl+F search, Ctrl+1/2 modes, Space play/pause, Ctrl+, settings, arrow keys, Enter, Delete, Shift+Up/Down queue reorder) but are wired as ad-hoc GTK accelerators and `EventControllerKey` handlers. Centralized `KeybindingService` with compile-time conflict detection deferred post-v1 — current approach is functional and meets all accessibility requirements.
+**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** All shortcuts work (Ctrl+F search, Ctrl+1/2 modes, Space play/pause, Ctrl+, settings, arrow keys, Enter, Delete, Shift+Up/Down queue reorder) but are wired as ad-hoc GTK accelerators and `EventControllerKey` handlers. Centralized `KeybindingService` with compile-time conflict detection still needs to be built for V1.
 
 ## Architecture Decision Record: Undo/Redo for Queue Operations
 
@@ -1156,7 +1156,7 @@ The following contracts define the guarantees, invariants, and fault behavior fo
 - Folder Mode filesystem-order may interleave albums split across directories
 - `ByLastPlayed` sort requires tracking play history, which MPD provides via `playlistinfo` but not as a persistent per-album attribute
 
-**Status: PARTIALLY IMPLEMENTED.** Album grid uses MPD-returned order with session-only manual reorder support (story 11-4). Folder mode uses filesystem order. User-selectable sort modes (ByArtist, ByYear, ByAlbumName) and the dedicated sort presenter module are deferred post-v1 — no UI for sort mode selection exists.
+**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** Album grid uses MPD-returned order with session-only manual reorder support (story 11-4). Folder mode uses filesystem order. User-selectable sort modes (ByArtist, ByYear, ByAlbumName) and the dedicated sort presenter module still need to be built for V1.
 
 ## Architecture Decision Record: Crate & Module Organization
 

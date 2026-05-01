@@ -155,7 +155,16 @@ development_status:
   19-1-auto-start-support: done
 
   epic-20: backlog
-  20-1-install-desktop-file: ready-for-dev
+  20-1-install-desktop-file: backlog
 
   epic-21: backlog
-  21-1-performance-profiling: ready-for-dev
+  21-1-performance-profiling: backlog
+
+  epic-22: backlog
+  22-1-libadwaita-integration: backlog
+
+  epic-23: backlog
+  23-1-centralized-keybinding-service: backlog
+
+  epic-24: backlog
+  24-1-user-selectable-sort-modes: backlog

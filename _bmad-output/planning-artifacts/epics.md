@@ -1381,3 +1381,83 @@ As a developer, I want basic performance profiling instrumentation built into th
 **Then** the timing code is compiled out (gated behind `debug_assertions`)
 
 **Technical Notes:** Use `std::time::Instant`, no new dependencies. Key paths: MPD commands, grid repopulation, cover decode, search queries, frame clock ticks. Gate with `cfg!(debug_assertions)` for zero cost in release. Memory via `/proc/self/status`. See story file for full details.
+
+---
+
+## Epic 22: libadwaita Widget Integration
+
+**Goal:** Replace custom composite widgets with libadwaita (`adw` crate) equivalents — Toast overlay, ViewSwitcher, NavigationView, MultiLayoutView.
+
+**ADRs:** §474 (libadwaita Integration)
+
+### Story 22.1: libadwaita Integration
+
+As a developer, I want to replace custom composite widgets with libadwaita equivalents, so that the UI follows GNOME HIG conventions and reduces custom widget maintenance.
+
+**Acceptance Criteria:**
+
+**Given** the `libadwaita` feature is enabled
+**When** the application runs
+**Then** `Adw.ToastOverlay` replaces the custom toast widget
+**And** `Adw.ViewSwitcher` replaces the custom group button bar for mode switching
+**And** `Adw.NavigationView` manages the navigation stack
+**And** `Adw.MultiLayoutView` + `Adw.BottomSheet` handle responsive sidebar layout
+
+**Given** the `libadwaita` feature is NOT enabled
+**When** the application is compiled
+**Then** existing custom widgets are used (backward compatible)
+
+**Technical Notes:** Feature-gated behind `libadwaita` Cargo feature. Requires `libadwaita >= 1.6` at runtime. See story file for full details and architecture.md §474 for ADR.
+
+---
+
+## Epic 23: Centralized Keybinding Service
+
+**Goal:** Single `KeybindingService` mapping `(key, mods, context)` to actions with compile-time conflict detection.
+
+**ADRs:** §893 (Keybinding Architecture)
+
+### Story 23.1: Centralized Keybinding Service
+
+As a developer, I want all keyboard shortcuts managed through a single KeybindingService, so that shortcuts are auditable, conflict-free, and consistently dispatched.
+
+**Acceptance Criteria:**
+
+**Given** the application runs
+**When** any keyboard shortcut is pressed
+**Then** the key event is routed through a centralized keybinding table
+
+**Given** the user switches between Album and Folder modes
+**When** mode-specific keys are pressed
+**Then** only the active mode's context bindings are enabled
+
+**Given** the keybinding table is compiled
+**When** two entries share the same (key, mods, context)
+**Then** a unit test fails (conflict detection)
+
+**Technical Notes:** Single `src/keybindings.rs` module. Action enum shared by keyboard, menu, hover buttons, and IPC. See architecture.md §893 for ADR.
+
+---
+
+## Epic 24: User-Selectable Sort Modes
+
+**Goal:** Sort mode selector in Album Mode — By Artist (default), By Year, By Album Name. Client-side sort on cached metadata.
+
+**ADRs:** §1131 (Browsing Sort Architecture)
+
+### Story 24.1: User-Selectable Sort Modes
+
+As a user browsing by album grid, I want to choose between sort modes, so that I can organize the library in the way that best suits my current task.
+
+**Acceptance Criteria:**
+
+**Given** the user is in Album Mode
+**When** the user selects a sort mode from a dropdown/button
+**Then** albums are sorted client-side from the cached album list
+**And** no MPD round-trip is needed for sorting
+
+**Given** a grouped view is active
+**When** a sort mode is selected
+**Then** the sort applies within each group
+
+**Technical Notes:** Sort operates on the album list already cached in memory. See architecture.md §1131 for full sort strategy design.
