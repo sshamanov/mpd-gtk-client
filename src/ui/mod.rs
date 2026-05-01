@@ -1197,8 +1197,11 @@ impl App {
             let drop_target = DropTarget::new(String::static_type(), DragAction::COPY);
             drop_target.connect_drop(move |_target, value, _x, _y| {
                 if let Ok(s) = value.get::<String>() {
-                    let _ = dt_cmd.send(MpdCommand::Add(s));
-                    return true;
+                    // Skip queue reorder drops (format "id:position") — those go to queue_list DropTarget
+                    if !s.contains(':') {
+                        let _ = dt_cmd.send(MpdCommand::Add(s));
+                        return true;
+                    }
                 }
                 false
             });
@@ -1277,6 +1280,107 @@ impl App {
                 gtk4::glib::Propagation::Proceed
             });
             queue_list.add_controller(kc);
+
+            // GtkDropTarget for drag-reorder within the queue
+            let indicator_tracker: std::rc::Rc<std::cell::RefCell<Option<gtk4::ListBoxRow>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+            let reorder_target = DropTarget::new(String::static_type(), DragAction::MOVE);
+
+            let tr_on_motion = indicator_tracker.clone();
+            let tr_list = queue_list.clone();
+            reorder_target.connect_motion(move |_target, _x, y| {
+                // Find the row at the cursor position using accumulated heights
+                let mut y_accum = 0i32;
+                let mut child = tr_list.first_child();
+                let mut target_idx = -1i32;
+                while let Some(row_widget) = child {
+                    if let Some(row) = row_widget.downcast_ref::<gtk4::ListBoxRow>() {
+                        let row_h = row.height();
+                        if y >= y_accum as f64 && y < (y_accum + row_h) as f64 {
+                            let midpoint = y_accum + row_h / 2;
+                            target_idx = if y < midpoint as f64 { row.index() } else { row.index() + 1 };
+                            break;
+                        }
+                        y_accum += row_h;
+                        target_idx = row.index() + 1; // past last row = end of queue
+                    }
+                    child = row_widget.next_sibling();
+                }
+
+                // Update drop indicator
+                if let Some(prev) = tr_on_motion.borrow_mut().take() {
+                    prev.remove_css_class("drop-indicator-row");
+                }
+                if target_idx >= 0 {
+                    if let Some(target_row) = tr_list.first_child() {
+                        let mut idx = 0i32;
+                        let mut child = Some(target_row);
+                        while let Some(row_widget) = child {
+                            if let Some(row) = row_widget.downcast_ref::<gtk4::ListBoxRow>() {
+                                if idx == target_idx {
+                                    row.add_css_class("drop-indicator-row");
+                                    *tr_on_motion.borrow_mut() = Some(row.clone());
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                            child = row_widget.next_sibling();
+                        }
+                    }
+                }
+                DragAction::MOVE
+            });
+
+            let tr_drop = indicator_tracker.clone();
+            let tr_list_drop = queue_list.clone();
+            let tr_cmd = cmd_tx.clone();
+            let tr_add_cmd = cmd_tx.clone();
+            reorder_target.connect_drop(move |_target, value, _x, y| {
+                // Clear drop indicator
+                if let Some(prev) = tr_drop.borrow_mut().take() {
+                    prev.remove_css_class("drop-indicator-row");
+                }
+
+                if let Ok(s) = value.get::<String>() {
+                    if let Some((id_str, _pos_str)) = s.split_once(':') {
+                        // Queue reorder: format "id:pos"
+                        if let Ok(drag_id) = id_str.parse::<i32>() {
+                            // Calculate target position from y using same midpoint logic as motion
+                            let mut y_accum = 0i32;
+                            let mut child = tr_list_drop.first_child();
+                            let mut target_pos = 0i32;
+                            while let Some(row_widget) = child {
+                                if let Some(row) = row_widget.downcast_ref::<gtk4::ListBoxRow>() {
+                                    let row_h = row.height();
+                                    if y >= y_accum as f64 && y < (y_accum + row_h) as f64 {
+                                        let midpoint = y_accum + row_h / 2;
+                                        target_pos = if y < midpoint as f64 { row.index() } else { row.index() + 1 };
+                                        break;
+                                    }
+                                    y_accum += row_h;
+                                    target_pos = row.index() + 1;
+                                }
+                                child = row_widget.next_sibling();
+                            }
+                            let _ = tr_cmd.send(MpdCommand::MoveId(drag_id, target_pos));
+                            return true;
+                        }
+                    } else {
+                        // Album drop from grid — forward to Add
+                        let _ = tr_add_cmd.send(MpdCommand::Add(s));
+                        return true;
+                    }
+                }
+                false
+            });
+
+            let tr_leave = indicator_tracker.clone();
+            reorder_target.connect_leave(move |_target| {
+                if let Some(prev) = tr_leave.borrow_mut().take() {
+                    prev.remove_css_class("drop-indicator-row");
+                }
+            });
+            queue_list.add_controller(reorder_target);
 
             paned.set_end_child(Some(&right_pane));
 
@@ -1701,6 +1805,16 @@ impl App {
                                     row.set_css_classes(&["queue-current"]);
                                     current_row = Some(row.clone());
                                 }
+                                // GtkDragSource for drag-reorder
+                                let reorder_ds = DragSource::new();
+                                reorder_ds.set_actions(DragAction::MOVE);
+                                let drag_row_id = item.id;
+                                reorder_ds.connect_prepare(move |_source, _x, _y| {
+                                    let data = format!("{}:{}", drag_row_id, 0);
+                                    let value = glib::Value::from(&data);
+                                    Some(ContentProvider::for_value(&value))
+                                });
+                                row.add_controller(reorder_ds);
                                 // Double-click to play
                                 let dbl = gtk4::GestureClick::new();
                                 dbl.set_button(1);
@@ -1880,7 +1994,8 @@ impl App {
                  .mini-queue-current { border: 2px solid @theme_selected_bg_color; border-radius: 4px; }
                  .mini-queue-cover { border-radius: 2px; }
                  .mini-queue-label { font-size: 0.8em; padding: 2px 0; }
-                 .queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }"
+                 .queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }
+                 .drop-indicator-row { border-top: 3px solid @theme_selected_bg_color; }"
             );
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),
