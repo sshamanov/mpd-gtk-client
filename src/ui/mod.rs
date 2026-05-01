@@ -120,14 +120,16 @@ fn calculate_visible_albums(
 ) -> Vec<(String, String)> {
     let scroll_top = vadj.value();
     let page_size = vadj.page_size();
-    let total_items = backing.borrow().len();
+    let Ok(binding) = backing.try_borrow() else { return vec![]; };
+    let total_items = binding.len();
     if total_items == 0 {
         return vec![];
     }
+    drop(binding);
 
     // Layout not yet settled — return all albums (safe fallback)
     if page_size <= 0.0 {
-        let binding = backing.borrow();
+        let Ok(binding) = backing.try_borrow() else { return vec![]; };
         return binding.iter().filter_map(|item| {
             if let AlbumGridItem::Album { artist, name, .. } = item {
                 Some((artist.clone(), name.clone()))
@@ -155,7 +157,7 @@ fn calculate_visible_albums(
     let start_idx = first_row.saturating_mul(items_per_row);
     let end_idx = (first_row + visible_rows).saturating_mul(items_per_row);
 
-    let binding = backing.borrow();
+    let Ok(binding) = backing.try_borrow() else { return vec![]; };
     let mut visible = Vec::new();
     for i in start_idx..end_idx.min(binding.len()) {
         if let AlbumGridItem::Album { artist, name, .. } = &binding[i] {
@@ -641,13 +643,82 @@ impl App {
             folder_content.append(&folder_search_results);
             folder_content.append(&folder_browser.borrow().container.clone());
 
-            // Mode stack with Crossfade transition animation for album/folder switching
+            // Visible mode toggle: Album/Folder switcher
+            let mode_switcher_box = gtk4::Box::new(Orientation::Horizontal, 0);
+            mode_switcher_box.set_halign(gtk4::Align::Center);
+            mode_switcher_box.set_margin_top(4);
+            mode_switcher_box.set_margin_bottom(2);
+            let mode_btn_album = gtk4::ToggleButton::with_label("Album");
+            let mode_btn_folder = gtk4::ToggleButton::with_label("Folder");
+            mode_btn_album.set_group(None::<&gtk4::ToggleButton>);
+            mode_btn_folder.set_group(Some(&mode_btn_album));
+            mode_btn_album.set_active(true);
+            mode_switcher_box.append(&mode_btn_album);
+            mode_switcher_box.append(&mode_btn_folder);
+
+            // Mode stack with Crossfade transition for album/folder switching
             let mode_stack = gtk4::Stack::new();
             mode_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
             mode_stack.set_transition_duration(300);
             mode_stack.add_child(&album_content);
             mode_stack.add_child(&folder_content);
             mode_stack.set_visible_child(&album_content);
+
+            // Wrap stack + switcher
+            let mode_content = gtk4::Box::new(Orientation::Vertical, 0);
+            mode_content.append(&mode_switcher_box);
+            mode_content.append(&mode_stack);
+
+            // Connect toggle buttons to mode switching
+            let mba_mode = mode_stack.clone();
+            let mba_ac = album_content.clone();
+            let mba_state = state.clone();
+            let mba_ls = left_scroll.clone();
+            let mba_fb = folder_browser.clone();
+            let mba_fsc = folder_search_results.clone();
+            mode_btn_album.connect_toggled(move |b| {
+                if !b.is_active() { return; }
+                // Save folder state
+                if let Ok(fb) = mba_fb.try_borrow() {
+                    if let Ok(mut s) = mba_state.write() {
+                        s.folder_browsing.expanded_paths =
+                            vec![std::path::PathBuf::from(fb.shared_path.borrow().clone())];
+                        s.folder_browsing.scroll_position = fb.container.first_child()
+                            .and_then(|first| first.next_sibling())
+                            .and_then(|sibling| sibling.downcast::<gtk4::ScrolledWindow>().ok())
+                            .map(|sw| sw.vadjustment().value()).unwrap_or(0.0);
+                    }
+                }
+                mba_fsc.set_visible(false);
+                // Restore album scroll
+                if let Ok(s) = mba_state.read() {
+                    let pos = s.album_browsing.scroll_position.1;
+                    let adj = mba_ls.vadjustment();
+                    adj.set_value(pos.clamp(0.0, adj.upper() - adj.page_size()));
+                }
+                mba_mode.set_visible_child(&mba_ac);
+                if let Ok(mut s) = mba_state.write() { s.mode = crate::state::Mode::Album; }
+            });
+            let mbf_mode = mode_stack.clone();
+            let mbf_fc = folder_content.clone();
+            let mbf_state = state.clone();
+            let mbf_ls = left_scroll.clone();
+            let mbf_cmd_tx = cmd_tx.clone();
+            mode_btn_folder.connect_toggled(move |b| {
+                if !b.is_active() { return; }
+                // Save album scroll
+                if let Ok(mut s) = mbf_state.write() {
+                    s.album_browsing.scroll_position.1 = mbf_ls.vadjustment().value();
+                }
+                mbf_mode.set_visible_child(&mbf_fc);
+                // Restore folder
+                let folder_path = if let Ok(s) = mbf_state.read() {
+                    s.folder_browsing.expanded_paths.last()
+                        .map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+                } else { String::new() };
+                let _ = mbf_cmd_tx.send(MpdCommand::ListDirectory(folder_path));
+                if let Ok(mut s) = mbf_state.write() { s.mode = crate::state::Mode::Folder; }
+            });
 
             // Mode switching: use stack transitions, save/restore scroll positions, update AppState
             let ms = mode_stack.clone();
@@ -717,7 +788,7 @@ impl App {
             app_clone.add_action(&folder_mode_act);
             app_clone.set_accels_for_action("app.folder-mode", &["<Ctrl>2"]);
 
-            left_pane_box.append(&mode_stack);
+            left_pane_box.append(&mode_content);
 
             // Album content: group bar + search + grid
             album_content.append(&group_switcher);
@@ -2166,7 +2237,7 @@ impl App {
                                     popbox.append(&btn_rem);
                                     pop.set_child(Some(&popbox));
                                     if let Some(ref w) = gest.widget() { pop.set_parent(w); }
-                                    pop.popup();
+                                    pop.present();
                                 });
                                 fc_ql.append(&row);
                             }
