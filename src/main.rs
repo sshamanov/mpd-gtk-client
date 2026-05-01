@@ -5,6 +5,8 @@ pub mod constants;
 pub mod coverart;
 pub mod errors;
 pub mod mpd;
+#[cfg(feature = "mpris")]
+pub mod mpris;
 pub mod search;
 pub mod state;
 pub mod ui;
@@ -175,6 +177,14 @@ fn main() {
     );
 
     info!("MPD event loop started");
+
+    // Initialize MPRIS D-Bus interface (feature-gated, opt-in via config)
+    #[cfg(feature = "mpris")]
+    let _mpris_conn = mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled);
+    #[cfg(not(feature = "mpris"))]
+    if config.mpris.enabled {
+        log::warn!("MPRIS: enabled in config but not compiled (rebuild with --features mpris)");
+    }
 
     // Signal handlers are no longer registered directly (glib::source::unix_signal_add
     // was removed in glib 0.22). The SHUTDOWN_REQUESTED flag is set by Ctrl+Q

@@ -2,18 +2,30 @@
 
 This file lists known issues, bugs, and missing features that are deferred. Items marked **[RESOLVED]** have been addressed by architecture decisions in `architecture.md` or `prd.md` and remain as implementation items only.
 
-### Resolved by Architecture (2026-04-29)
+### Resolved
 
-| Deferred Item | Resolution |
-|---------------|------------|
-| Dead MPD connection never triggers reconnect | **[RESOLVED in architecture.md §4-5]** Connection lifecycle: 3 consecutive failures → reconnect. Proven pattern from validation session. |
-| `MpdEvent::Reconnected` dead code | **[RESOLVED]** Variant removed, proven in validation session. |
-| Settings changes require app restart | **[RESOLVED in architecture.md §5a]** Live reconnect via `MpdCommand::Reconnect` with epoch counter. |
-| Search index not rebuilt on library update | **[RESOLVED in architecture.md §9c, §10a]** Index rebuild lifecycle defined. Skip-if-unchanged optimization documented. |
-| Cover art `set_cover_path` dead code | **[RESOLVED in architecture.md §Cover Art Pipeline]** Full pipeline designed with widget registry pattern. Pending implementation. |
-| Toast auto-dismiss race | **[RESOLVED]** Generation counter fix proven in validation session. |
+| Deferred Item | Resolution | Date |
+|---------------|------------|------|
+| Dead MPD connection never triggers reconnect | **[RESOLVED in architecture.md §4-5]** Connection lifecycle: 3 consecutive failures → reconnect. | 2026-04-29 |
+| `MpdEvent::Reconnected` dead code | **[RESOLVED]** Variant removed. | 2026-04-29 |
+| Settings changes require app restart | **[RESOLVED in architecture.md §5a]** Live reconnect via `MpdCommand::Reconnect` with epoch counter. | 2026-04-29 |
+| Search index not rebuilt on library update | **[RESOLVED in architecture.md §9c, §10a]** Index rebuild lifecycle defined. | 2026-04-29 |
+| Cover art `set_cover_path` dead code | **[RESOLVED in architecture.md]** Full pipeline designed with widget registry pattern. | 2026-04-29 |
+| Toast auto-dismiss race | **[RESOLVED]** Generation counter fix. | 2026-04-29 |
+| `search_albums` misses `AlbumArtist` tag | **[RESOLVED in code]** Commit `68f3593` — `AlbumArtist:` lines parsed, used as fallback when per-track `Artist:` missing. | 2026-04-29 |
 
-### Remaining — Deferred
+### Skipped (2026-04-29)
+
+These items are real but not worth implementing at this stage — zero or negligible impact:
+
+| Item | Reason |
+|------|--------|
+| `ExponentialBackoff` derive(Clone) is misleading | Never actually cloned. Maintenance risk only. |
+| Config loaded twice during startup | Minor I/O waste on a tiny TOML file. |
+| Folder tree Left/BackSpace at root sends `ListDirectory("")` | Harmless MPD no-op. |
+| Unicode symbols in GTK labels may not render | Portability concern. All modern Linux systems render them. |
+
+### Active Backlog
 
 #### UI & Interaction
 
@@ -25,7 +37,6 @@ This file lists known issues, bugs, and missing features that are deferred. Item
 
 #### MPD Protocol & Data
 
-- **`search_albums` misses `AlbumArtist` tag** — Compilations show empty artists. Needs `AlbumArtist:` parsing in adapter. [src/mpd/mod.rs]
 - **`list_albums_grouped` loses artist for Date/Genre groupings** — MPD protocol limitation. Per-album fetch needed for non-Artist groupings. [src/mpd/]
 - **`InsertNext` uses potentially stale `current_pos` from last poll** — Command response is immediate; poll staleness is bounded by idle response time.
 - **`search_albums` stale artist across tracks when Artist tag missing** — Rare edge case. `file:` line reset added but edge cases remain.
@@ -34,16 +45,19 @@ This file lists known issues, bugs, and missing features that are deferred. Item
 
 - **`MpdAdapter` has no `Drop` — no clean MPD close on shutdown** — Socket closes on process exit. Graceful close adds ~50ms to shutdown.
 - **SIGINT cleanup via `process::exit(0)` skips graceful MPD disconnect** — `idle_add` defers exit. Full cleanup needs GTK lifecycle work.
-- **`ExponentialBackoff` derive(Clone) is misleading** — Maintenance risk only. Never actually cloned.
-- **Config loaded twice during startup** — Minor I/O waste. Config unlikely to change between calls.
-- **Folder tree Left/BackSpace at root sends `ListDirectory("")`** — Harmless no-op.
-- **Unicode symbols in GTK labels may not render on all systems** — Portability concern.
 
-#### Cover Art (pending implementation)
+#### Cover Art (v2 pipeline)
 
-All items in `src/coverart/mod.rs` are pending implementation:
-- CoverProvider cache read (designed)
-- AlbumArtProvider MPD binary fetch (designed)
-- ReadPictureProvider fallback (designed)  
-- ActualRead queue in idle cycles (designed)
-- Widget registry integration for in-place updates (designed)
+Current `src/coverart/mod.rs` is a basic single-file fetcher (v1). The v2 architecture in `architecture.md` designs a full `CoverProvider + ActualRead` two-layer pipeline that remains unimplemented:
+- CoverProvider cache read (synchronous, no fallthrough)
+- AlbumArtProvider MPD binary fetch (content-addressed via MD5)
+- ReadPictureProvider fallback (timestamp-compared)
+- ActualRead priority queue with scroll-aware loading (one album per idle cycle)
+- Online cover lookup support (opt-in, rate-limited)
+- Widget registry integration for in-place cell updates
+
+#### Deferred from: code review of story 14-2 (2026-05-01)
+
+- **MPRIS PropertiesChanged signal emission** — Property getters read SharedState directly, sufficient for playerctl/mpris-remote. Lock screen and GNOME Shell media controls don't auto-update without signal emission.
+- **SharedState playback fields never populated** — Pre-existing: MPD StateChanged handler in ui/mod.rs extracts metadata to local variables but never writes to SharedState. `s.current.track`, `s.current.album` always None. Affects any code reading current track metadata from SharedState, including MPRIS, not just this story.
+- **D-Bus session bus disconnection mid-session** — No monitoring or reconnection for D-Bus session bus drops. MPRIS silently stops responding if D-Bus restarts.

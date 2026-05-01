@@ -255,7 +255,7 @@ enum MpdEvent {
 ### Options Considered
 
 1. **CoverProvider + ActualRead two-layer split** — CoverProvider reads disk cache synchronously, returns immediately or not at all. ActualRead runs in idle cycles, fetches via MPD protocol, writes cache, emits events. No cascading fallback chain.
-2. **Layered provider chain with deduplication** — Original v1 design: `LocalLookupProvider` → `EmbeddedArtProvider` → `OnlineLookupProvider` with session + disk caches. Superseded — MPD is remote, no local filesystem access.
+2. **Layered provider chain with deduplication** — Original v1 design: `LocalLookupProvider` → `EmbeddedArtProvider` → `OnlineLookupProvider` with session + disk caches. Replaced by Option 1 — the two-layer split decouples cache reads from fetching, allowing any provider (including online) to be added to ActualRead without affecting the fast cache path.
 3. **Event-driven cover resolution** — Cover requests emitted as events; multiple handlers process independently. Flexible but risks duplicate work.
 
 ### Decision
@@ -320,7 +320,8 @@ UI thread: receives CoverRefreshed → decode bytes → GdkTexture → redraw wi
 ### Explicit Trade-offs Accepted
 
 - MD5 is content-addressing, not security — sufficient for dedup against MPD's own responses
-- No online cover lookup — covers come exclusively via MPD protocol
+- Online cover lookup is optional, opt-in via `online-cover-art` feature flag — disabled by default for privacy
+- Online lookups rate-limited to 1 request/second (configurable) with exponential backoff on failure
 - Cover art loads incrementally (one per idle cycle) — visible items may take several cycles on first load
 - Revalidation on reconnect emits only on actual change — but the first revalidation pass requires fetching all visible album covers
 
@@ -683,9 +684,11 @@ last_profile = "local"
 
 ### Key Details
 
-- **MPRIS D-Bus integration:** Implement `org.mpris.MediaPlayer2` Player interface via `zbus` crate. Player interface only: Play, Pause, PlayPause, Stop, Next, Previous, Seek, SetPosition, OpenUri. Standard properties (PlaybackStatus, Metadata, Position, Volume, CanGoNext, etc.). D-Bus bus name: `org.mpris.MediaPlayer2.mpdclient`.
-- **Disabled by default:** `[mpris] enabled = false` in config. Opt-in only.
-- **Implementation:** Connect MPRIS method calls to existing `MpdCommand` channel — no new code paths. Register from MPD background thread via `zbus::Connection::session()`.
+- **MPRIS D-Bus integration:** Implement `org.mpris.MediaPlayer2` Player interface via `zbus` crate (`zbus = { version = "5", default-features = false, features = ["blocking"], optional = true }`). Player interface only: Play, Pause, PlayPause, Stop, Next, Previous, Seek, SetPosition, OpenUri. Standard properties (PlaybackStatus, Metadata, Position, Volume, CanGoNext, etc.). D-Bus bus name: `org.mpris.MediaPlayer2.mpdclient`.
+- **Blocking API, no tokio:** `default-features = false` excludes zbus's tokio-based async runtime. The `blocking` feature uses `zbus::blocking::Connection` which spawns a single internal IO thread for D-Bus message processing — compatible with the std::thread-only model (see ADR: Async Runtime Decision §790). Verified: `cargo tree -p zbus --no-default-features -f blocking` shows zero tokio dependencies.
+- **Disabled by default:** `[mpris] enabled = false` in config. Feature-gated: `[features] mpris = ["zbus"]`.
+- **Implementation:** New file `src/mpris.rs` (feature-gated). Struct `MprisPlayer { cmd_tx: mpsc::Sender<MpdCommand> }` with `#[zbus(interface)]` derive macro. All 15 methods map one-to-one to `cmd_tx.send(MpdCommand::*)` — no new code paths. Registered at startup via `connection.object_server().at("/org/mpris/MediaPlayer2", player)`.
+- **Shared D-Bus connection:** The single `zbus::blocking::Connection` created for MPRIS is also used for libnotify D-Bus calls (story 14-4), avoiding a separate D-Bus dependency for notifications. Notify calls use `connection.call_method()` directly — no `notify-rust` crate needed.
 - **Second-instance detection:** Lock file at `~/.cache/mpd-client/lock` on startup; second instance sends CLI-parsed action (e.g., `--toggle-playback`) to running instance via Unix socket, then exits
 - **CLI flags:** override config values for session only; `--mpd-host`, `--mpd-port`, `--profile`, `--mode`, `--start-playing`, `--toggle-playback`, `--next`, `--prev`
 - Remote actions received via Unix socket are dispatched as internal commands, not re-parsed
@@ -749,7 +752,7 @@ last_profile = "local"
 - **Toast types are non-modal** — no user action required; click-to-dismiss optional
 - **MPRIS integration** provides: lock screen playback info, media key support, desktop environment "now playing" display
 - **No system tray icon in v1** — desktop environment tray support is inconsistent across Linux DEs (GNOME removed it); MPRIS provides equivalent functionality for background control
-- **Notification area:** Optional libnotify integration for persistent notifications (e.g., "MPD disconnected — retrying") — disabled by default, opt-in via config
+- **Notification area:** Optional libnotify integration for persistent notifications (e.g., "MPD disconnected — retrying") — disabled by default, opt-in via config. Uses the same `zbus::blocking::Connection` as MPRIS (see ADR: IPC & CLI Architecture §687), calling `org.freedesktop.Notifications` interface directly — no additional D-Bus dependency
 - **Desktop file** registers for common audio MIME types — file manager "Open with" works for audio files
 
 ### Explicit Trade-offs Accepted
@@ -804,6 +807,7 @@ last_profile = "local"
 - GTK4 main loop is its own event loop. Adding tokio means running a second event loop alongside GTK's — more complexity, more failure modes.
 - MPD protocol is inherently synchronous: send command, read response, wait for "OK". No benefit from async I/O for a single TCP connection with request–response semantics.
 - Background work (MPD I/O, cover art processing) is a perfect fit for dedicated `std::thread` workers communicating via channels.
+- **zbus exception (confirmed compatible):** `zbus = { default-features = false, features = ["blocking"] }` uses zbus's blocking API which spawns a single internal IO thread — no tokio dependency. This is a bounded exception: the IO thread is internal to the connection, the public API is blocking, and the thread count grows by exactly 1 (not a thread pool). See ADR: IPC & CLI Architecture §687 for details.
 - Confirmed by spike build comparison (`notes/ASYNC_RUNTIME_DECISION.md`, now archived in this section).
 
 ## Architecture Decision Record: Session Persistence & State Restoration
@@ -2271,112 +2275,59 @@ Folder Normalizer strategies that collapse multi-file structures (cue sheets, DS
 
 ```
 mpd-client/
-├── Cargo.toml              # Single crate, [dev-dependencies] for gtk4
+├── Cargo.toml
 ├── Cargo.lock
-├── build.rs                # glib-compile-resources for gresource
 ├── .gitignore
-├── CLAUDE.md               # Project instructions for AI agents
+├── CLAUDE.md
 ├── README.md
-├── MIGRATION.md            # Workspace → single crate migration steps
-├── scripts/
-│   └── check-patterns.sh   # Enforcement: clippy, unwrap, GTK import, tests
-├── resources/
-│   ├── style.css           # GTK4 stylesheet (embedded via gresource)
-│   ├── icons/              # App icons
-│   │   ├── mpd-client.svg
-│   │   ├── mpd-client-16.png
-│   │   ├── mpd-client-32.png
-│   │   ├── mpd-client-48.png
-│   │   └── mpd-client-128.png
-│   └── mpd-client.gresource.xml
+├── MIGRATION.md
 ├── src/
-│   ├── main.rs             # Entry point, CLI parsing, startup phases
-│   ├── app.rs              # GtkApplication + GAction registration + CSS
-│   ├── errors.rs           # UserFacingError trait, ErrorSinkEvent, ErrorLevel
-│   ├── constants.rs        # Layout constants (split ratio, rail width, proportions)
+│   ├── main.rs
+│   ├── errors.rs
+│   ├── constants.rs
 │   ├── state/
-│   │   ├── mod.rs          # AppState, SharedState, Store, EventBus
-│   │   └── types.rs        # Mode, PlaybackState, ConnectionState
+│   │   └── mod.rs
 │   ├── mpd/
-│   │   ├── mod.rs          # MpdAdapter public API
-│   │   ├── state_machine.rs# MpdState enum + transitions
-│   │   ├── protocol.rs     # Command/response parsing
-│   │   ├── commands.rs     # MpdCommand enum
-│   │   ├── events.rs       # MpdEvent enum
-│   │   ├── channels.rs     # Channel types (MpdCommand, MpdEvent — not ErrorSink)
-│   │   └── mock.rs         # MockMpdServer (#[cfg(test)])
-│   ├── queue/
-│   │   ├── mod.rs          # QueueStore, QueueItem
-│   │   ├── mutations.rs    # Add/remove/reorder operations
-│   │   └── sync.rs         # Re-sync with MPD playlist
-│   ├── presenters/
-│   │   ├── mod.rs          # Re-exports
-│   │   ├── types.rs        # FormatLabel, CssClass, SortKey
-│   │   ├── browse/
-│   │   │   ├── mod.rs      # Album/folder browsing presenters
-│   │   │   ├── album_grid.rs  # AlbumGridViewModel + GridCoordinateMapper (inline)
-│   │   │   └── folder_norm.rs # FolderNormalizer trait + strategies
-│   │   └── queue/
-│   │       ├── mod.rs      # Queue presentation presenters
-│   │       ├── album_queue.rs # QueueStore → AlbumMiniGridViewModel
-│   │       └── track_queue.rs # QueueStore → TrackListViewModel
+│   │   ├── mod.rs
+│   │   ├── state_machine.rs
+│   │   └── mock.rs             # [cfg(test)]
+│   ├── queue/                  # [future] QueueStore extracted from state
+│   ├── presenters/             # [future] Separate presenter layer
 │   ├── coverart/
-│   │   ├── mod.rs          # CoverArtService
-│   │   ├── providers.rs    # Local/Embedded/Online providers
-│   │   └── caches.rs       # SessionCache (LRU), DiskCache, rate limiter, hash utilities
+│   │   ├── mod.rs
+│   │   ├── providers.rs        # [future] AlbumArtProvider + ReadPictureProvider
+│   │   └── caches.rs           # [future] Disk cache, LRU, rate limiter
 │   ├── search/
-│   │   ├── mod.rs          # SearchService
-│   │   ├── index.rs        # In-memory search index
-│   │   └── scoring.rs      # Relevance + fuzzy matching
-│   ├── layout/
-│   │   ├── mod.rs          # LayoutService + breakpoints (inline, 5 breakpoints as const array)
+│   │   └── mod.rs
+│   ├── layout/                 # [future] LayoutService
 │   ├── ui/
-│   │   ├── mod.rs          # Module root
-│   │   ├── gtk_reexport.rs # Re-exported GTK types (presenter boundary)
-│   │   ├── widgets/
-│   │   │   ├── mod.rs
-│   │   │   ├── workspace/{mod.rs, imp.rs}  # Mode orchestrator — GtkBox subclass, owns active widgets, handles mode switch lifecycle (hide/detach, not destroy)
-│   │   │   ├── breadcrumb_bar.rs # Navigation path: genre > artist > album (Album) or filesystem ancestry (Folder)
-│   │   │   ├── album_grid/{mod.rs, imp.rs}
-│   │   │   ├── folder_tree/{mod.rs, imp.rs}
-│   │   │   ├── queue_album/{mod.rs, imp.rs}
-│   │   │   ├── queue_track/{mod.rs, imp.rs}
-│   │   │   ├── now_playing/{mod.rs, imp.rs}
-│   │   │   ├── cover_display/{mod.rs, imp.rs}
-│   │   │   ├── search_bar.rs       # Simple widget (search logic injected from mode-specific presenter as strategy)
-│   │   │   ├── toast_overlay.rs    # Simple widget
-│   │   │   └── settings_dialog.rs  # Simple widget
-│   │   └── theme.rs        # CSS loading
+│   │   ├── mod.rs
+│   │   ├── gtk_reexport.rs
+│   │   └── widgets/
+│   │       ├── mod.rs
+│   │       ├── album_cover.rs
+│   │       ├── folder_tree.rs
+│   │       └── toast.rs
 │   ├── config/
-│   │   ├── mod.rs          # Load/save, defaults (first-run)
-│   │   └── cli.rs          # CLI flag parsing
-│   ├── ipc/
-│   │   ├── mod.rs          # Unix socket listener
-│   │   └── mpris.rs        # D-Bus MPRIS
-│   └── utils/
-│       ├── mod.rs
-│       └── strings.rs       # Unicode normalization, i18n centralization
+│   │   └── mod.rs
+│   ├── ipc/                    # [future] Unix socket + MPRIS
 ├── tests/
 │   ├── common/
-│   │   └── mod.rs           # Shared test helpers: mock MPD server setup, fixture data, channel wiring
-│   ├── smoke_test.rs        # End-to-end: MockMpdServer → connect → status → verify parsed state (not feature-gated, always runs)
-│   ├── mpd_integration.rs   # Real MPD tests (feature-gated)
-│   ├── queue_integration.rs # Queue sync against real MPD
-│   └── search_integration.rs# Search against real MPD
-└── build.rs                 # glib-compile-resources
+│   │   └── mod.rs
+│   └── smoke_test.rs
 ```
 
 ### Requirements to Structure Mapping
 
 | FR Category | Directory | Key Files |
 |-------------|-----------|-----------|
-| Playback (4 FRs) | `src/mpd/` | `commands.rs`, `state_machine.rs`, `events.rs` |
-| Queue (8 FRs) | `src/queue/` | `mutations.rs`, `sync.rs` |
-| Browsing (10+ FRs) | `src/presenters/browse/` + `src/ui/widgets/` | `album_grid.rs` (incl. GridCoordinateMapper), `folder_norm.rs`, `album_grid/`, `folder_tree/` |
-| Layout (6 FRs) | `src/layout/` | `breakpoints.rs` |
-| Cover Art (7 FRs) | `src/coverart/` | `providers.rs`, `caches.rs`, `rate_limiter.rs` |
-| Search (8+ FRs) | `src/search/` | `index.rs`, `scoring.rs` |
-| Drag & Drop (7 FRs) | `src/presenters/` + `src/ui/widgets/` | `album_grid.rs` (GridCoordinateMapper), presenter projections |
+| Playback (4 FRs) | `src/mpd/` | `mod.rs`, `state_machine.rs` |
+| Queue (8 FRs) | `src/state/` | `mod.rs` (QueueStore inline) |
+| Browsing (10+ FRs) | `src/ui/` | `mod.rs`, `widgets/album_cover.rs`, `widgets/folder_tree.rs` |
+| Layout (6 FRs) | `src/constants.rs` | (constants only; LayoutService is `[future]`) |
+| Cover Art (7 FRs) | `src/coverart/` | `mod.rs` |
+| Search (8+ FRs) | `src/search/` | `mod.rs` |
+| Drag & Drop (7 FRs) | `src/ui/` | `mod.rs` |
 
 ### Architectural Boundaries
 

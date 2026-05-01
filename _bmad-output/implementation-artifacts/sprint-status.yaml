@@ -128,7 +128,7 @@ development_status:
 
   epic-14: in-progress
   14-1-cli-argument-parsing: done
-  14-2-mpris-dbus-integration: backlog
+  14-2-mpris-dbus-integration: done
   14-3-second-instance-detection: backlog
   14-4-libnotify-notification: backlog
 

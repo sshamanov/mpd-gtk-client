@@ -38,7 +38,17 @@ pub struct Config {
     pub mpd_port: u16,
     #[serde(default = "default_split_ratio")]
     pub split_ratio: f64,
+    #[serde(default)]
+    pub mpris: MprisConfig,
 }
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct MprisConfig {
+    #[serde(default = "default_mpris_enabled")]
+    pub enabled: bool,
+}
+
+fn default_mpris_enabled() -> bool { false }
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
@@ -50,6 +60,7 @@ impl Default for Config {
             mpd_host: default_host(),
             mpd_port: default_port(),
             split_ratio: default_split_ratio(),
+            mpris: MprisConfig { enabled: false },
         }
     }
 }

@@ -296,6 +296,35 @@ So that future maintenance is straightforward and the code accurately reflects r
 **When** the cleanup is applied
 **Then** the `Clone` derive is removed or documented with a comment explaining why it exists
 
+### Story 6.6: Graceful MPD Shutdown
+
+As a developer,
+I want MPD to receive a clean `close` command on app shutdown,
+So that the server doesn't see an abrupt disconnect and the client exits cleanly.
+
+**Acceptance Criteria:**
+
+**Given** the app is shutting down normally (window closed, Ctrl+Q, SIGINT/SIGTERM)
+**When** the shutdown sequence begins
+**Then** a `close` command is sent to MPD before the TCP socket is dropped
+**And** the MPD background thread exits within 100ms of receiving the shutdown signal
+**And** `process::exit(0)` is replaced with a proper GTK lifecycle shutdown that drains pending events
+
+### Story 6.7: Queue Key Handler Race Condition
+
+As a user reordering the queue,
+I want rapid Shift+Up/Down key presses to always move the correct item,
+So that the queue order is always what I intended.
+
+**Acceptance Criteria:**
+
+**Given** the user presses Shift+Up or Shift+Down rapidly (<50ms between presses)
+**When** each key event fires before the previous queue update finishes
+**Then** the `item_ids` map is read from the latest queue state, not a stale snapshot
+**And** each reorder operation acts on the correct item index
+
+**Technical Notes:** The race window is <10ms. The `item_ids` map is rebuilt on each `MpdEvent::Queue`. The fix should either (a) use the same generation counter that queue events carry, or (b) debounce rapid key events and operate on the final state only.
+
 ---
 
 ## Epic 7: Cover Art & Visual Polish
@@ -481,6 +510,8 @@ So that I don't get the wrong album because of grid index mismatch.
 **And** the correct `PlayAlbum` command is sent with the right album name
 **And** this works for any album in any position across all grouped views
 
+**Status: ✅ DONE (2026-04-29)** — `album_names` -> `Vec<Option<String>>` with `None` for group headers.
+
 ### Story 9.4: CUE/DSD Row Playback
 
 As a folder-mode user,
@@ -509,6 +540,40 @@ So that compilations and soundtracks show the right artist name instead of "Unkn
 **When** the `search_albums` parser processes the response
 **Then** `AlbumArtist:` is checked as a fallback when `Artist:` is missing for an album
 **And** albums tagged only with `AlbumArtist:` display the correct artist in search results
+
+**Status: ✅ DONE (2026-04-27, commit 68f3593)**
+
+### Story 9.6: Fix list_albums_grouped Artist Loss for Date/Genre
+
+As a user browsing grouped views,
+I want all albums to show their artist name in Date and Genre groupings,
+So that I can identify albums correctly even when MPD omits artist metadata.
+
+**Acceptance Criteria:**
+
+**Given** the user switches to a Date or Genre grouped view
+**When** `list_albums_grouped` processes the MPD response
+**Then** each album's artist is resolved by fetching per-album metadata when the grouped response lacks it
+**And** the artist is displayed alongside each album in the grid
+**And** albums without artist metadata show "Unknown Artist" instead of an empty string
+
+**Technical Notes:** MPD's `list` with group-by does not return artist data for non-Artist groupings. Requires per-album `listalbumartist` or `search` fetch to backfill. Batch to avoid N+1.
+
+### Story 9.7: Fix search_albums Stale Artist Edge Cases
+
+As a user searching the library,
+I want search results to always show the correct artist name,
+So that I don't see the previous track's artist carried over to a tagless track.
+
+**Acceptance Criteria:**
+
+**Given** an album has tracks with mixed Artist tags (some present, some missing)
+**When** `search_albums` processes the MPD response
+**Then** each album's artist is reset at each `file:` boundary
+**And** albums with entirely missing Artist tags show "Unknown Artist"
+**And** the `AlbumArtist` fallback from Story 9.5 still applies when Artist is missing
+
+**Technical Notes:** The `file:` line separator fix was added but edge cases remain when Artist tags span multiple tracks. Ensure the artist accumulator is reset per-track boundary, not per-album boundary.
 
 ---
 
@@ -632,3 +697,392 @@ So that I can organize albums in my preferred order for the session.
 **Then** the album is moved to the drop position in the grid display
 **And** the new order persists for the session only
 **And** switching to a grouped view and back to Albums preserves the custom order
+
+---
+
+## Epic 12: UI Responsiveness
+**Goal:** Grid population and event processing run off the GTK main thread. Large libraries don't freeze the UI during rebuild or event bursts. App stays smooth at 60 FPS.
+
+### Story 12.1: Async Grid Population via GtkGridView Factory
+
+As a user with a large library,
+I want the album grid to populate without freezing the UI,
+So that I can scroll and interact while albums load.
+
+**Acceptance Criteria:**
+
+**Given** the app is populating the album grid (initial load, grouped view switch, search results)
+**When** `populate_album_grid` or `populate_grouped_grid` would normally run synchronously
+**Then** a `GtkGridView` factory pattern is used instead of manual `FlowBox` child insertion
+**And** cell widgets are created in batches of 16 per idle cycle
+**And** the UI remains responsive during population (>30 FPS maintained)
+**And** cells are recycled when the model changes (not destroyed and recreated)
+
+**Technical Notes:** The architecture notes GtkGridView factory pattern as the designed fix. Requires replacing `FlowBox` with `GtkGridView` + `GtkSliceListModel` + factory signal.
+
+### Story 12.2: GTK4 Frame Clock Integration (Replace 30ms Timer)
+
+As a user,
+I want smooth scrolling and event processing without stutter,
+So that the UI feels responsive even under heavy event load.
+
+**Acceptance Criteria:**
+
+**Given** the app processes MPD events at high frequency (queue updates, status changes)
+**When** the 30ms `glib::timeout_add_local` timer fires
+**Then** event processing is driven by GTK4's `GdkFrameClock` instead of a fixed-interval timer
+**And** events are batched per-frame (max 64 per frame as a safety limit)
+**And** no event processing happens between frames or during layout passes
+
+**Technical Notes:** The current 30ms timer can starve the GTK main loop under heavy load. `GdkFrameClock::connect_frame_tick` fires once per monitor refresh, aligning work with vsync. The 64-event batch limit already exists as a mitigation.
+
+---
+
+## Epic 13: Cover Art v2 Pipeline
+**Goal:** Replace the basic `CoverFetcher` with the two-layer `CoverProvider + ActualRead` architecture designed in `architecture.md`. MD5 content-addressed disk cache, scroll-aware loading, online lookup support.
+
+### Story 13.1: CoverProvider — Synchronous Cache Read
+
+As a developer,
+I want a fast synchronous cache layer that never blocks the UI,
+So that cover art for cached albums returns immediately without any fallthrough chain.
+
+**Acceptance Criteria:**
+
+**Given** an album has a cached cover image on disk
+**When** `CoverProvider::get(album_id)` is called
+**Then** it returns `Some((path, md5_hash, timestamp))` synchronously (no I/O wait, no blocking)
+**And** the path is a valid JPEG at `~/.cache/mpd-client/covers/<md5>.jpg`
+
+**Given** an album has no cached cover
+**When** `CoverProvider::get(album_id)` is called
+**Then** it returns `None`
+**And** the caller can enqueue the album in ActualRead for background fetching
+
+**Technical Notes:** In-memory index of `album_id → (path, hash, timestamp)` built on startup from the cache directory. No disk I/O at query time. Fast-path for `src/coverart/mod.rs`.
+
+### Story 13.2: ActualRead — Background Fetch Queue
+
+As a developer,
+I want cover fetching to run one album per idle cycle in the background,
+So that covers load incrementally without blocking MPD commands or the UI.
+
+**Acceptance Criteria:**
+
+**Given** the ActualRead queue has albums to process
+**When** the background idle cycle fires
+**Then** exactly one album is fetched per cycle
+**And** the fetch uses `albumart <uri>` primary then `readpicture <uri>` fallback
+**And** the binary data is MD5-hashed and compared against the cache hash
+**And** only a different hash triggers `CoverRefreshed` emission
+**And** identical hashes are silently skipped (no emission, no redraw)
+
+**Given** a `readpicture` fetch succeeds
+**When** the MPD response includes a timestamp
+**Then** the timestamp is compared against the cached timestamp
+**And** only newer timestamps trigger emission
+
+**Technical Notes:** AlbumArtProvider (primary, content-addressed via MD5) and ReadPictureProvider (fallback, time-addressed). One album per idle cycle (~100ms) keeps the MPD command loop responsive.
+
+### Story 13.3: Scroll-Aware Loading Priority
+
+As a user with a large library,
+I want visible albums to load their covers first,
+So that scrolling doesn't trigger unnecessary fetches for off-screen items.
+
+**Acceptance Criteria:**
+
+**Given** the user scrolls through the album grid rapidly
+**When** scroll stops for ≥300ms
+**Then** covers for visible (and near-visible, ±1 row) albums are enqueued in ActualRead with high priority
+**And** albums that scrolled out of view during rapid scrolling are NOT enqueued
+**And** the 300ms stop timer resets on each scroll event
+
+### Story 13.4: Widget Registry Integration for In-Place Updates
+
+As a user,
+I want cover art to appear in the grid as soon as it's fetched,
+So that placeholders are replaced seamlessly without grid rebuilds.
+
+**Acceptance Criteria:**
+
+**Given** AlbumArtProvider emits `CoverRefreshed(id, data)`
+**When** the UI thread receives the event
+**Then** the `GdkTexture` is decoded from raw bytes on the main thread
+**And** the widget registry (`HashMap<String, Picture>`) looks up the target cell
+**And** `set_filename()` / `queue_draw()` updates the cell in-place
+**And** no full grid rebuild is triggered
+
+**Technical Notes:** The widget registry pattern is already validated and working in the v1 implementation. This story formalizes it for the v2 pipeline.
+
+### Story 13.5: Online Cover Lookup (Opt-In)
+
+As a user,
+I want the app to optionally fetch covers from online sources when local/MPD art is unavailable,
+So that even albums without embedded or folder art can have covers.
+
+**Acceptance Criteria:**
+
+**Given** AlbumArtProvider and ReadPictureProvider both returned no cover
+**When** the `online-cover-art` feature flag is enabled
+**Then** the album is enqueued for online lookup (MusicBrainz → Cover Art Archive → Discogs)
+**And** requests are rate-limited to 1/second (configurable)
+**And** failed lookups are retried with exponential backoff (1s, 2s, 4s, 8s, 16s max)
+
+**Given** the `online-cover-art` feature flag is disabled
+**When** an album has no locally available cover
+**Then** no HTTP request is made (privacy-by-default)
+**And** the album continues showing the hash-derived color placeholder
+
+**Technical Notes:** Online lookup is opt-in via `Cargo.toml` feature flag (`online-cover-art`). Uses `ureq` + `rustls` for HTTP. Disabled by default.
+
+---
+
+## Epic 14: CLI & Desktop Integration
+**Goal:** Enable desktop environment integration through CLI flags for session-level overrides, MPRIS D-Bus for media key support and lock screen controls, second-instance detection for single-instance operation, and optional libnotify notification support.
+**ADRs:** §661 (IPC & CLI), §743 (Notification & System Integration)
+**FRs covered:** PRD §194 (desktop integration), PRD §195 (keyboard shortcuts CLI)
+
+### Story 14.1: CLI Argument Parsing
+
+As a user,
+I want to pass command-line flags to control the application at startup,
+So that I can specify MPD host/port, startup mode, and initial actions without editing config files.
+
+**Acceptance Criteria:**
+
+**Given** the application is launched from the command line
+**When** `--mpd-host <host>` is passed
+**Then** the MPD connection uses the specified host (overrides config)
+**And** the config file is not modified
+
+**Given** the application is launched with `--mode album` or `--mode folder`
+**When** the UI initializes
+**Then** the specified mode is activated on startup (overrides last-saved mode)
+
+**Given** the application is launched with `--start-playing` or `--toggle-playback`
+**When** the connection to MPD is established
+**Then** the corresponding action is dispatched
+
+**Given** invalid flags are passed
+**When** the CLI parser encounters an unrecognized argument
+**Then** a helpful error message is printed to stderr
+**And** the application exits with a non-zero status
+
+**Technical Notes:** Use a lightweight CLI parser (`argh` or manual `std::env::args()` parsing — no clap dependency needed for <10 flags). Supported flags: `--mpd-host`, `--mpd-port`, `--profile`, `--mode`, `--start-playing`, `--toggle-playback`, `--next`, `--prev`, `--version`, `--help`. Config overrides are session-only (not persisted).
+
+### Story 14.2: MPRIS D-Bus Integration
+
+As a user,
+I want the application to integrate with the Linux desktop via MPRIS D-Bus,
+So that I can control playback with media keys, lock screen controls, and tools like `playerctl`.
+
+**Acceptance Criteria:**
+
+**Given** the application is running and MPRIS is enabled in config
+**When** `playerctl play-pause` is invoked
+**Then** playback toggles via the existing MPD command channel
+**And** `playerctl status` returns the correct playback state
+
+**Given** a track is playing
+**When** a D-Bus client queries `org.mpris.MediaPlayer2.Player` properties
+**Then** `PlaybackStatus`, `Metadata` (title, artist, album, art URL, length), and `Position` are returned correctly
+
+**Given** MPRIS is disabled in config (default)
+**When** the application starts
+**Then** no D-Bus name is acquired
+**And** no MPRIS-related code runs
+
+**Technical Notes:** Implement `org.mpris.MediaPlayer2` and `Player` interfaces via `zbus` crate. D-Bus bus name: `org.mpris.MediaPlayer2.mpdclient`. Disabled by default: `[mpris] enabled = false` in config. MPRIS method calls map to existing `MpdCommand` channel — no new code paths for playback control. Feature flag: `mpris`.
+
+### Story 14.3: Second-Instance Detection
+
+As a user launching the application a second time,
+I want the second instance to forward CLI actions to the already-running instance,
+So that I don't get duplicate windows and my intended action still happens.
+
+**Acceptance Criteria:**
+
+**Given** an instance of the application is already running
+**When** a second instance is launched with `--toggle-playback`
+**Then** the second instance detects the running instance via a lock file
+**And** forwards the action to the running instance via Unix socket
+**And** the second instance exits without creating a window
+
+**Given** no instance is running
+**When** the application starts
+**Then** a lock file is created at `~/.cache/mpd-client/lock`
+**And** a Unix socket listener is started for incoming commands
+
+**Given** the application exits normally
+**When** the shutdown sequence runs
+**Then** the lock file and Unix socket are cleaned up
+
+**Technical Notes:** Lock file at `~/.cache/mpd-client/lock`. Unix socket listener runs on GTK main loop via `gio` socket API (no separate thread). Remote actions are dispatched as internal commands, not re-parsed. `gio`-managed socket binding auto-cleans on crash.
+
+### Story 14.4: libnotify Notification Integration
+
+As a user,
+I want the application to optionally show desktop notifications for important events,
+So that I can be informed of connection changes or playback events even when the window is minimized.
+
+**Acceptance Criteria:**
+
+**Given** the application is running and libnotify is enabled in config
+**When** the MPD connection drops
+**Then** a persistent desktop notification is shown: "MPD disconnected — retrying..."
+**And** the notification is updated or dismissed when the connection is restored
+
+**Given** libnotify is disabled in config (default)
+**When** a connection event occurs
+**Then** no desktop notification is shown (in-app toast only)
+
+**Technical Notes:** Opt-in via config (`[notifications] libnotify = false` by default). Uses the same `zbus::blocking::Connection` as MPRIS (story 14-2) to call `org.freedesktop.Notifications` D-Bus interface directly — no `notify-rust` crate needed. Maps to existing toast event stream. Disabled by default for privacy — user must opt in.
+
+---
+
+## Epic 15: Connection Profiles
+**Goal:** Support multiple named MPD connection profiles (local Unix socket, remote NAS, etc.) with persistent config and profile selection UI.
+**ADRs:** §448 (Multi-Profile Connections)
+
+### Story 15.1: Multi-Profile Connection Config
+
+As a user with multiple MPD instances (local, NAS, work),
+I want to define named connection profiles in the config,
+So that I can switch between MPD servers without re-entering connection details.
+
+**Acceptance Criteria:**
+
+**Given** the config file contains multiple profiles
+**When** the application reads the config
+**Then** all profiles are parsed and available for selection
+**And** the `default_profile` key determines the initial connection
+**And** the `last_profile` key is updated on each manual profile switch
+
+**Given** a profile is defined with a Unix socket path
+**When** connecting via that profile
+**Then** the adapter uses the Unix socket path directly (skips auto-detection)
+
+**Given** no profiles are defined in config
+**When** the application starts
+**Then** the existing single-host behavior is preserved (backward compatible)
+**And** the first successful auto-detect is saved as the "default" profile
+
+**Technical Notes:** Config format:
+```toml
+[profiles.local]
+host = "/run/mpd/socket"
+[profiles.nas]
+host = "192.168.1.100"
+port = 6600
+[general]
+default_profile = "local"
+last_profile = "local"
+```
+No profile editing UI in v1 — profiles are hand-edited in TOML. Profile selector in settings dialog.
+
+### Story 15.2: Profile Selector in Settings Dialog
+
+As a user,
+I want to switch between connection profiles from the settings dialog,
+So that I can change MPD servers without editing config files.
+
+**Acceptance Criteria:**
+
+**Given** the settings dialog is open
+**When** the user navigates to the Connection section
+**Then** a profile dropdown shows all defined profiles from the config
+**And** the current profile is pre-selected
+
+**Given** the user selects a different profile and clicks Save
+**When** the settings are applied
+**Then** the current MPD connection is gracefully closed
+**And** a new connection is established using the selected profile's host/port/socket
+**And** the `last_profile` key is updated in config
+
+**Given** only one profile is defined
+**When** the settings dialog opens
+**Then** the profile dropdown is hidden (no selection needed)
+
+**Technical Notes:** Profile dropdown uses `gtk4::DropDown` with a `StringList`. Connection restart uses the same `MpdCommand::Reconnect` mechanism. No profile add/edit UI in v1.
+
+---
+
+## Epic 16: Infrastructure & Code Quality
+**Goal:** Config schema versioning with corruption recovery, rotating log file infrastructure, and window geometry persistence for startup state restoration.
+**ADRs:** §589 (Configuration Management), §621 (Logging & Observability), §810 (Session Persistence)
+
+### Story 16.1: Config Schema Version and Corruption Recovery
+
+As a developer,
+I want the config file to have a schema version with automatic corruption recovery,
+So that future config changes are migratable and corrupt configs don't break the application.
+
+**Acceptance Criteria:**
+
+**Given** the config file has a `schema_version` field that is lower than the current version
+**When** the config is loaded
+**Then** a migration function is applied to update the config to the current version
+**And** the migrated config is written back to disk
+
+**Given** the config file is corrupt (invalid TOML, truncated, or unreadable)
+**When** the config loader attempts to parse it
+**Then** the corrupt file is backed up to `config.toml.bad`
+**And** a fresh default config is created
+**And** a warning is logged with the backup path
+
+**Given** the config file is valid but missing the `schema_version` field
+**When** the config is loaded
+**Then** the schema version defaults to 1
+**And** all migrations from version 1 to current are applied sequentially
+
+**Technical Notes:** `schema_version: u32` field in `Config` struct, defaulting to 0 (unversioned). Migration functions are a `Vec<fn(&mut Config)>` indexed by version — each function transitions from version N to N+1. Current version starts at 1. Backup path: `~/.config/mpd-client/config.toml.bad`.
+
+### Story 16.2: Rotating Log File
+
+As a developer debugging issues,
+I want the application to write logs to a rotating file in addition to stderr,
+So that I can review past sessions' logs even after the terminal is closed.
+
+**Acceptance Criteria:**
+
+**Given** the application is running with `RUST_LOG=debug`
+**When** log messages are emitted
+**Then** they are written to both stderr (at configured level) and a log file
+**And** the log file is at `~/.local/share/mpd-client/log/`
+**And** log files rotate at 5MB each, keeping 3 rotated files
+
+**Given** the log directory does not exist
+**When** the application starts
+**Then** the directory is created automatically
+
+**Given** the log file cannot be written (permissions, disk full)
+**When** a log write attempt fails
+**Then** the error is silently ignored (logging failure is non-fatal)
+**And** the application continues with stderr-only logging
+
+**Technical Notes:** Use `log` + `env_logger` for the existing setup. Add a file appender via a custom logger or `log4rs` (minimal config, no polling). Log path: `~/.local/share/mpd-client/log/mpd-client.log`. Rotation: max 5MB per file, 3 files. Trace-level to file, info-level to stderr (configurable via `RUST_LOG`).
+
+### Story 16.3: Window Geometry Persistence
+
+As a user,
+I want the application to remember my window size and position between sessions,
+So that I don't have to resize and reposition the window every time I launch it.
+
+**Acceptance Criteria:**
+
+**Given** the user resizes and repositions the window
+**When** the application exits normally
+**Then** the window width, height, and (x, y) position are saved to the config file
+
+**Given** the application is restarted after a normal exit
+**When** the window is created
+**Then** the window geometry from the saved config is applied
+**And** the window appears at the saved position with the saved size
+
+**Given** the saved position is off-screen (multi-monitor change)
+**When** the window geometry is restored
+**Then** GTK4's default window positioning is used as fallback
+**And** the off-screen position is ignored
+
+**Technical Notes:** Store `window_width`, `window_height`, `window_x`, `window_y` in `Config` struct. Write on graceful shutdown only (not on every resize — avoids IO churn). GTK4's `GtkWindow::get_default_size()` and `GtkWindow::get_position()` provide the values. Off-screen detection: check against available monitor geometry via `GdkDisplay::monitors()`.
