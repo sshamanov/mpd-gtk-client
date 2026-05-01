@@ -46,6 +46,7 @@ pub struct AlbumBrowsingState {
     pub selected_album_id: Option<String>,
     pub hover_album_id: Option<String>,
     pub group_expansion: HashMap<String, bool>,
+    pub custom_album_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +105,7 @@ pub fn create_initial_state() -> SharedState {
             selected_album_id: None,
             hover_album_id: None,
             group_expansion: HashMap::new(),
+            custom_album_order: Vec::new(),
         },
         folder_browsing: FolderBrowsingState {
             expanded_paths: Vec::new(),

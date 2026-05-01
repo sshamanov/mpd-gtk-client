@@ -403,7 +403,7 @@ impl App {
 
                 // GtkDragSource for dragging album covers to queue
                 let drag_source = DragSource::new();
-                drag_source.set_actions(DragAction::COPY);
+                drag_source.set_actions(DragAction::COPY | DragAction::MOVE);
                 drag_source.connect_prepare(move |source, _x, _y| {
                     let Some(container) = source.widget().and_then(|w| w.downcast::<Box>().ok()) else {
                         return None::<ContentProvider>;
@@ -832,6 +832,72 @@ impl App {
             pinned_header.set_margin_start(8);
             pinned_header.set_margin_top(4);
             album_overlay.add_overlay(&pinned_header);
+
+            // GtkDropTarget for album grid reorder (plain Albums view only)
+            let grid_state = state.clone();
+            let grid_data = album_grid_data.clone();
+            let grid_model = album_model.clone();
+            let grid_cw = cover_widgets.clone();
+            let grid_vadj = left_scroll.vadjustment();
+            let grid_cmd = cmd_tx.clone();
+            let grid_target = DropTarget::new(String::static_type(), DragAction::MOVE);
+            grid_target.connect_drop(move |target, value, x, y| {
+                // Only allow reorder in plain Albums view (single "All Albums" header, not multi-group)
+                let header_count = grid_data.borrow().iter().filter(|item| matches!(item, AlbumGridItem::Header { .. })).count();
+                if header_count > 1 {
+                    return false;
+                }
+
+                if let Ok(s) = value.get::<String>() {
+                    if !s.contains(':') {
+                        // Plain album name — this is a grid reorder attempt
+                        let scroll_top = grid_vadj.value();
+                        let adjusted_y = scroll_top + y; // Convert to data-space y
+
+                        // 200x250 cell size from factory setup
+                        let col = (x / 200.0_f64).floor() as usize;
+                        let row = (adjusted_y / 250.0_f64).floor() as usize;
+                        let grid_width = target.widget().and_then(|w| w.downcast::<gtk4::ScrolledWindow>().ok())
+                            .map(|sw| sw.width()).unwrap_or(800);
+                        let cols_per_row = std::cmp::max(1, grid_width / 200);
+                        let target_idx = row.saturating_mul(cols_per_row as usize) + col;
+
+                        // Reorder the backing data
+                        let mut data = grid_data.borrow_mut();
+                        let source_pos = data.iter().position(|item| {
+                            matches!(item, AlbumGridItem::Album { name, .. } if name == &s)
+                        });
+                        if let Some(src) = source_pos {
+                            if src == target_idx.min(data.len().saturating_sub(1)) {
+                                return true; // No move needed
+                            }
+                            let item = data.remove(src);
+                            let insert_at = if target_idx > src {
+                                target_idx.min(data.len())
+                            } else {
+                                target_idx.min(data.len())
+                            };
+                            data.insert(insert_at, item);
+
+                            // Save custom order and update model
+                            let order: Vec<String> = data.iter().filter_map(|item| {
+                                if let AlbumGridItem::Album { name, .. } = item {
+                                    Some(name.clone())
+                                } else { None }
+                            }).collect();
+                            if let Ok(mut st) = grid_state.write() {
+                                st.album_browsing.custom_album_order = order;
+                            }
+                            drop(data);
+                            let items: Vec<AlbumGridItem> = grid_data.borrow().clone();
+                            batch_populate(&grid_model, &grid_data, items, &grid_cw);
+                        }
+                        return true;
+                    }
+                }
+                false
+            });
+            left_scroll.add_controller(grid_target);
 
             album_content.append(&search_entry);
             album_content.append(&album_overlay);
@@ -1655,7 +1721,7 @@ impl App {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                let items: Vec<AlbumGridItem> = albums.iter()
+                                let mut items: Vec<AlbumGridItem> = albums.iter()
                                     .enumerate()
                                     .map(|(i, (artist, name))| {
                                         let (pr, pg, pb) = placeholder_rgb(artist);
@@ -1667,6 +1733,19 @@ impl App {
                                         }
                                     })
                                     .collect();
+                                // Apply custom session order in plain Albums view
+                                if let Ok(st) = fc_state.read() {
+                                    let order = &st.album_browsing.custom_album_order;
+                                    if !order.is_empty() {
+                                        items.sort_by_key(|item| {
+                                            if let AlbumGridItem::Album { name, .. } = item {
+                                                order.iter().position(|o| o == name).unwrap_or(usize::MAX)
+                                            } else {
+                                                usize::MAX
+                                            }
+                                        });
+                                    }
+                                }
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
                                 // Scroll-aware: only fetch covers for visible (±1 row) albums
@@ -1701,7 +1780,7 @@ impl App {
                                 if need_index {
                                     if let Ok(mut idx) = fc_si.write() { idx.build(&flat); }
                                 }
-                                let items: Vec<AlbumGridItem> = groups.iter()
+                                let mut items: Vec<AlbumGridItem> = groups.iter()
                                     .flat_map(|(header, albums)| {
                                         let mut group_items: Vec<AlbumGridItem> = Vec::new();
                                         group_items.push(AlbumGridItem::Header {
@@ -1720,6 +1799,25 @@ impl App {
                                         group_items
                                     })
                                     .collect();
+                                // Apply custom session order in plain Albums view (single group)
+                                if groups.len() == 1 {
+                                    if let Ok(st) = fc_state.read() {
+                                        let order = &st.album_browsing.custom_album_order;
+                                        if !order.is_empty() {
+                                            // Preserve the header, reorder only Album items
+                                            let header_item = items.first().cloned();
+                                            let mut album_items: Vec<AlbumGridItem> = items.drain(1..).collect();
+                                            album_items.sort_by_key(|item| {
+                                                if let AlbumGridItem::Album { name, .. } = item {
+                                                    order.iter().position(|o| o == name).unwrap_or(usize::MAX)
+                                                } else {
+                                                    usize::MAX
+                                                }
+                                            });
+                                            items = header_item.into_iter().chain(album_items).collect();
+                                        }
+                                    }
+                                }
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
                                 if need_index {
