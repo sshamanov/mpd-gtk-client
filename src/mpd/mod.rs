@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
 
@@ -56,6 +56,27 @@ impl MpdStream {
         }
     }
 
+}
+
+/// Describes how to connect to an MPD server — used internally and in the state machine.
+#[derive(Debug, Clone)]
+pub enum ConnectionTarget {
+    /// Auto-detect: Unix socket at common paths, then TCP fallback to localhost:6600.
+    Auto,
+    /// TCP connection to a host:port.
+    Tcp(String, u16),
+    /// Unix socket at an explicit path.
+    Unix(String),
+}
+
+impl ConnectionTarget {
+    /// Extract the TCP host:port, if this target is TCP.
+    pub fn tcp_host_port(&self) -> Option<(&str, u16)> {
+        match self {
+            ConnectionTarget::Tcp(host, port) => Some((host.as_str(), *port)),
+            _ => None,
+        }
+    }
 }
 
 /// Try connecting to MPD via Unix socket at common paths.
@@ -258,16 +279,51 @@ impl MpdAdapter {
     /// Connect to MPD via TCP host:port or Unix socket path.
     /// If `host` is "auto" or empty, attempts Unix socket auto-detection
     /// with fallback chain: $XDG_RUNTIME_DIR/mpd/socket → /run/mpd/socket → localhost:6600.
-    pub fn connect(host: &str, port: u16) -> Result<Self, Error> {
-        if host.is_empty() || host == "auto" {
-            #[cfg(unix)]
-            if let Ok(adapter) = try_unix_socket_connect() {
-                return Ok(adapter);
+    pub fn connect(target: &ConnectionTarget) -> Result<Self, Error> {
+        match target {
+            ConnectionTarget::Auto => {
+                #[cfg(unix)]
+                if let Ok(adapter) = try_unix_socket_connect() {
+                    return Ok(adapter);
+                }
+                Self::connect_tcp("localhost", 6600)
             }
-            // Fallback to TCP
-            return Self::connect_tcp("localhost", 6600);
+            ConnectionTarget::Tcp(host, port) => Self::connect_tcp(host, *port),
+            ConnectionTarget::Unix(path) => Self::connect_unix(path),
         }
-        Self::connect_tcp(host, port)
+    }
+
+    /// Connect to MPD via a specific Unix socket path.
+    fn connect_unix(path: &str) -> Result<Self, Error> {
+        #[cfg(unix)]
+        {
+            let stream = UnixStream::connect(Path::new(path))?;
+            log::info!("[adapter] connected via Unix socket at {path}");
+            let clone = MpdStream::Unix(stream.try_clone()?);
+            let mut reader = BufReader::new(clone);
+            let mut greeting = String::new();
+            match reader.read_line(&mut greeting) {
+                Ok(0) | Err(_) => return Err(Error::Connection(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset, "no greeting from MPD",
+                ))),
+                Ok(_) => {
+                    if !greeting.trim().starts_with("OK ") {
+                        return Err(Error::Protocol("invalid MPD greeting".into()));
+                    }
+                    let version = greeting.trim().trim_start_matches("OK ").to_string();
+                    Ok(MpdAdapter {
+                        stream: MpdStream::Unix(stream),
+                        reader,
+                        protocol_version: Some(version),
+                        capabilities: Default::default(),
+                    })
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Err(Error::Connection(std::io::Error::new(
+            std::io::ErrorKind::Unsupported, "Unix sockets not supported on this platform",
+        )))
     }
 
     fn connect_tcp(host: &str, port: u16) -> Result<Self, Error> {

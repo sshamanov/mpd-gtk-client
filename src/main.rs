@@ -17,6 +17,7 @@ pub mod ui;
 use config::CliOverrides;
 use log::info;
 use mpd::state_machine::{MpdCommand, MpdEvent, MpdEventLoop};
+use mpd::ConnectionTarget;
 use state::create_initial_state;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -192,17 +193,14 @@ fn main() {
         }
     }
 
-    // Shared host/port for live reconnect (Settings writes, background thread reads)
-    let conn_params: Arc<Mutex<(String, u16)>> = Arc::new(Mutex::new((
-        config.mpd_host.clone(),
-        config.mpd_port,
-    )));
+    // Shared connection target for live reconnect (Settings writes, background thread reads)
+    let conn_params: Arc<Mutex<ConnectionTarget>> = Arc::new(Mutex::new(
+        config.connection_target(),
+    ));
 
     // Create bounded MPD event channel (backpressure: drop events when UI is busy)
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(1024);
     let (event_loop, cmd_tx) = MpdEventLoop::spawn(
-        config.mpd_host.clone(),
-        config.mpd_port,
         event_tx,
         conn_params.clone(),
     );

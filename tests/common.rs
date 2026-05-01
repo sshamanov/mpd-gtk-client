@@ -1,4 +1,4 @@
-use mpd_client::mpd::MpdAdapter;
+use mpd_client::mpd::{ConnectionTarget, MpdAdapter};
 use std::path::PathBuf;
 
 pub use mpd_client::mpd::mock::MockMpdServer;
@@ -6,7 +6,8 @@ pub use mpd_client::mpd::mock::MockMpdServer;
 /// Starts a MockMpdServer and creates an MpdAdapter connected to it.
 pub fn with_mpd_server() -> (MockMpdServer, MpdAdapter) {
     let server = MockMpdServer::new();
-    let client = MpdAdapter::connect("127.0.0.1", server.addr().port()).unwrap();
+    let target = ConnectionTarget::Tcp("127.0.0.1".into(), server.addr().port());
+    let client = MpdAdapter::connect(&target).unwrap();
     (server, client)
 }
 

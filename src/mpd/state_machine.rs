@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used)]
 
-use crate::mpd::MpdAdapter;
+use crate::mpd::{ConnectionTarget, MpdAdapter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -134,10 +134,8 @@ pub struct MpdEventLoop {
 impl MpdEventLoop {
     /// Spawn the background thread and return a handle + command sender.
     pub fn spawn(
-        _host: String,
-        _port: u16,
         event_tx: mpsc::SyncSender<MpdEvent>,
-        conn_params: Arc<std::sync::Mutex<(String, u16)>>,
+        conn_params: Arc<std::sync::Mutex<ConnectionTarget>>,
     ) -> (Self, mpsc::Sender<MpdCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<MpdCommand>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -181,8 +179,8 @@ impl MpdEventLoop {
                         }
                         MpdState::Connecting { start_time: _ } => {
                             let _ = event_tx.try_send(MpdEvent::Connecting);
-                            let (ref c_host, c_port) = *conn_params.lock().expect("conn_params lock");
-                            match MpdAdapter::connect(c_host, c_port) {
+                            let target = conn_params.lock().expect("conn_params lock").clone();
+                            match MpdAdapter::connect(&target) {
                                 Ok(adapter) => {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
                                     connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone);

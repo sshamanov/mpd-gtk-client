@@ -130,10 +130,10 @@ development_status:
   14-1-cli-argument-parsing: done
   14-2-mpris-dbus-integration: done
   14-3-second-instance-detection: done
-  14-4-libnotify-notification: in-progress
+  14-4-libnotify-notification: done
 
   epic-15: backlog
-  15-1-multi-profile-connection-config: backlog
+  15-1-multi-profile-connection-config: in-progress
   15-2-profile-selector-ui: backlog
 
   epic-16: backlog

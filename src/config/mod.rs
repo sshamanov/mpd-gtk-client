@@ -2,6 +2,7 @@
 //! Also defines [`CliOverrides`] for session-only CLI flag overrides.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Session-only overrides parsed from CLI flags — not persisted to config file.
@@ -42,6 +43,23 @@ pub struct Config {
     pub mpris: MprisConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Named connection profiles (epic 15). Key = profile name.
+    #[serde(default)]
+    pub profiles: Option<HashMap<String, ProfileConfig>>,
+    /// Profile to use on startup. Falls back to legacy `mpd_host`/`mpd_port` when None.
+    pub default_profile: Option<String>,
+    /// Last manually selected profile (persisted for next startup).
+    pub last_profile: Option<String>,
+}
+
+/// A named MPD connection profile — either a Unix socket path or TCP host:port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileConfig {
+    /// Unix socket path (e.g., `/run/mpd/socket`) or TCP hostname.
+    pub host: String,
+    /// TCP port (only used when `host` is not a Unix socket path).
+    #[serde(default = "default_port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -72,6 +90,9 @@ impl Default for Config {
             split_ratio: default_split_ratio(),
             mpris: MprisConfig { enabled: false },
             notifications: NotificationsConfig { libnotify: false },
+            profiles: None,
+            default_profile: None,
+            last_profile: None,
         }
     }
 }
@@ -96,11 +117,51 @@ impl Config {
         }
     }
 
-    /// Load config for a specific named profile.
-    /// Currently a stub — falls back to `load()` until multi-profile support lands (epic 15).
+    /// Load config, optionally selecting a profile's connection parameters.
+    ///
+    /// If `name` is provided and exists in `profiles`, the returned Config uses
+    /// the profile's `host`/`port` as `mpd_host`/`mpd_port` for backward compat.
+    /// Falls back to `load()` if the profile doesn't exist.
     pub fn with_profile(name: &str) -> Self {
-        log::info!("Profile '{name}' requested but multi-profile is not yet implemented; using defaults");
-        Self::load()
+        let mut cfg = Self::load();
+        if let Some(ref profiles) = cfg.profiles {
+            if let Some(profile) = profiles.get(name) {
+                log::info!("Using profile '{name}': {}", profile.host);
+                cfg.mpd_host = profile.host.clone();
+                cfg.mpd_port = profile.port;
+                cfg.default_profile = Some(name.to_string());
+            } else {
+                log::warn!("Profile '{name}' not found, using default connection");
+            }
+        }
+        cfg
+    }
+
+    /// Resolve the connection target for the configured (or default) profile.
+    pub fn connection_target(&self) -> crate::mpd::ConnectionTarget {
+        let profile_name = self.default_profile.as_deref().or(self.last_profile.as_deref());
+
+        if let Some(name) = profile_name {
+            if let Some(ref profiles) = self.profiles {
+                if let Some(profile) = profiles.get(name) {
+                    let host = profile.host.trim();
+                    if host.starts_with('/') || host.starts_with('~') {
+                        return crate::mpd::ConnectionTarget::Unix(host.to_string());
+                    }
+                    return crate::mpd::ConnectionTarget::Tcp(host.to_string(), profile.port);
+                }
+            }
+        }
+
+        // No profiles — use legacy behavior
+        let host = self.mpd_host.trim();
+        if host.is_empty() || host == "auto" {
+            crate::mpd::ConnectionTarget::Auto
+        } else if host.starts_with('/') || host.starts_with('~') {
+            crate::mpd::ConnectionTarget::Unix(host.to_string())
+        } else {
+            crate::mpd::ConnectionTarget::Tcp(host.to_string(), self.mpd_port)
+        }
     }
 
     pub fn save(&self) -> std::io::Result<()> {

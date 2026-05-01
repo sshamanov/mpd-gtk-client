@@ -171,7 +171,7 @@ pub struct App {
     state: SharedState,
     event_rx: Arc<Mutex<mpsc::Receiver<MpdEvent>>>,
     cmd_tx: mpsc::Sender<MpdCommand>,
-    conn_params: Arc<Mutex<(String, u16)>>,
+    conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
 }
 
 impl App {
@@ -179,7 +179,7 @@ impl App {
         state: SharedState,
         event_rx: mpsc::Receiver<MpdEvent>,
         cmd_tx: mpsc::Sender<MpdCommand>,
-        conn_params: Arc<Mutex<(String, u16)>>,
+        conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
     ) -> Self {
         Self {
             state,
@@ -975,7 +975,14 @@ impl App {
                             sp.set_position((sp.width() as f64 * c.split_ratio) as i32);
                             // Update shared host/port and trigger reconnect
                             if let Ok(mut params) = cp.lock() {
-                                *params = (c.mpd_host.clone(), c.mpd_port);
+                                let host = c.mpd_host.trim().to_string();
+                                *params = if host.starts_with('/') || host.starts_with('~') {
+                                    crate::mpd::ConnectionTarget::Unix(host)
+                                } else if host.is_empty() || host == "auto" {
+                                    crate::mpd::ConnectionTarget::Auto
+                                } else {
+                                    crate::mpd::ConnectionTarget::Tcp(host, c.mpd_port)
+                                };
                             }
                             let _ = tx.send(MpdCommand::Reconnect);
                             dw.close();
