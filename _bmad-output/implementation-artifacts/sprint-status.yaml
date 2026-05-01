@@ -158,10 +158,10 @@ development_status:
   20-1-install-desktop-file: done
 
   epic-21: backlog
-  21-1-performance-profiling: in-progress
+  21-1-performance-profiling: done
 
   epic-22: backlog
-  22-1-libadwaita-integration: backlog
+  22-1-libadwaita-integration: in-progress
 
   epic-23: backlog
   23-1-centralized-keybinding-service: backlog

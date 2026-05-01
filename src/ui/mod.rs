@@ -305,31 +305,24 @@ impl App {
             let left_pane_box = Box::new(Orientation::Vertical, 0);
 
             // Group selector bar — display label maps to MPD tag name
-            let group_bar = Box::new(Orientation::Horizontal, 2);
-            group_bar.set_margin_start(4);
-            group_bar.set_margin_end(4);
-            group_bar.set_margin_top(4);
-            let group_tx = cmd_tx.clone();
-            let groups = [("Albums", "Albums"), ("Artists", "Artist"), ("Years", "Date"), ("Genres", "Genre")];
-            let mut first_btn: Option<gtk4::ToggleButton> = None;
-            for (display, mpd_tag) in &groups {
-                let btn = gtk4::ToggleButton::with_label(display);
-                btn.set_css_classes(&["group-select-btn"]);
-                if let Some(ref fb) = first_btn {
-                    btn.set_group(Some(fb));
-                } else {
-                    btn.set_active(true);
-                }
-                if first_btn.is_none() {
-                    first_btn = Some(btn.clone());
-                }
-                let tx = group_tx.clone();
-                let tag = mpd_tag.to_string();
-                btn.connect_toggled(move |b| {
-                    if b.is_active() { let _ = tx.send(MpdCommand::ListAlbumsGrouped(tag.clone())); }
-                });
-                group_bar.append(&btn);
+            // Group selector using libadwaita ViewSwitcher
+            let group_stack = adw::ViewStack::new();
+            // Add empty pages — ViewSwitcher shows their titles; switching triggers the MPD command
+            let group_pages = [("Albums", "Albums"), ("Artists", "Artist"), ("Years", "Date"), ("Genres", "Genre")];
+            for (display, _) in &group_pages {
+                group_stack.add_titled(&gtk4::Box::new(Orientation::Vertical, 0), Some(display), display);
             }
+            let group_switcher = adw::ViewSwitcher::new();
+            group_switcher.set_stack(Some(&group_stack));
+            group_switcher.set_halign(gtk4::Align::Center);
+            let gtx = cmd_tx.clone();
+            group_stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+                let name = stack.visible_child_name().unwrap_or_default();
+                let tag = group_pages.iter().find(|(d, _)| *d == name)
+                    .map(|(_, t)| *t)
+                    .unwrap_or("Albums");
+                let _ = gtx.send(MpdCommand::ListAlbumsGrouped(tag.to_string()));
+            });
 
             let left_scroll = ScrolledWindow::new();
             left_scroll.set_vexpand(true);
@@ -712,7 +705,7 @@ impl App {
             left_pane_box.append(&mode_stack);
 
             // Album content: group bar + search + grid
-            album_content.append(&group_bar);
+            album_content.append(&group_switcher);
 
             // Album search entry
             let search_entry = gtk4::SearchEntry::new();
@@ -748,30 +741,19 @@ impl App {
             let search_index: Arc<RwLock<SearchIndex>> = Arc::new(RwLock::new(SearchIndex::new()));
 
             // stop_search: Escape or clear button
-            let restore_bar = group_bar.clone();
+            let restore_stack = group_stack.clone();
             let prev_group_stop = prev_group.clone();
             search_entry.connect_stop_search(move |_| {
                 // Restore the previously active group, fall back to "Albums"
                 let tag = prev_group_stop.borrow_mut().take().unwrap_or_else(|| "Albums".into());
-                let restore_idx = match tag.as_str() {
-                    "Artist" => 1, "Date" => 2, "Genre" => 3, _ => 0,
-                };
-                let mut idx = 0i32;
-                let mut child = restore_bar.first_child();
-                while let Some(w) = child {
-                    if let Some(btn) = w.downcast_ref::<gtk4::ToggleButton>() {
-                        if idx == restore_idx { btn.set_active(true); break; }
-                        idx += 1;
-                    }
-                    child = w.next_sibling();
-                }
+                restore_stack.set_visible_child_name(&tag);
             });
 
             // search_changed: debounced with local index check + MPD fallback.
             let se_tx = cmd_tx.clone();
             let se_gen = search_gen.clone();
             let se_group = prev_group.clone();
-            let restore_bar2 = group_bar.clone();
+            let restore_stack = group_stack.clone();
             let se_index = search_index.clone();
             let se_grid = album_grid.clone();
             let se_stack = left_stack.clone();
@@ -782,27 +764,17 @@ impl App {
                 let q = entry.text().to_string();
 
                 if q.is_empty() {
-                    if let Some(ref btn) = restore_bar2.first_child()
-                        .and_then(|c| c.downcast::<gtk4::ToggleButton>().ok())
-                    {
-                        btn.set_active(true);
-                    }
+                    restore_stack.set_visible_child_name("Albums");
                     return;
                 }
 
                 if se_group.borrow().is_none() {
-                    let tags = ["Albums", "Artist", "Date", "Genre"];
-                    let mut idx = 0i32;
-                    let mut child = restore_bar2.first_child();
-                    while let Some(w) = child {
-                        if let Some(btn) = w.downcast_ref::<gtk4::ToggleButton>() {
-                            if btn.is_active() && idx < tags.len() as i32 {
-                                *se_group.borrow_mut() = Some(tags[idx as usize].to_string());
-                                break;
-                            }
-                            idx += 1;
+                    if let Some(name) = restore_stack.visible_child_name() {
+                        let tags = ["Albums", "Artist", "Date", "Genre"];
+                        let name_str: &str = &name;
+                        if tags.contains(&name_str) {
+                            *se_group.borrow_mut() = Some(name.to_string());
                         }
-                        child = w.next_sibling();
                     }
                 }
 
@@ -1628,12 +1600,10 @@ impl App {
 
             paned.set_end_child(Some(&right_pane));
 
-            // Toast overlay for notifications
-            let toast = std::rc::Rc::new(std::cell::RefCell::new(widgets::toast::ToastOverlay::new()));
-            let main_overlay = gtk4::Overlay::new();
-            main_overlay.set_child(Some(&paned));
-            main_overlay.add_overlay(toast.borrow().widget());
-            window.set_child(Some(&main_overlay));
+            // Toast overlay for notifications (libadwaita)
+            let toast_overlay = adw::ToastOverlay::new();
+            toast_overlay.set_child(Some(&paned));
+            window.set_child(Some(&toast_overlay));
 
             let default_w = window.default_width().max(800) as f64;
             paned.set_position((default_w * cfg.split_ratio) as i32);
@@ -1748,7 +1718,7 @@ impl App {
             let fc_ql = queue_list.clone();
             let fc_ids = item_ids_w.clone();
             let fc_si = search_index.clone();
-            let fc_toast = toast.clone();
+            let fc_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
             let fc_ev_cover_widgets = cover_widgets.clone();
             let fc_cp_np = fc_ev_cover_paths.clone();
@@ -2256,7 +2226,7 @@ impl App {
                         }
                         MpdEvent::Error(msg) => {
                             fc_ci.set_css_classes(&["connection-indicator", "error"]);
-                            fc_toast.borrow().show_toast(&format!("MPD Error: {msg}"));
+                            fc_toast.add_toast(adw::Toast::new(&format!("MPD Error: {msg}")));
                         }
                     }
                     guard = match fc_rx.lock() {

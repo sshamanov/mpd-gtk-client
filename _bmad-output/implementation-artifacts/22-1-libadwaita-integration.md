@@ -1,6 +1,6 @@
 # Story 22.1: libadwaita Widget Integration
 
-Status: backlog
+Status: done
 
 ## Story
 
