@@ -115,7 +115,7 @@ development_status:
   epic-10: in-progress
   10-1-configurable-layout-values: done
   10-2-smooth-mode-transitions: done
-  10-3-album-mini-grid-queue: ready-for-dev
+  10-3-album-mini-grid-queue: done
   10-4-play-next-in-context-menu: done
 
   epic-11: in-progress

@@ -24,6 +24,16 @@ enum AlbumGridItem {
 /// Backing data store for the album grid.
 type AlbumGridData = std::rc::Rc<std::cell::RefCell<Vec<AlbumGridItem>>>;
 
+/// Item in the mini queue grid (album-level grouping).
+#[derive(Clone)]
+struct MiniGridItem {
+    album: String,
+    artist: String,
+}
+
+/// Backing data store for the mini queue grid.
+type MiniGridData = std::rc::Rc<std::cell::RefCell<Vec<MiniGridItem>>>;
+
 /// Store a string value on a GLib Object (safe wrapper for use in factory closures).
 unsafe fn widget_set_str(w: &impl IsA<glib::Object>, key: &str, val: &str) {
     unsafe { w.set_data(key, val.to_string()); }
@@ -1033,7 +1043,132 @@ impl App {
             let queue_scroll = ScrolledWindow::new();
             queue_scroll.set_child(Some(&queue_list));
             queue_scroll.set_vexpand(true);
-            right_pane.append(&queue_scroll);
+
+            // Mini grid for Album Mode queue (replaces track list in Album Mode)
+            let mini_grid_data: MiniGridData = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mini_grid_model: ListStore = ListStore::builder()
+                .item_type(StringObject::static_type())
+                .build();
+            let mini_grid_factory = SignalListItemFactory::new();
+
+            // Shared current-album tracker for mini grid highlight
+            let mini_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+
+            // Factory setup: cover + label cell for each mini grid item
+            mini_grid_factory.connect_setup(move |_factory, item| {
+                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+                let container = Box::new(Orientation::Vertical, 0);
+                container.set_size_request(120, 150);
+                container.set_css_classes(&["mini-queue-cell"]);
+
+                let cover = Picture::new();
+                cover.set_size_request(120, 120);
+                cover.set_halign(gtk4::Align::Center);
+                cover.set_valign(gtk4::Align::Center);
+                cover.set_css_classes(&["mini-queue-cover"]);
+                container.append(&cover);
+
+                let label = Label::new(None);
+                label.set_halign(gtk4::Align::Center);
+                label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                label.set_max_width_chars(14);
+                label.set_lines(1);
+                label.set_css_classes(&["mini-queue-label"]);
+                container.append(&label);
+
+                list_item.set_child(Some(&container));
+            });
+
+            // Factory bind: populate cover and label from model + cover_paths
+            let mg_bind_data = mini_grid_data.clone();
+            let mg_bind_cover = cover_paths.clone();
+            let mg_bind_current = mini_current_album.clone();
+            mini_grid_factory.connect_bind(move |_factory, item| {
+                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
+                let Some(obj) = list_item.item() else { return; };
+                let Some(so) = obj.downcast_ref::<StringObject>() else { return; };
+                let idx: usize = match so.string().parse() { Ok(i) => i, Err(_) => return };
+                let binding = mg_bind_data.borrow();
+                let Some(item_data) = binding.get(idx) else { return };
+
+                let container = match list_item.child().and_then(|c| c.downcast::<Box>().ok()) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let children: Vec<gtk4::Widget> = {
+                    let mut v = Vec::new();
+                    let mut child = container.first_child();
+                    while let Some(c) = child { v.push(c.clone()); child = c.next_sibling(); }
+                    v
+                };
+
+                // Cover image (or hidden if no cover available)
+                if let Some(cover) = children.first().and_then(|c| c.clone().downcast::<Picture>().ok()) {
+                    if let Some(path) = mg_bind_cover.borrow().get(&item_data.album).and_then(|o| o.as_deref()) {
+                        cover.set_filename(Some(path));
+                        cover.set_visible(true);
+                    } else {
+                        cover.set_visible(false);
+                    }
+                }
+
+                // Album name label
+                if let Some(label) = children.get(1).and_then(|c| c.clone().downcast::<Label>().ok()) {
+                    label.set_text(&item_data.album);
+                }
+
+                // Tooltip: "Artist - Album" (or just album name if artist is empty)
+                let tooltip = if item_data.artist.is_empty() {
+                    item_data.album.clone()
+                } else {
+                    format!("{} - {}", item_data.artist, item_data.album)
+                };
+                container.set_tooltip_text(Some(&tooltip));
+
+                // Highlight currently playing album
+                let is_current = mg_bind_current.borrow().as_deref() == Some(&item_data.album);
+                if is_current {
+                    container.set_css_classes(&["mini-queue-cell", "mini-queue-current"]);
+                } else {
+                    container.set_css_classes(&["mini-queue-cell"]);
+                }
+            });
+
+            // GridView for mini queue grid
+            let mini_selection = NoSelection::new(Some(mini_grid_model.clone()));
+            let mini_grid_view = GridView::new(Some(mini_selection), Some(mini_grid_factory));
+            mini_grid_view.set_min_columns(1);
+            mini_grid_view.set_max_columns(3);
+            mini_grid_view.set_vexpand(true);
+
+            // Double-click plays the album
+            let mg_activate_data = mini_grid_data.clone();
+            let mg_activate_cmd = cmd_tx.clone();
+            mini_grid_view.connect_activate(move |grid, position| {
+                if let Some(model) = grid.model() {
+                    if let Some(item) = model.item(position) {
+                        if let Some(so) = item.downcast_ref::<StringObject>() {
+                            if let Ok(idx) = so.string().parse::<usize>() {
+                                let binding = mg_activate_data.borrow();
+                                if let Some(data) = binding.get(idx) {
+                                    let _ = mg_activate_cmd.send(MpdCommand::PlayAlbum(data.album.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Stack switching between mini grid (Album Mode) and track list (Folder Mode)
+            let queue_stack = gtk4::Stack::new();
+            let mini_scroll = ScrolledWindow::new();
+            mini_scroll.set_child(Some(&mini_grid_view));
+            mini_scroll.set_vexpand(true);
+            queue_stack.add_child(&mini_scroll);
+            queue_stack.add_child(&queue_scroll);
+            queue_stack.set_visible_child(&mini_scroll); // Album Mode by default
+            right_pane.append(&queue_stack);
 
             // Shared item_ids for Delete key — updated by Queue event handler
             let item_ids_w: SharedIds = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
@@ -1232,11 +1367,31 @@ impl App {
             let fc_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
             let fc_shutdown = shutdown_app.clone();
 
+            // Mini grid captures and mode-aware queue stack switching
+            let fc_state = state.clone();
+            let fc_mini_model = mini_grid_model.clone();
+            let fc_mini_data = mini_grid_data.clone();
+            let fc_mini_current = mini_current_album.clone();
+            let fc_queue_stack = queue_stack.clone();
+            let fc_mini_scroll_ref = mini_scroll.clone();
+            let fc_queue_scroll_ref = queue_scroll.clone();
+            let fc_prev_mode: std::cell::Cell<crate::state::Mode> = std::cell::Cell::new(crate::state::Mode::Album);
+
             window.add_tick_callback(move |_widget, _fc| {
                 // Check for shutdown request from SIGINT/SIGTERM signal handlers.
                 if crate::SHUTDOWN_REQUESTED.swap(false, Ordering::AcqRel) {
                     fc_shutdown.quit();
                     return glib::ControlFlow::Break;
+                }
+
+                // Ensure queue display matches current mode
+                let cur_mode = fc_state.read().map(|s| s.mode).unwrap_or(crate::state::Mode::Album);
+                if cur_mode != fc_prev_mode.get() {
+                    fc_prev_mode.set(cur_mode);
+                    match cur_mode {
+                        crate::state::Mode::Album => fc_queue_stack.set_visible_child(&fc_mini_scroll_ref),
+                        crate::state::Mode::Folder => fc_queue_stack.set_visible_child(&fc_queue_scroll_ref),
+                    }
                 }
 
                 let mut guard = match fc_rx.lock() {
@@ -1555,6 +1710,31 @@ impl App {
                             }
                             // Refresh shared item_ids for key-based delete/move lookup
                             *fc_ids.borrow_mut() = item_ids;
+
+                            // Populate mini grid from queue data (Album Mode album-level grouping)
+                            let mut seen: Vec<(String, String)> = Vec::new();
+                            let mut found_current: Option<String> = None;
+                            for item in &queue {
+                                if let Some(ref album) = item.album {
+                                    let artist = item.artist.as_deref().unwrap_or("");
+                                    if !seen.iter().any(|(a, _)| a == album) {
+                                        seen.push((album.clone(), artist.to_string()));
+                                    }
+                                    if csp == Some(item.position) {
+                                        found_current = Some(album.clone());
+                                    }
+                                }
+                            }
+                            *fc_mini_current.borrow_mut() = found_current;
+                            let mini_items: Vec<MiniGridItem> = seen.into_iter()
+                                .map(|(album, artist)| MiniGridItem { album, artist })
+                                .collect();
+                            let total = mini_items.len();
+                            *fc_mini_data.borrow_mut() = mini_items;
+                            fc_mini_model.remove_all();
+                            for i in 0..total {
+                                fc_mini_model.append(&StringObject::new(&i.to_string()));
+                            }
                         }
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = fc_ev_cover_paths.borrow_mut();
@@ -1650,7 +1830,11 @@ impl App {
                  .shortcut-key { font-weight: bold; }
                  .error-label { color: #f44336; font-size: 0.85em; }
                  .format-badge { font-size: 0.85em; color: gray; padding: 2px 0; }
-                 .seekbar { margin: 4px 0; min-height: 12px; }"
+                 .seekbar { margin: 4px 0; min-height: 12px; }
+                 .mini-queue-cell { padding: 4px; border-radius: 4px; }
+                 .mini-queue-current { border: 2px solid @theme_selected_bg_color; border-radius: 4px; }
+                 .mini-queue-cover { border-radius: 2px; }
+                 .mini-queue-label { font-size: 0.8em; padding: 2px 0; }"
             );
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),
