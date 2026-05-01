@@ -4,6 +4,7 @@ pub mod config;
 pub mod constants;
 pub mod coverart;
 pub mod errors;
+pub mod ipc;
 pub mod mpd;
 #[cfg(feature = "mpris")]
 pub mod mpris;
@@ -15,6 +16,7 @@ use config::CliOverrides;
 use log::info;
 use mpd::state_machine::{MpdCommand, MpdEvent, MpdEventLoop};
 use state::create_initial_state;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -149,6 +151,33 @@ fn main() {
 
     info!("Config: {}:{}", config.mpd_host, config.mpd_port);
 
+    // --- Second-instance detection (atomic O_EXCL lock, before window creation) ---
+    match ipc::try_acquire_lock() {
+        Ok(ipc::LockOutcome::Acquired) => {
+            info!("IPC lock acquired, starting as primary instance");
+        }
+        Ok(ipc::LockOutcome::AnotherInstanceRunning) => {
+            if let Some(ref cmd) = action {
+                if let Some(action_str) = ipc::action_to_string(cmd) {
+                    if ipc::forward_action(action_str) {
+                        info!("Action '{action_str}' forwarded to running instance, exiting");
+                    } else {
+                        log::error!("Failed to forward action to running instance");
+                    }
+                } else {
+                    info!("Second instance detected with non-forwardable action, exiting");
+                }
+            } else {
+                info!("Second instance detected, exiting");
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            log::error!("Failed to acquire IPC lock: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let state = create_initial_state();
 
     // Apply mode override (--mode) to initial state
@@ -177,6 +206,19 @@ fn main() {
     );
 
     info!("MPD event loop started");
+
+    // --- Start IPC socket listener for second-instance forwarding ---
+    let ipc_stop = Arc::new(AtomicBool::new(false));
+    let ipc_cmd_tx = cmd_tx.clone();
+    let ipc_stop_clone = ipc_stop.clone();
+    thread::Builder::new()
+        .name("ipc-listener".into())
+        .spawn(move || {
+            if let Err(e) = ipc::start_listener(ipc_cmd_tx, ipc_stop_clone) {
+                log::error!("IPC listener failed: {e}");
+            }
+        })
+        .expect("Failed to spawn IPC listener thread");
 
     // Initialize MPRIS D-Bus interface (feature-gated, opt-in via config)
     #[cfg(feature = "mpris")]
@@ -231,6 +273,10 @@ fn main() {
         }
         thread::park_timeout(Duration::from_millis(100));
     }
+    // Clean up IPC artifacts
+    ipc_stop.store(true, Ordering::Relaxed);
+    ipc::remove_socket();
+    ipc::remove_lock();
     info!("Exiting");
 }
 
