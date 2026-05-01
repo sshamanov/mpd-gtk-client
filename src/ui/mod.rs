@@ -1034,6 +1034,11 @@ impl App {
                 hc_check.set_margin_top(8);
                 content.append(&hc_check);
 
+                let auto_start_check = gtk4::CheckButton::with_label("Auto-start on login");
+                auto_start_check.set_active(scfg.auto_start);
+                auto_start_check.set_margin_top(4);
+                content.append(&auto_start_check);
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");
@@ -1049,10 +1054,20 @@ impl App {
                 let pd_profile = profile_dropdown.clone();
                 let pd_names = profile_names.clone();
                 let hc_checkbox = hc_check.clone();
+                let auto_start_box = auto_start_check.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.split_ratio = sa.value();
                     c.high_contrast = hc_checkbox.is_active();
+                    let new_auto_start = auto_start_box.is_active();
+                    if new_auto_start != c.auto_start {
+                        c.auto_start = new_auto_start;
+                        if new_auto_start {
+                            let _ = Config::install_autostart();
+                        } else {
+                            Config::remove_autostart();
+                        }
+                    }
 
                     // Apply selected profile first (overrides host/port)
                     if pd_names.len() > 1 {

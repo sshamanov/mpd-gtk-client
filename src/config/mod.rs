@@ -72,6 +72,9 @@ pub struct Config {
     /// High contrast mode for accessibility.
     #[serde(default = "default_false")]
     pub high_contrast: bool,
+    /// Auto-start on desktop login via XDG autostart.
+    #[serde(default = "default_false")]
+    pub auto_start: bool,
 }
 
 fn default_false() -> bool { false }
@@ -120,6 +123,7 @@ impl Default for Config {
             schema_version: CURRENT_SCHEMA_VERSION,
             window_geometry: None,
             high_contrast: false,
+            auto_start: false,
         }
     }
 }
@@ -257,5 +261,35 @@ impl Config {
             std::io::Error::other(e.to_string())
         })?;
         std::fs::write(&path, content)
+    }
+
+    /// Install XDG autostart .desktop file.
+    pub fn install_autostart() -> std::io::Result<()> {
+        let exe = std::env::current_exe()
+            .map_err(|e| std::io::Error::other(format!("Cannot get exe path: {e}")))?;
+        let autostart_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("autostart");
+        std::fs::create_dir_all(&autostart_dir)?;
+        let path = autostart_dir.join("mpd-client.desktop");
+        let content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=mpd-client\n\
+             Exec={}\n\
+             X-GNOME-Autostart-enabled=true\n\
+             X-GNOME-AutostartDelay=0\n",
+            exe.display()
+        );
+        std::fs::write(&path, content)
+    }
+
+    /// Remove XDG autostart .desktop file.
+    pub fn remove_autostart() {
+        let autostart_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("autostart");
+        let path = autostart_dir.join("mpd-client.desktop");
+        let _ = std::fs::remove_file(path);
     }
 }
