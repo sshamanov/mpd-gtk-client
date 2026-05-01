@@ -134,7 +134,7 @@ development_status:
 
   epic-15: backlog
   15-1-multi-profile-connection-config: in-progress
-  15-2-profile-selector-ui: backlog
+  15-2-profile-selector-ui: in-progress
 
   epic-16: backlog
   16-1-config-schema-corruption: backlog

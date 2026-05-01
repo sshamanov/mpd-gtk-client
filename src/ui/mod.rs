@@ -944,6 +944,27 @@ impl App {
                 port_error.set_visible(false);
                 content.append(&port_error);
 
+                // Profile selector (hidden when ≤1 profile)
+                let profile_names: Vec<String> = scfg.profiles.as_ref().map_or_else(Vec::new, |p| {
+                    let mut names: Vec<String> = p.keys().cloned().collect();
+                    names.sort();
+                    names
+                });
+                let profile_dropdown = gtk4::DropDown::from_strings(
+                    &profile_names.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),
+                );
+                profile_dropdown.set_visible(profile_names.len() > 1);
+                if profile_names.len() > 1 {
+                    content.append(&Label::new(Some("Profile:")));
+                    content.append(&profile_dropdown);
+                }
+                // Pre-select current profile
+                if let Some(ref cur) = scfg.default_profile.or(scfg.last_profile) {
+                    if let Some(pos) = profile_names.iter().position(|n| n == cur) {
+                        profile_dropdown.set_selected(pos as u32);
+                    }
+                }
+
                 content.append(&Label::new(Some("Split Ratio:")));
                 let split_adj = gtk4::Adjustment::new(scfg.split_ratio, 0.5, 0.9, 0.025, 0.1, 0.0);
                 let split_scale = gtk4::Scale::new(gtk4::Orientation::Horizontal, Some(&split_adj));
@@ -963,35 +984,63 @@ impl App {
                 let tx = stx.clone();
                 let sa = split_adj.clone();
                 let sp = settings_paned.clone();
+                let pd_profile = profile_dropdown.clone();
+                let pd_names = profile_names.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
-                    c.mpd_host = he.text().to_string();
                     c.split_ratio = sa.value();
-                    match pe.text().parse::<u16>() {
-                        Ok(p) if p > 0 => {
-                            c.mpd_port = p;
-                            perr.set_visible(false);
-                            let _ = c.save();
-                            sp.set_position((sp.width() as f64 * c.split_ratio) as i32);
-                            // Update shared host/port and trigger reconnect
-                            if let Ok(mut params) = cp.lock() {
-                                let host = c.mpd_host.trim().to_string();
-                                *params = if host.starts_with('/') || host.starts_with('~') {
-                                    crate::mpd::ConnectionTarget::Unix(host)
-                                } else if host.is_empty() || host == "auto" {
-                                    crate::mpd::ConnectionTarget::Auto
-                                } else {
-                                    crate::mpd::ConnectionTarget::Tcp(host, c.mpd_port)
-                                };
+
+                    // Apply selected profile first (overrides host/port)
+                    if pd_names.len() > 1 {
+                        let idx = pd_profile.selected() as usize;
+                        if let Some(name) = pd_names.get(idx) {
+                            if let Some(ref profiles) = c.profiles.clone() {
+                                if let Some(profile) = profiles.get(name) {
+                                    let host = profile.host.trim().to_string();
+                                    c.mpd_host = host.clone();
+                                    c.mpd_port = profile.port;
+                                    c.last_profile = Some(name.clone());
+                                    // Determine connection target from profile
+                                    if let Ok(mut params) = cp.lock() {
+                                        *params = if host.starts_with('/') || host.starts_with('~') {
+                                            crate::mpd::ConnectionTarget::Unix(host)
+                                        } else {
+                                            crate::mpd::ConnectionTarget::Tcp(host, profile.port)
+                                        };
+                                    }
+                                }
                             }
-                            let _ = tx.send(MpdCommand::Reconnect);
-                            dw.close();
                         }
-                        _ => {
-                            perr.set_text("Invalid port (1-65535)");
-                            perr.set_visible(true);
+                    } else {
+                        // No profile selected — use manual host/port
+                        c.mpd_host = he.text().to_string();
+                        match pe.text().parse::<u16>() {
+                            Ok(p) if p > 0 => {
+                                c.mpd_port = p;
+                                perr.set_visible(false);
+                            }
+                            _ => {
+                                perr.set_text("Invalid port (1-65535)");
+                                perr.set_visible(true);
+                                return;
+                            }
+                        }
+                        if let Ok(mut params) = cp.lock() {
+                            let host = c.mpd_host.trim().to_string();
+                            *params = if host.starts_with('/') || host.starts_with('~') {
+                                crate::mpd::ConnectionTarget::Unix(host)
+                            } else if host.is_empty() || host == "auto" {
+                                crate::mpd::ConnectionTarget::Auto
+                            } else {
+                                crate::mpd::ConnectionTarget::Tcp(host, c.mpd_port)
+                            };
                         }
                     }
+
+                    let _ = c.save();
+                    sp.set_position((sp.width() as f64 * c.split_ratio) as i32);
+                    let _ = tx.send(MpdCommand::Reconnect);
+                    dw.close();
                 });
                 let dw2 = d.clone();
                 cancel_btn.connect_clicked(move |_| { dw2.close(); });
