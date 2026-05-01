@@ -66,7 +66,7 @@ This document provides the epic and story breakdown for completing mpd-client v1
 - **FR-S1:** ✓ System provides live search with debounced input (150ms)
 - **FR-S2:** ✓ System searches album metadata in Album Mode
 - **FR-S3:** ✗ System searches path/filename in Folder Mode
-- **FR-S4:** ✗ System ranks results by relevance score with configurable thresholds
+- **FR-S4:** ✗ System ranks results by relevance score with configurable thresholds — Story 9.8 added, not yet implemented
 - **FR-S5:** ✓ System maintains search index with memory budget ≤5MB per 10k tracks
 - **FR-S6:** ✓ System processes queries without blocking UI
 - **FR-S7:** ✓ User can use keyboard shortcuts (Ctrl+F, Esc)
@@ -465,7 +465,7 @@ So that I can verify the playback quality (bit depth, sample rate, DSD rate).
 ---
 
 ## Epic 9: Search & Browse Polish
-**Goal:** Folder Mode search, pinned group headers, CUE/DSD interactive rows, fixed grouped-mode double-click, AlbumArtist tag support.
+**Goal:** Folder Mode search, pinned group headers, CUE/DSD interactive rows, fixed grouped-mode double-click, AlbumArtist tag support, search relevance scoring.
 
 ### Story 9.1: Folder Mode Search
 
@@ -574,6 +574,33 @@ So that I don't see the previous track's artist carried over to a tagless track.
 **And** the `AlbumArtist` fallback from Story 9.5 still applies when Artist is missing
 
 **Technical Notes:** The `file:` line separator fix was added but edge cases remain when Artist tags span multiple tracks. Ensure the artist accumulator is reset per-track boundary, not per-album boundary.
+
+### Story 9.8: Search Relevance Scoring
+
+As a user searching the library,
+I want search results sorted by relevance (exact album title matches first, then artist matches, then partial matches),
+So that the most likely intended album appears at the top of the results.
+
+**Acceptance Criteria:**
+
+**Given** a search query is entered in Album Mode
+**When** results are displayed
+**Then** they are sorted by relevance score in descending order
+**And** scoring follows the PRD weighting: exact album title (100pts), exact artist (80pts), partial album title (60pts x match%), partial artist (40pts x match%), track title (30pts per match, max 90pts), year/genre (20pts)
+**And** results below the minimum score threshold (20pts) are excluded
+**And** tied scores retain their original album list order
+
+**Given** a search query is entered in Folder Mode
+**When** results are displayed
+**Then** scoring follows the PRD weighting: exact filename (100pts), exact folder name (80pts), partial path (50pts x match%), file extension (10pts)
+**And** results below the minimum score threshold (20pts) are excluded
+
+**Given** 200+ results match a query
+**When** the result set is computed
+**Then** only the top 200 highest-scoring results are displayed
+**And** a "Show all N results" button is shown at the bottom of the results list
+
+**Technical Notes:** Relevance scoring is a pure computation on the existing search match set — no additional MPD queries or index changes needed. The scoring function should be a standalone `pub fn score(query: &str, album: &Album) -> u32` in `src/search/mod.rs` that any caller can use without touching the search index. Folder Mode scoring requires the folder tree's normalized entry metadata (filename, folder path). The 200-result limit avoids rendering thousands of items; the "Show all" button lifts the cap. Sorting by descending score uses the existing album ordering as the tiebreaker (stable sort).
 
 ---
 
@@ -1086,3 +1113,271 @@ So that I don't have to resize and reposition the window every time I launch it.
 **And** the off-screen position is ignored
 
 **Technical Notes:** Store `window_width`, `window_height`, `window_x`, `window_y` in `Config` struct. Write on graceful shutdown only (not on every resize — avoids IO churn). GTK4's `GtkWindow::get_default_size()` and `GtkWindow::get_position()` provide the values. Off-screen detection: check against available monitor geometry via `GdkDisplay::monitors()`.
+
+---
+
+## Epic 17: MPRIS & SharedState Integration
+
+**Goal:** Fix MPRIS metadata output by populating SharedState `CurrentContext` from MPD state changes, emit MPRIS `PropertiesChanged` signals for lock-screen auto-update, and handle D-Bus session bus disconnection gracefully.
+
+**ADRs:** §661 (IPC & CLI Architecture), §743 (Notification & System Integration)
+
+**FRs covered:** FR-P2 (playback state display), PRD §194 (desktop integration)
+
+### Story 17.1: Populate SharedState CurrentContext from MPD State Changes
+
+As an MPRIS client,
+I want `SharedState.current.track` and `SharedState.current.album` to be populated from MPD state changes,
+So that `playerctl metadata` returns the correct title, artist, and album for the current track.
+
+**Acceptance Criteria:**
+
+**Given** a track is playing with artist, title, and album available from MPD
+**When** the `StateChanged` handler in `ui/mod.rs` processes the `PlaybackUpdate`
+**Then** `update_current_context()` is called with `CurrentContext { track: Some(track_info), album: Some(album_name) }`
+**And** the fields are written to `SharedState` via the existing `Store::update_current_context()` method
+
+**Given** no track is playing (MPD state is `stop`)
+**When** the `StateChanged` handler processes the update
+**Then** `update_current_context()` is called with `CurrentContext { track: None, album: None }`
+**And** SharedState reflects the empty state
+
+**Given** MPRIS (or any other consumer) reads `SharedState.current`
+**When** a track is playing
+**Then** `s.current.track` returns populated `Track` data with artist, title, and file path
+**And** `s.current.album` returns the album name string
+
+**Given** `playerctl metadata` is invoked while a track is playing
+**When** the MPRIS interface reads from SharedState
+**Then** `xesam:title`, `xesam:artist`, and `xesam:album` return real values (not empty)
+
+**Technical Notes:** The `StateChanged` handler in `src/ui/mod.rs` (line ~1768) receives `MpdEvent::StateChanged(update)` with a `PlaybackUpdate` struct that already contains `artist`, `title`, `album`, `elapsed`, `duration`, and `state`. The handler calls `update_now_playing()` which updates GTK labels but never writes to `SharedState.current`. The fix is to add a `Store::update_current_context()` call alongside the existing `update_now_playing()` call. The `PlaybackUpdate` fields map to `CurrentContext.track` (construct a `Track` from `artist`, `title`, `file`, `duration`) and `CurrentContext.album` (from `album`). No GTK label changes needed — this is purely a SharedState write. The `Store` and `update_current_context()` method already exist; they are simply never called from the StateChanged handler.
+
+### Story 17.2: Emit MPRIS PropertiesChanged Signal on Playback State Changes
+
+As a user with lock screen media controls,
+I want the MPRIS interface to emit `PropertiesChanged` signals on playback state transitions,
+So that `playerctl status` and lock screen controls auto-update without manual polling.
+
+**Acceptance Criteria:**
+
+**Given** the application is running with MPRIS enabled
+**When** playback state changes (playing → paused, paused → playing, stop, track change)
+**Then** the MPRIS interface emits `org.freedesktop.DBus.Properties.PropertiesChanged` for `org.mpris.MediaPlayer2.Player`
+**And** the signal carries the changed properties: `PlaybackStatus`, `Metadata`, and `Position`
+
+**Given** `playerctl --follow` is monitoring the MPRIS interface
+**When** a track change occurs
+**Then** `playerctl --follow` outputs the updated metadata within 1 second of the change
+
+**Given** playback state remains unchanged (same track, same state)
+**When** no MPD event triggers a state transition
+**Then** no `PropertiesChanged` signal is emitted (no duplicate emissions)
+
+**Given** the MPRIS interface is queried via `playerctl status`
+**When** playback transitions from playing to paused
+**Then** the status update is received without requiring `playerctl status` to be re-invoked
+
+**Technical Notes:** The `PlaybackUpdate` struct carries `state`, `artist`, `title`, `album`, `elapsed`, `duration`. A dedicated channel or callback from the UI thread to the MPRIS module is needed since the MPRIS struct is created in `mpris.rs` and the state changes arrive in `ui/mod.rs`. Options: (a) pass a `mpsc::Sender<PlaybackUpdate>` to the MPRIS module and emit signals from the zbus IO thread, or (b) store a reference to the emitted signal sender on a shared structure. Option (a) is simpler — the MPRIS module receives updates and emits `PropertiesChanged` via `connection.object_server().interface_set("org.mpris.MediaPlayer2.Player", ...).unwrap().set_properties(...)`. The zbus `ObjectServer` provides `context.path().interface::<T>()` for emitting property changes. Property emission is done on the zbus IO thread (not GTK thread). The `PlaybackUpdate` channel must buffer (latest value only) to avoid queuing stale updates.
+
+### Story 17.3: Monitor and Reconnect D-Bus Session Bus
+
+As a user with MPRIS enabled,
+I want the application to recover from a D-Bus session bus restart,
+So that MPRIS media controls continue working without restarting the application.
+
+**Acceptance Criteria:**
+
+**Given** the application is running with MPRIS enabled and the D-Bus session bus is active
+**When** the D-Bus session bus is restarted (e.g., `dbus-daemon --replace`, session logout/login edge case)
+**Then** the MPRIS module detects the disconnection within 5 seconds
+**And** attempts reconnection with retry (1s, 2s, 4s backoff, max 3 retries)
+**And** re-registers the MPRIS interfaces on successful reconnection
+
+**Given** reconnection succeeds after a D-Bus restart
+**When** the MPRIS interfaces are re-registered
+**Then** `playerctl status` works again without restarting the application client
+**And** a toast notification is shown: "MPRIS reconnected"
+
+**Given** all reconnection attempts fail
+**When** the retry limit is exhausted
+**Then** MPRIS integration is disabled for the session
+**And** a warning is logged: "MPRIS: failed to reconnect after 3 attempts"
+**And** the application continues without MPRIS (no crash, no hang)
+
+**Technical Notes:** zbus's `Connection` does not have built-in reconnection for the blocking API. The approach is: (a) spawn a monitoring thread that periodically checks connection health via `connection.is_connected()` (zbus 5.x provides this method), (b) on disconnect, attempt `Connection::new_session()` with retry, (c) on success, register interfaces on the new connection via `object_server().at()`. The monitoring interval is 5 seconds (check every 5s if connected). The monitoring thread is spawned in `mpris::init()` alongside the interface registration. Shared `Arc<Mutex<Option<Connection>>>` holds the current connection for MPRIS method dispatch - the monitoring thread swaps it on reconnection. Method handlers (Play, Pause, etc.) must handle the case where `cmd_tx.send()` fails during reconnection (log and return). This is NOT expected to be a common case - D-Bus session bus restarts are rare in normal desktop operation.
+
+---
+
+## Epic 18: Accessibility Compliance
+
+**Goal:** Meet WCAG 2.1 AA compliance targets - high contrast mode for users with visual impairments and complete keyboard navigation.
+
+**FRs covered:** NFR-U4 (high contrast mode), NFR-U1 (keyboard navigation completeness)
+
+### Story 18.1: High Contrast Mode Support
+
+As a user with visual impairment,
+I want the application to support a high contrast theme variant,
+So that all text and UI elements meet WCAG 2.1 AA contrast ratios (4.5:1 text, 3:1 UI elements).
+
+**Acceptance Criteria:**
+
+**Given** the application is running in default dark theme
+**When** the user enables high contrast mode in Settings
+**Then** a high-contrast CSS variant is applied with WCAG 2.1 AA contrast ratios
+**And** all text elements meet minimum 4.5:1 contrast against their background
+**And** all UI controls (buttons, sliders, indicators) meet minimum 3:1 contrast
+**And** cover art placeholders are replaced with solid high-contrast colors when enabled
+
+**Given** the system accessibility preference signals high contrast
+**When** the application starts
+**Then** the high contrast theme is loaded automatically (respects system contrast settings)
+
+**Given** high contrast mode is active
+**When** the user disables it in Settings
+**Then** the normal theme is restored
+**And** the preference is persisted in config
+
+**Given** the user switches between normal and high contrast mode
+**When** the theme changes
+**Then** no widgets are left unstyled
+**And** the transition is instant (no animation delay)
+
+**Technical Notes:** High contrast mode is a CSS variant loaded alongside the base theme. GTK4 CSS variables (`@define-color`) are overridden for the high contrast palette. A new `high_contrast: bool` field is added to the `Config` struct. On toggle, the application CSS provider is updated without re-creating any widgets. High contrast palette: backgrounds (#000000 or #1e1e1e for dark HC, #ffffff for light HC), text (#ffffff or #e0e0e0 minimum), accents (maintain hue but increase lightness). Detection via `GtkSettings` contrast preference inspection.
+
+### Story 18.2: Keyboard Navigation Audit and Completion
+
+As a user who relies on keyboard navigation,
+I want to traverse all interactive elements using only the keyboard,
+So that I can fully operate the application without a mouse.
+
+**Acceptance Criteria:**
+
+**Given** the application is running
+**When** the user presses Tab/Shift-Tab
+**Then** focus traverses through all major zones in logical order: search bar, album grid/folder tree, queue, transport controls, mode switcher, menu
+**And** no interactive element is unreachable by Tab
+**And** the focus order follows visual left-to-right, top-to-bottom order
+
+**Given** focus is in the album grid
+**When** the user presses arrow keys
+**Then** focus moves in 2D (respecting column count and group boundaries)
+**And** Enter/Space activates the focused item (select or play)
+
+**Given** focus is in the folder tree
+**When** the user presses Left/Right arrow
+**Then** the focused folder is collapsed/expanded
+**And** Up/Down moves between rows
+
+**Given** focus is in the queue
+**When** the user presses Shift+Up/Shift+Down
+**Then** the focused item is moved up/down in the queue
+
+**Given** a keyboard shortcut is bound (Ctrl+F, Ctrl+1/2, Space, etc.)
+**When** the shortcut is pressed
+**Then** the corresponding action is triggered regardless of where focus is (global shortcuts)
+**And** no shortcut conflicts with GTK4 built-in widget shortcuts
+
+**Given** the audit is complete
+**When** all findings are documented
+**Then** a report lists each missing or broken keyboard interaction
+**And** all identified issues are resolved or documented as known limitations
+
+**Technical Notes:** Create a keyboard navigation audit checklist covering all interactive elements in both Album and Folder modes. Use GTK4's focus chain (`set_focus_child`, `set_can_focus`) and `GtkEventControllerKey` for custom key handling. Test with Tab-only navigation (no mouse) to verify completeness. Pay special attention to: album grid items, folder tree rows, queue items, context menus, settings dialog, hover buttons (show on focus, not just hover), seekbar (arrow keys for fine adjustment, PageUp/PageDown for coarse). Add accessible labels (`set_accessible_label`) for screen readers where missing.
+
+---
+
+## Epic 19: Desktop Integration
+
+**Goal:** Complete desktop environment integration with auto-start support.
+
+**FRs covered:** NFR-O2 (auto-start capability)
+
+### Story 19.1: Auto-Start Support
+
+As a user,
+I want the application to start automatically when I log into my desktop,
+So that my music client is always ready without manual launch.
+
+**Acceptance Criteria:**
+
+**Given** the user enables auto-start in Settings
+**When** the setting is saved
+**Then** an XDG autostart `.desktop` file is created at `~/.config/autostart/mpd-client.desktop`
+**And** the file contains the correct `Exec=` path pointing to the installed binary
+**And** the file contains `X-GNOME-Autostart-enabled=true`
+
+**Given** the user disables auto-start in Settings
+**When** the setting is saved
+**Then** the autostart `.desktop` file is removed
+**And** the application does not start automatically on next login
+
+**Given** the auto-start file already exists
+**When** the application is launched by the desktop environment at login
+**Then** the application starts normally with full functionality (no special auto-start mode needed)
+
+**Given** the installed binary path changes (update/reinstall)
+**When** auto-start is already enabled
+**Then** the `Exec=` path in the autostart file is updated on next settings save
+
+**Given** the `~/.config/autostart/` directory does not exist
+**When** auto-start is enabled
+**Then** the directory is created automatically
+
+**Technical Notes:** XDG autostart standard: `.desktop` file at `~/.config/autostart/`. The `Exec=` path should use the installed binary location. Add `auto_start: bool` field to `Config` struct (default false). UI toggle in Settings dialog, Connection or General section. The autostart file uses `Type=Application` with the same `.desktop` name as the application's desktop entry file. No startup delay needed (`X-GNOME-AutostartDelay=0`).
+
+---
+
+## Epic 20: Desktop Integration (Post-v1 Cleanup)
+
+**Goal:** Complete desktop integration — proper `.desktop` file with categories and MIME types for application menu integration.
+
+**ADRs:** §724 (Build & Packaging Architecture)
+
+**NFRs covered:** NFR-O2 (Auto-start capability / desktop entry)
+
+### Story 20.1: Install Desktop File with Proper Categories
+
+As a user, I want the application to appear in the desktop application menu with a proper icon and category, so that I can launch it from my desktop environment's app launcher.
+
+**Acceptance Criteria:**
+
+**Given** the application is launched for the first time
+**When** startup completes
+**Then** a `.desktop` file is installed at `~/.local/share/applications/mpd-client.desktop`
+**And** the file contains `Categories=Audio;Music;Player;`
+**And** `Name=mpd-client`, `Type=Application`, `Terminal=false`
+
+**Given** the binary path changes after an update
+**When** the application starts
+**Then** the `Exec=` path in the desktop file is updated
+
+**Technical Notes:** Uses XDG Desktop Entry spec. Install at `~/.local/share/applications/`. Call `install_desktop_file()` at startup. Different from the autostart file (story 19.1) — both are needed for full desktop integration. Common audio MIME types in `MimeType=` field. See story file for full details.
+
+---
+
+## Epic 21: Performance & Observability (Post-v1 Cleanup)
+
+**Goal:** Basic performance profiling instrumentation — timing macros for critical paths, frame rate monitoring, memory snapshots.
+
+**ADRs:** §621 (Logging & Observability)
+
+**NFRs covered:** NFR-O5 (Performance profiling support)
+
+### Story 21.1: Performance Profiling Instrumentation
+
+As a developer, I want basic performance profiling instrumentation built into the application, so that I can identify slow operations and measure UI responsiveness.
+
+**Acceptance Criteria:**
+
+**Given** the application is running with `RUST_LOG=debug`
+**When** a critical operation completes
+**Then** a log message at debug level includes the elapsed time in milliseconds
+**And** operations exceeding 100ms are logged at warn level
+
+**Given** the application is compiled in release mode
+**When** any profiling path would execute
+**Then** the timing code is compiled out (gated behind `debug_assertions`)
+
+**Technical Notes:** Use `std::time::Instant`, no new dependencies. Key paths: MPD commands, grid repopulation, cover decode, search queries, frame clock ticks. Gate with `cfg!(debug_assertions)` for zero cost in release. Memory via `/proc/self/status`. See story file for full details.

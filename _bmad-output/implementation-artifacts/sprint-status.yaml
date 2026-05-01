@@ -96,13 +96,13 @@ development_status:
   6-6-graceful-mpd-shutdown: done
   6-7-queue-key-race-condition: done
 
-  epic-9: in-progress
+  epic-9: done
   9-3-fix-grouped-double-click: done
   9-4-cue-dsd-row-playback: done
   9-5-albumartist-search: done
   9-6-list-albums-grouped-artist-loss: done
   9-7-search-albums-stale-artist: done
-  9-8-search-relevance-scoring: backlog
+  9-8-search-relevance-scoring: done
 
   epic-12: done
   12-1-async-grid-population: done
@@ -153,3 +153,9 @@ development_status:
 
   epic-19: done
   19-1-auto-start-support: done
+
+  epic-20: backlog
+  20-1-install-desktop-file: ready-for-dev
+
+  epic-21: backlog
+  21-1-performance-profiling: ready-for-dev
