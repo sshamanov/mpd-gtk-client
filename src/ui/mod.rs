@@ -621,6 +621,8 @@ impl App {
 
             // Folder mode content box (folder tree)
             let folder_content = Box::new(Orientation::Vertical, 0);
+            folder_content.set_vexpand(true);
+            folder_content.set_hexpand(true);
             folder_content.set_widget_name("folder-content");
 
             let folder_browser = std::rc::Rc::new(std::cell::RefCell::new(
@@ -666,6 +668,8 @@ impl App {
 
             // Wrap stack + switcher
             let mode_content = gtk4::Box::new(Orientation::Vertical, 0);
+            mode_content.set_vexpand(true);
+            mode_content.set_hexpand(true);
             mode_content.append(&mode_switcher_box);
             mode_content.append(&mode_stack);
 
