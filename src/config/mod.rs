@@ -35,6 +35,15 @@ impl CliOverrides {
 /// Version 0 means "unversioned" (pre-migration). Version 1 is the first versioned schema.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
+/// Window geometry persisted for session restoral.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    pub width: i32,
+    pub height: i32,
+    pub x: i32,
+    pub y: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_host")]
@@ -57,6 +66,9 @@ pub struct Config {
     /// Schema version for migration. Defaults to 0 if absent (unversioned).
     #[serde(default)]
     pub schema_version: u32,
+    /// Window geometry for session restoral (saved on graceful shutdown).
+    #[serde(default)]
+    pub window_geometry: Option<WindowGeometry>,
 }
 
 /// A named MPD connection profile — either a Unix socket path or TCP host:port.
@@ -101,6 +113,7 @@ impl Default for Config {
             default_profile: None,
             last_profile: None,
             schema_version: CURRENT_SCHEMA_VERSION,
+            window_geometry: None,
         }
     }
 }

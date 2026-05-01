@@ -138,5 +138,5 @@ development_status:
 
   epic-16: backlog
   16-1-config-schema-corruption: done
-  16-2-rotating-log-file: backlog
-  16-3-window-geometry-persistence: backlog
+  16-2-rotating-log-file: done
+  16-3-window-geometry-persistence: done

@@ -243,6 +243,27 @@ impl App {
                 .show_menubar(true)
                 .build();
 
+            // Restore window size from saved config (position is best-effort, ignored on Wayland)
+            if let Some(ref geo) = cfg.window_geometry {
+                window.set_default_size(geo.width, geo.height);
+            }
+
+            // Save window geometry on close (using glib::ObjectExt::set_data pattern)
+            {
+                let w = window.clone();
+                window.connect_close_request(move |_| {
+                    let cur_w = w.default_width();
+                    let cur_h = w.default_height();
+                    let mut c = crate::config::Config::load();
+                    c.window_geometry = Some(crate::config::WindowGeometry {
+                        width: cur_w.max(1), height: cur_h.max(1),
+                        x: 0, y: 0,
+                    });
+                    let _ = c.save();
+                    glib::Propagation::Proceed
+                });
+            }
+
             let paned = Paned::new(Orientation::Horizontal);
 
             // --- Left pane: group bar + album grid ---
