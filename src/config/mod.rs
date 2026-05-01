@@ -31,6 +31,10 @@ impl CliOverrides {
     }
 }
 
+/// Current schema version for config migration.
+/// Version 0 means "unversioned" (pre-migration). Version 1 is the first versioned schema.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_host")]
@@ -50,6 +54,9 @@ pub struct Config {
     pub default_profile: Option<String>,
     /// Last manually selected profile (persisted for next startup).
     pub last_profile: Option<String>,
+    /// Schema version for migration. Defaults to 0 if absent (unversioned).
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// A named MPD connection profile — either a Unix socket path or TCP host:port.
@@ -93,6 +100,34 @@ impl Default for Config {
             profiles: None,
             default_profile: None,
             last_profile: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+        }
+    }
+}
+
+/// Migration functions indexed by source version.
+/// `migrations[0]` transitions version 0 → 1, `migrations[1]` transitions 1 → 2, etc.
+fn migrations() -> Vec<fn(&mut Config)> {
+    vec![
+        migrate_0_to_1,
+    ]
+}
+
+/// Migration 0 → 1: First versioned schema.
+/// Current config structure is identical to what was being written before schema_version was added.
+fn migrate_0_to_1(_cfg: &mut Config) {
+    // No structural changes needed — the Config struct already matches v1.
+    // Future migrations will modify fields here.
+}
+
+/// Run all pending migrations from the config's current version to CURRENT_SCHEMA_VERSION.
+fn run_migrations(cfg: &mut Config) {
+    let all = migrations();
+    for version in cfg.schema_version..CURRENT_SCHEMA_VERSION {
+        if let Some(migrate) = all.get(version as usize) {
+            log::info!("Migrating config from version {} to {}", version, version + 1);
+            migrate(cfg);
+            cfg.schema_version = version + 1;
         }
     }
 }
@@ -105,15 +140,45 @@ impl Config {
             .join("config.toml")
     }
 
+    /// Load config with corruption recovery and schema migration.
     pub fn load() -> Self {
         let path = Self::config_path();
-        if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| toml::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Self::default()
+        if !path.exists() {
+            return Self::default();
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                match toml::from_str::<Config>(&content) {
+                    Ok(mut cfg) => {
+                        if cfg.schema_version < CURRENT_SCHEMA_VERSION {
+                            run_migrations(&mut cfg);
+                            let _ = cfg.save();
+                        }
+                        cfg
+                    }
+                    Err(e) => {
+                        // Corrupt config — back up and start fresh
+                        let backup_path = path.with_extension("toml.bad");
+                        if std::fs::rename(&path, &backup_path).is_ok() {
+                            log::warn!(
+                                "Config file corrupt ({}), backed up to {}. Using defaults.",
+                                e, backup_path.display()
+                            );
+                        } else {
+                            log::warn!(
+                                "Config file corrupt ({}), could not back up. Using defaults.",
+                                e
+                            );
+                        }
+                        Self::default()
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Config file unreadable ({}), using defaults.", e);
+                Self::default()
+            }
         }
     }
 
