@@ -15,6 +15,7 @@ use crate::state::{AppState, PlaybackState, SharedState};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use zbus::blocking::Connection;
 use zbus::fdo;
 use zbus::zvariant::{ObjectPath, Value};
@@ -331,68 +332,150 @@ impl MprisPlayer {
 
 // -- Initialization --
 
-/// Initialize MPRIS D-Bus interfaces.
+/// Initialize MPRIS D-Bus interfaces and start background monitoring.
 ///
-/// Creates a `zbus::blocking::Connection`, registers both `org.mpris.MediaPlayer2`
-/// and `org.mpris.MediaPlayer2.Player` interfaces at `/org/mpris/MediaPlayer2`,
-/// and requests the bus name.
+/// Creates a `zbus::blocking::Connection`, registers `org.mpris.MediaPlayer2`
+/// and `org.mpris.MediaPlayer2.Player` interfaces, requests the bus name,
+/// and spawns threads for PropertiesChanged emission and D-Bus health monitoring.
 ///
-/// If `update_rx` is provided, spawns a listener thread that emits
-/// `PropertiesChanged` D-Bus signals when playback state updates are received.
-///
-/// Returns `Some(Connection)` on success. The connection must be kept alive for
-/// the lifetime of the application (dropping it disconnects from D-Bus).
+/// The monitoring thread reconnects automatically if the D-Bus session bus
+/// restarts (up to 3 retries with backoff).
 pub fn init(
     cmd_tx: mpsc::Sender<MpdCommand>,
     state: SharedState,
     enabled: bool,
     update_rx: mpsc::Receiver<PlaybackUpdate>,
-) -> Option<Connection> {
+) {
     if !enabled {
-        return None;
+        return;
     }
 
     let conn: Connection = match zbus::blocking::Connection::session() {
         Ok(c) => c,
         Err(e) => {
             log::warn!("MPRIS: failed to connect to D-Bus session bus: {e}");
-            return None;
+            return;
         }
     };
 
-    let root = MprisRoot {
-        cmd_tx: cmd_tx.clone(),
-        state: state.clone(),
-    };
-    if let Err(e) = conn.object_server().at("/org/mpris/MediaPlayer2", root) {
-        log::warn!("MPRIS: failed to register root interface: {e}");
-        return None;
-    }
-
-    let player = MprisPlayer { cmd_tx, state };
-    if let Err(e) = conn.object_server().at("/org/mpris/MediaPlayer2", player) {
-        log::warn!("MPRIS: failed to register player interface: {e}");
-        return None;
+    if register_interfaces(&conn, &cmd_tx, &state).is_none() {
+        return;
     }
 
     match conn.request_name("org.mpris.MediaPlayer2.mpdclient") {
-        Ok(()) => {
-            log::info!("MPRIS: registered as org.mpris.MediaPlayer2.mpdclient");
-        }
+        Ok(()) => log::info!("MPRIS: registered as org.mpris.MediaPlayer2.mpdclient"),
         Err(e) => {
             log::warn!("MPRIS: failed to request bus name: {e}");
-            return None;
+            return;
         }
     }
 
-    // Spawn update listener thread for PropertiesChanged signal emission
+    // Spawn PropertiesChanged emission thread
     let emit_conn = conn.clone();
     thread::Builder::new()
         .name("mpris-updates".into())
         .spawn(move || emit_loop(emit_conn, update_rx))
         .expect("MPRIS: failed to spawn update listener thread");
 
-    Some(conn)
+    // Spawn D-Bus connection health monitor
+    let mon_cmd_tx = cmd_tx.clone();
+    let mon_state = state.clone();
+    thread::Builder::new()
+        .name("mpris-monitor".into())
+        .spawn(move || monitor_loop(conn, mon_cmd_tx, mon_state))
+        .expect("MPRIS: failed to spawn monitor thread");
+}
+
+/// Register MPRIS interfaces on a connection. Returns `Some(())` on success.
+fn register_interfaces(
+    conn: &Connection,
+    cmd_tx: &mpsc::Sender<MpdCommand>,
+    state: &SharedState,
+) -> Option<()> {
+    let root = MprisRoot {
+        cmd_tx: cmd_tx.clone(),
+        state: state.clone(),
+    };
+    conn.object_server()
+        .at("/org/mpris/MediaPlayer2", root)
+        .map_err(|e| log::warn!("MPRIS: failed to register root interface: {e}"))
+        .ok()?;
+
+    let player = MprisPlayer {
+        cmd_tx: cmd_tx.clone(),
+        state: state.clone(),
+    };
+    conn.object_server()
+        .at("/org/mpris/MediaPlayer2", player)
+        .map_err(|e| log::warn!("MPRIS: failed to register player interface: {e}"))
+        .ok()?;
+
+    Some(())
+}
+
+/// Check whether the D-Bus session bus connection is alive by pinging the bus daemon.
+fn conn_is_alive(conn: &Connection) -> bool {
+    let args = ();
+    conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "Hello",
+        &args,
+    )
+    .is_ok()
+}
+
+/// Monitor D-Bus connection health. Reconnects up to 3 times on session bus restart.
+fn monitor_loop(mut conn: Connection, cmd_tx: mpsc::Sender<MpdCommand>, state: SharedState) {
+    const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_RETRIES: u32 = 3;
+
+    loop {
+        thread::sleep(CHECK_INTERVAL);
+
+        if conn_is_alive(&conn) {
+            continue;
+        }
+
+        log::warn!("MPRIS: D-Bus session bus disconnected, attempting reconnection");
+
+        let mut success = false;
+        let mut delay = Duration::from_secs(1);
+
+        for attempt in 1..=MAX_RETRIES {
+            thread::sleep(delay);
+
+            match zbus::blocking::Connection::session() {
+                Ok(new_conn) => {
+                    if register_interfaces(&new_conn, &cmd_tx, &state).is_some() {
+                        match new_conn.request_name("org.mpris.MediaPlayer2.mpdclient") {
+                            Ok(()) => {
+                                log::info!("MPRIS: reconnected (attempt {attempt})");
+                                conn = new_conn;
+                                success = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::warn!("MPRIS: name request failed on reconnect: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("MPRIS: reconnect attempt {attempt} failed: {e}");
+                }
+            }
+
+            delay = delay.saturating_mul(2);
+        }
+
+        if !success {
+            log::warn!("MPRIS: failed to reconnect after {MAX_RETRIES} attempts");
+            // MPRIS is permanently disabled for this session
+            return;
+        }
+    }
 }
 
 /// Background loop: receives `PlaybackUpdate` messages and emits

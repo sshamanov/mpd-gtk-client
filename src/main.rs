@@ -229,13 +229,10 @@ fn main() {
 
     // Initialize D-Bus services (feature-gated, opt-in via config)
     #[cfg(feature = "mpris")]
-    let _notif_handle = {
-        let _mpris_conn = mpris::init(
-            cmd_tx.clone(), state.clone(), config.mpris.enabled,
-            mpris_update_rx,
-        );
-        notifications::spawn(state.clone(), config.notifications.libnotify)
-    };
+    {
+        mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled, mpris_update_rx);
+        let _notif_handle = notifications::spawn(state.clone(), config.notifications.libnotify);
+    }
     #[cfg(not(feature = "mpris"))]
     if config.mpris.enabled {
         log::warn!("MPRIS: enabled in config but not compiled (rebuild with --features mpris)");
