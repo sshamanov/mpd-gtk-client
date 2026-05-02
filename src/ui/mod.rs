@@ -327,7 +327,7 @@ impl App {
             // Group selector using libadwaita ViewSwitcher
             let group_stack = adw::ViewStack::new();
             // Add empty pages — ViewSwitcher shows their titles; switching triggers the MPD command
-            let group_pages = [("Albums", "Albums"), ("Artists", "Artist"), ("Years", "Date"), ("Genres", "Genre")];
+            let group_pages = [("Albums", "Albums"), ("Album Artists", "AlbumArtist"), ("Years", "Date"), ("Genres", "Genre")];
             for (display, _) in &group_pages {
                 group_stack.add_titled(&gtk4::Box::new(Orientation::Vertical, 0), Some(display), display);
             }
@@ -344,7 +344,7 @@ impl App {
             });
 
             // Sort mode selector
-            let sort_modes = ["Artist", "Album Name", "Artist (Z-A)", "Album Name (Z-A)"];
+            let sort_modes = ["Album Artist", "Album Name", "Album Artist (Z-A)", "Album Name (Z-A)"];
             let sort_dropdown = gtk4::DropDown::from_strings(&sort_modes);
             sort_dropdown.set_selected(0);
             sort_dropdown.set_valign(gtk4::Align::Center);

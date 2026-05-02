@@ -843,12 +843,17 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
 
     /// Fetch all albums with their artist names.
     pub fn list_albums(&mut self) -> Result<Vec<(String, String)>, Error> {
-        let lines = self.send_command("list album group Artist")?;
+        let lines = self.send_command("list album group AlbumArtist")?;
         let mut albums: Vec<(String, String)> = Vec::new();
         let mut current_artist = String::new();
         for line in lines {
-            if let Some(artist) = line.strip_prefix("Artist: ") {
+            // AlbumArtist takes priority; fall back to Artist if AlbumArtist is absent
+            if let Some(artist) = line.strip_prefix("AlbumArtist: ") {
                 current_artist = artist.to_string();
+            } else if let Some(artist) = line.strip_prefix("Artist: ") {
+                if current_artist.is_empty() {
+                    current_artist = artist.to_string();
+                }
             } else if let Some(album) = line.strip_prefix("Album: ") {
                 albums.push((current_artist.clone(), album.to_string()));
             }
@@ -865,10 +870,11 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         }
         let lines = self.send_command(&format!("list album group {group}"))?;
 
-        // For non-Artist groupings, fetch the flat album list to build an artist lookup map.
-        // MPD's `list album group {group}` does not include Artist metadata for Date/Genre
-        // groupings, so we backfill from the flat list grouped by Artist.
-        let flat_albums: Option<Vec<(String, String)>> = if group != "Artist" {
+        // For Date/Genre groupings, fetch the flat album list to build an artist lookup map.
+        // MPD's `list album group {group}` does not include Artist metadata for Date/Genre,
+        // so we backfill from the flat list grouped by AlbumArtist.
+        // Artist and AlbumArtist groupings include artist metadata inline — no backfill needed.
+        let flat_albums: Option<Vec<(String, String)>> = if group != "Artist" && group != "AlbumArtist" {
             Some(self.list_albums()?)
         } else {
             None
@@ -889,9 +895,9 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
                 }
                 current_header = name.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
-                // Artist grouping: header IS the artist
+                // Artist/AlbumArtist grouping: header IS the artist
                 // Date/Genre grouping: look up artist from the flat album list
-                let artist = if group == "Artist" {
+                let artist = if group == "Artist" || group == "AlbumArtist" {
                     current_header.clone()
                 } else {
                     artist_lookup
