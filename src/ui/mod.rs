@@ -414,6 +414,8 @@ impl App {
 
                 let placeholder = gtk4::DrawingArea::new();
                 placeholder.set_size_request(200, 200);
+                placeholder.set_halign(gtk4::Align::Fill);
+                placeholder.set_valign(gtk4::Align::Fill);
                 // Overlay on top — hides when cover is available
                 cover_overlay.add_overlay(&placeholder);
 
@@ -1838,8 +1840,6 @@ impl App {
             let fc_cp_np = fc_ev_cover_paths.clone();
             let fc_ev_model = album_model.clone();
             let fc_ev_data = album_grid_data.clone();
-            let fc_vadj = left_scroll.vadjustment();
-            let fc_vadj_grid = album_grid.clone();
             let fc_current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
             let fc_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
             let fc_shutdown = shutdown_app.clone();
@@ -2010,21 +2010,26 @@ impl App {
                                         });
                                     }
                                 }
+                                // Fetch covers for all albums on initial load (before items is moved into batch_populate)
+                                let cmd = fc_cmd.clone();
+                                let all_albums: Vec<(String, String)> = items.iter()
+                                    .filter_map(|i| match i {
+                                        AlbumGridItem::Album { artist, name, .. } => Some((artist.clone(), name.clone())),
+                                        AlbumGridItem::Header { .. } => None,
+                                    })
+                                    .collect();
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
-                                // Scroll-aware: only fetch covers for visible (±1 row) albums
-                                let backing = fc_ev_data.clone();
-                                let vadj = fc_vadj.clone();
-                                let grid = fc_vadj_grid.clone();
-                                let cmd = fc_cmd.clone();
+                                let mut all_albums = Some(all_albums);
                                 glib::idle_add_local(move || {
-                                    let albums = calculate_visible_albums(&backing, &vadj, &grid);
-                                    if !albums.is_empty() {
-                                        log::debug!(
-                                            "[ui] initial: enqueuing {} visible albums for cover fetch",
-                                            albums.len()
-                                        );
-                                        let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                    if let Some(albums) = all_albums.take() {
+                                        if !albums.is_empty() {
+                                            log::debug!(
+                                                "[ui] initial load: enqueuing {} albums for cover fetch",
+                                                albums.len()
+                                            );
+                                            let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                        }
                                     }
                                     glib::ControlFlow::Break
                                 });
@@ -2082,22 +2087,27 @@ impl App {
                                         }
                                     }
                                 }
+                                // Fetch covers for all albums on group change (before items is moved)
+                                let cmd = fc_cmd.clone();
+                                let all_albums: Vec<(String, String)> = items.iter()
+                                    .filter_map(|i| match i {
+                                        AlbumGridItem::Album { artist, name, .. } => Some((artist.clone(), name.clone())),
+                                        AlbumGridItem::Header { .. } => None,
+                                    })
+                                    .collect();
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_grid);
                                 if need_index {
-                                    // Scroll-aware: only fetch covers for visible (±1 row) albums
-                                    let backing = fc_ev_data.clone();
-                                    let vadj = fc_vadj.clone();
-                                    let grid = fc_vadj_grid.clone();
-                                    let cmd = fc_cmd.clone();
+                                    let mut all_albums = Some(all_albums);
                                     glib::idle_add_local(move || {
-                                        let albums = calculate_visible_albums(&backing, &vadj, &grid);
-                                        if !albums.is_empty() {
-                                            log::debug!(
-                                                "[ui] grouped: enqueuing {} visible albums for cover fetch",
-                                                albums.len()
-                                            );
-                                            let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                        if let Some(albums) = all_albums.take() {
+                                            if !albums.is_empty() {
+                                                log::debug!(
+                                                    "[ui] grouped: enqueuing {} albums for cover fetch",
+                                                    albums.len()
+                                                );
+                                                let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                            }
                                         }
                                         glib::ControlFlow::Break
                                     });
