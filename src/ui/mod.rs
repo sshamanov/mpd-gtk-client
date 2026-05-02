@@ -46,17 +46,27 @@ unsafe fn widget_get_str(w: &impl IsA<glib::Object>, key: &str) -> Option<String
 
 /// Given a Picture widget inside a cover_overlay (Overlay), find and hide
 /// the placeholder DrawingArea overlay that sits on top of it.
-fn hide_cover_placeholder(pic: &Picture) {
-    if let Some(co) = pic.parent() {
-        let mut child = co.first_child();
-        while let Some(c) = child {
-            if let Ok(da) = c.clone().downcast::<gtk4::DrawingArea>() {
-                da.set_visible(false);
-                break;
-            }
-            child = c.next_sibling();
-        }
+/// Generate a solid-color placeholder texture from an artist name.
+/// Both placeholder and real cover go through set_paintable() on the same
+/// Picture widget — no widget toggle, no size difference, no layout shift.
+fn placeholder_texture(artist: &str) -> gdk4::Texture {
+    let (r, g, b) = placeholder_rgb(artist);
+    let r8 = (r * 255.0) as u8;
+    let g8 = (g * 255.0) as u8;
+    let b8 = (b * 255.0) as u8;
+    let mut data = vec![0u8; 200 * 200 * 3];
+    for i in 0..(200 * 200) {
+        data[i * 3] = r8;
+        data[i * 3 + 1] = g8;
+        data[i * 3 + 2] = b8;
     }
+    let pixbuf = gdk_pixbuf::Pixbuf::from_mut_slice(
+        data,
+        gdk_pixbuf::Colorspace::Rgb,
+        false, 8, 200, 200,
+        200 * 3,
+    );
+    gdk4::Texture::for_pixbuf(&pixbuf)
 }
 
 /// Pre-compute placeholder RGB from an artist name.
@@ -398,10 +408,12 @@ impl App {
                 let album_section = Box::new(Orientation::Vertical, 0);
                 album_section.set_visible(false);
 
-                // Cover area: Overlay with cover_image as main child, placeholder on top.
-                // cover_image stays always-visible — no layout shift when set_filename is called.
-                let cover_overlay = Overlay::new();
-                cover_overlay.set_size_request(200, 200);
+                // Single Overlay: Picture (main child) + hover buttons (overlay).
+                // No placeholder DrawingArea — placeholder is a generated colored texture
+                // set on the same Picture widget via set_paintable(). Same widget type,
+                // same 200x200 size for both placeholder and cover — no layout shift.
+                let overlay = Overlay::new();
+                overlay.set_size_request(200, 200);
 
                 let cover_image = Picture::new();
                 cover_image.set_widget_name("cover-image");
@@ -409,18 +421,7 @@ impl App {
                 cover_image.set_halign(gtk4::Align::Fill);
                 cover_image.set_valign(gtk4::Align::Fill);
                 cover_image.set_content_fit(gtk4::ContentFit::ScaleDown);
-                // Main child — always visible, determines overlay size
-                cover_overlay.set_child(Some(&cover_image));
-
-                let placeholder = gtk4::DrawingArea::new();
-                placeholder.set_size_request(200, 200);
-                placeholder.set_halign(gtk4::Align::Fill);
-                placeholder.set_valign(gtk4::Align::Fill);
-                // Overlay on top — hides when cover is available
-                cover_overlay.add_overlay(&placeholder);
-
-                let overlay = Overlay::new();
-                overlay.set_child(Some(&cover_overlay));
+                overlay.set_child(Some(&cover_image));
 
                 // Hover buttons — album name read from overlay at click time
                 let tx_add = setup_tx.clone();
@@ -562,31 +563,18 @@ impl App {
                                 let da = if artist.is_empty() { "Unknown Artist" } else { artist.as_str() };
                                 a.set_text(da);
                             }
-                            // Update cover area — cover_overlay is an Overlay, not a Box
-                            if let Some(outer_ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
-                                if let Some(ca) = outer_ov.child().and_then(|c| c.downcast::<Overlay>().ok()) {
-                                    let has_cov = bind_cp.borrow().get(name).and_then(|o| o.as_deref()).is_some();
-                                    // Cover image: first child of cover_overlay (always visible — no toggle)
-                                    if let Some(pic) = ca.first_child().and_then(|c| c.downcast::<Picture>().ok()) {
-                                        if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
-                                            pic.set_filename(Some(p));
-                                        } else {
-                                            pic.set_filename(None::<&str>);
-                                        }
-                                        // Register for async cover updates
-                                        bind_cw.borrow_mut().insert(name.clone(), pic.clone());
+                            // Update cover — single Picture, always visible.
+                            // Placeholder = generated colored texture; cover = loaded image.
+                            // Same widget, same size — no toggle, no layout shift.
+                            if let Some(ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
+                                if let Some(pic) = ov.child().and_then(|c| c.downcast::<Picture>().ok()) {
+                                    if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
+                                        pic.set_filename(Some(p));
+                                    } else {
+                                        let texture = placeholder_texture(artist);
+                                        pic.set_paintable(Some(&texture));
                                     }
-                                    // Placeholder: second child of cover_overlay (toggles on top)
-                                    if let Some(pl) = ca.first_child()
-                                        .and_then(|c| c.next_sibling())
-                                        .and_then(|c| c.downcast::<gtk4::DrawingArea>().ok()) {
-                                        pl.set_visible(!has_cov);
-                                        let (rp, gp, bp) = (*pr, *pg, *pb);
-                                        pl.set_draw_func(move |_area, cr, _w, _h| {
-                                            cr.set_source_rgb(rp, gp, bp);
-                                            let _ = cr.paint();
-                                        });
-                                    }
+                                    bind_cw.borrow_mut().insert(name.clone(), pic.clone());
                                 }
                             }
                         }
@@ -2340,7 +2328,6 @@ impl App {
                                     if let Some(pic) = widgets.get(album) {
                                         log::info!("[UI] cover update: '{album}' -> {p}");
                                         pic.set_filename(Some(p));
-                                        hide_cover_placeholder(pic);
                                         pic.queue_draw();
                                     }
                                     // Also update mini-queue Picture widget if registered
@@ -2368,7 +2355,6 @@ impl App {
                                 // Update album grid widget in-place (widget registry lookup)
                                 if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
                                     pic.set_paintable(Some(&texture));
-                                    hide_cover_placeholder(pic);
                                     pic.queue_draw();
                                 }
                                 // Also update mini-queue widget if registered
