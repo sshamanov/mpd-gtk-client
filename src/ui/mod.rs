@@ -1369,6 +1369,9 @@ impl App {
                 .item_type(StringObject::static_type())
                 .build();
             let mini_grid_factory = SignalListItemFactory::new();
+            // Widget registry for mini-queue covers (async updates from CoverPaths/CoverRefreshed)
+            let mini_cover_widgets: std::rc::Rc<std::cell::RefCell<HashMap<String, gtk4::Picture>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
 
             // Shared current-album tracker for mini grid highlight
             let mini_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> =
@@ -1403,6 +1406,7 @@ impl App {
             let mg_bind_data = mini_grid_data.clone();
             let mg_bind_cover = cover_paths.clone();
             let mg_bind_current = mini_current_album.clone();
+            let mg_bind_cw = mini_cover_widgets.clone();
             mini_grid_factory.connect_bind(move |_factory, item| {
                 let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
                 let Some(obj) = list_item.item() else { return; };
@@ -1430,6 +1434,8 @@ impl App {
                     } else {
                         cover.set_visible(false);
                     }
+                    // Register for async cover updates (CoverPaths/CoverRefreshed)
+                    mg_bind_cw.borrow_mut().insert(item_data.album.clone(), cover.clone());
                 }
 
                 // Album name label
@@ -1848,6 +1854,7 @@ impl App {
             let fc_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
             let fc_ev_cover_widgets = cover_widgets.clone();
+            let fc_mini_cw = mini_cover_widgets.clone();
             let fc_cp_np = fc_ev_cover_paths.clone();
             let fc_ev_model = album_model.clone();
             let fc_ev_data = album_grid_data.clone();
@@ -2324,19 +2331,23 @@ impl App {
                         MpdEvent::CoverPaths(paths) => {
                             let mut cp = fc_ev_cover_paths.borrow_mut();
                             let widgets = fc_ev_cover_widgets.borrow();
+                            let mini_widgets = fc_mini_cw.borrow();
                             for (album, path) in &paths {
                                 log::info!("[UI] cover path: '{album}' -> {:?}", path);
                                 cp.insert(album.clone(), path.clone());
-                                // Update the Picture widget in-place if registered
+                                // Update grid Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
                                     if let Some(pic) = widgets.get(album) {
                                         log::info!("[UI] cover update: '{album}' -> {p}");
                                         pic.set_filename(Some(p));
-                                        // Hide the placeholder DrawingArea overlay on top
                                         hide_cover_placeholder(pic);
                                         pic.queue_draw();
-                                    } else {
-                                        log::warn!("[UI] cover: no widget registered for '{album}'");
+                                    }
+                                    // Also update mini-queue Picture widget if registered
+                                    if let Some(pic) = mini_widgets.get(album) {
+                                        pic.set_filename(Some(p));
+                                        pic.set_visible(true);
+                                        pic.queue_draw();
                                     }
                                 }
                             }
@@ -2354,8 +2365,12 @@ impl App {
                                     pic.set_paintable(Some(&texture));
                                     hide_cover_placeholder(pic);
                                     pic.queue_draw();
-                                } else {
-                                    log::warn!("[UI] cover refresh: no grid widget registered for '{album_id}'");
+                                }
+                                // Also update mini-queue widget if registered
+                                if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
+                                    pic.set_paintable(Some(&texture));
+                                    pic.set_visible(true);
+                                    pic.queue_draw();
                                 }
                                 // Also update now-playing cover if this is the current album
                                 if fc_current_album.borrow().as_deref() == Some(&album_id) {
