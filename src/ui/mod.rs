@@ -2342,7 +2342,7 @@ impl App {
                                             pic.queue_draw();
                                         }
                                         let is_current = fc_current_album.borrow().as_deref()
-                                            .map(|a| album.to_lowercase().ends_with(&format!("||{}", a.to_lowercase())))
+                                            .map(|a| album.ends_with(&format!("||{}", a)))
                                             .unwrap_or(false);
                                         if is_current {
                                             fc_np_cover.set_paintable(Some(&tex));
@@ -2375,7 +2375,7 @@ impl App {
                                 }
                                 // Also update now-playing cover if this is the current album
                                 let is_current = fc_current_album.borrow().as_deref()
-                                    .map(|a| album_id.to_lowercase().ends_with(&format!("||{}", a.to_lowercase())))
+                                    .map(|a| album_id.ends_with(&format!("||{}", a)))
                                     .unwrap_or(false);
                                 if is_current {
                                     fc_np_cover.set_paintable(Some(&texture));
@@ -2503,10 +2503,10 @@ fn update_now_playing(
     if let Some(ref a) = update.album {
         w.album.set_text(a);
         let cp = w.cover_paths.borrow();
-        // Keys are composite and lowercase — find by album-name suffix (case-insensitive)
-        let suffix = format!("||{}", a.to_lowercase());
+        // Keys are composite (artist||album) — find by album-name suffix
+        let suffix = format!("||{}", a);
         let path = cp.iter()
-            .find(|(k, _)| k.to_lowercase().ends_with(&suffix))
+            .find(|(k, _)| k.ends_with(&suffix))
             .and_then(|(_, v)| v.as_deref());
         if let Some(p) = path {
             w.cover.set_filename(Some(p));
