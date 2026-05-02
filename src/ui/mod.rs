@@ -385,6 +385,8 @@ impl App {
                 let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
                 let container = Box::new(Orientation::Vertical, 0);
                 container.set_size_request(200, 250);
+                container.set_halign(gtk4::Align::Start);
+                container.set_valign(gtk4::Align::Start);
                 container.set_css_classes(&["album-cover-cell"]);
 
                 // Header label — hidden by default
@@ -400,6 +402,7 @@ impl App {
 
                 // Album content — hidden by default
                 let album_section = Box::new(Orientation::Vertical, 0);
+                album_section.set_valign(gtk4::Align::Start);
                 album_section.set_visible(false);
 
                 // Single Overlay: Picture (main child) + hover buttons (overlay).
@@ -408,12 +411,11 @@ impl App {
                 // same 200x200 size for both placeholder and cover — no layout shift.
                 let overlay = Overlay::new();
                 overlay.set_size_request(200, 200);
+                overlay.set_valign(gtk4::Align::Start);
 
                 let cover_image = Picture::new();
                 cover_image.set_widget_name("cover-image");
                 cover_image.set_size_request(200, 200);
-                cover_image.set_halign(gtk4::Align::Fill);
-                cover_image.set_valign(gtk4::Align::Fill);
                 cover_image.set_content_fit(gtk4::ContentFit::ScaleDown);
                 overlay.set_child(Some(&cover_image));
 
