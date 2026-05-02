@@ -632,9 +632,42 @@ fn group_albums_by_artist(albums: &[(String, String)]) -> crate::mpd::AlbumGroup
 }
 
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
+    // Extract format badge from status "audio" field (e.g., "dsd64:2" → "DSD64")
+    let format = status.get("audio").and_then(|audio| {
+        let fmt = audio.split(':').next().unwrap_or(audio);
+        if fmt.eq_ignore_ascii_case("dsd64") {
+            Some("DSD64".into())
+        } else if fmt.eq_ignore_ascii_case("dsd128") {
+            Some("DSD128".into())
+        } else if fmt.eq_ignore_ascii_case("dsd256") {
+            Some("DSD256".into())
+        } else if fmt.eq_ignore_ascii_case("dsd512") {
+            Some("DSD512".into())
+        } else if let Some(pcm) = fmt.split(':').next() {
+            // PCM format: "44100:24:2" or just the name
+            if pcm.contains(':') {
+                let parts: Vec<&str> = pcm.split(':').collect();
+                if parts.len() >= 2 {
+                    if let Ok(bits) = parts[1].parse::<u32>() {
+                        let rate_str = if let Ok(r) = parts[0].parse::<f64>() {
+                            format!("{:.1}", r / 1000.0).trim_end_matches('0').trim_end_matches('.').to_string()
+                        } else { parts[0].to_string() };
+                        return Some(format!("{}/{}", bits, rate_str));
+                    }
+                }
+            }
+            None
+        } else {
+            None
+        }
+    });
+
     PlaybackUpdate {
         state: status.get("state").cloned().unwrap_or_default(),
         song: status.get("song").and_then(|v| v.parse().ok()),
+        artist: None,
+        title: None,
+        album: None,
         volume: status.get("volume")
             .and_then(|v| v.parse::<i16>().ok())
             .map(|v| if v == -1 { 0 } else { v })
@@ -642,7 +675,7 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
         elapsed: status.get("elapsed").and_then(|v| v.parse().ok()),
         duration: status.get("duration").and_then(|v| v.parse().ok()),
         playlist_version: status.get("playlist").cloned(),
-        ..Default::default()
+        format,
     }
 }
 
