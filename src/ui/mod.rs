@@ -383,8 +383,8 @@ impl App {
                 let album_section = Box::new(Orientation::Vertical, 0);
                 album_section.set_visible(false);
 
-                // Cover area: Overlay so cover_image stays always-visible underneath.
-                // Only the placeholder toggles on top — no layout shift when covers load.
+                // Cover area: Overlay with cover_image as main child, placeholder on top.
+                // cover_image stays always-visible — no layout shift when set_filename is called.
                 let cover_overlay = Overlay::new();
                 cover_overlay.set_size_request(200, 200);
 
@@ -394,12 +394,12 @@ impl App {
                 cover_image.set_halign(gtk4::Align::Fill);
                 cover_image.set_valign(gtk4::Align::Fill);
                 cover_image.set_content_fit(gtk4::ContentFit::ScaleDown);
-                // Always visible — avoids layout shift when set_filename is called
-                cover_overlay.add_overlay(&cover_image);
+                // Main child — always visible, determines overlay size
+                cover_overlay.set_child(Some(&cover_image));
 
                 let placeholder = gtk4::DrawingArea::new();
                 placeholder.set_size_request(200, 200);
-                // Placeholder sits on top, hides when cover is available
+                // Overlay on top — hides when cover is available
                 cover_overlay.add_overlay(&placeholder);
 
                 let overlay = Overlay::new();
