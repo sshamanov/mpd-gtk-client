@@ -573,6 +573,7 @@ impl App {
                                     }
                                     drop(cp);
                                     bind_cw.borrow_mut().insert(key.clone(), pic.clone());
+                                    log::debug!("[UI] bind: registered widget for '{key}'");
                                 }
                             }
                         }
@@ -2328,8 +2329,12 @@ impl App {
                                     if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
                                         let tex = gdk4::Texture::for_pixbuf(&pixbuf);
                                         if let Some(pic) = widgets.get(album) {
+                                            log::info!("[UI] cover update: '{album}' -> {p}");
                                             pic.set_paintable(Some(&tex));
                                             pic.queue_draw();
+                                        } else {
+                                            log::warn!("[UI] cover: no grid widget for '{album}', registry has {} entries: {:?}",
+                                                widgets.len(), widgets.keys().take(3).collect::<Vec<_>>());
                                         }
                                         if let Some(pic) = mini_widgets.get(album) {
                                             pic.set_paintable(Some(&tex));
