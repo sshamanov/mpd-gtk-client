@@ -2490,12 +2490,16 @@ fn update_now_playing(
     if let Some(ref a) = update.album {
         w.album.set_text(a);
         let cp = w.cover_paths.borrow();
-        if let Some(Some(path)) = cp.get(a) {
-            w.cover.set_filename(Some(path));
+        // Keys are composite (artist||album) — find by album-name suffix
+        let suffix = format!("||{}", a);
+        let path = cp.iter()
+            .find(|(k, _)| k.ends_with(&suffix))
+            .and_then(|(_, v)| v.as_deref());
+        if let Some(p) = path {
+            w.cover.set_filename(Some(p));
             w.cover.set_visible(true);
-        } else {
-            w.cover.set_visible(false);
         }
+        // Don't hide cover on cache miss — CoverPaths/CoverRefreshed may update it later
     } else {
         w.album.set_text("");
         w.cover.set_visible(false);
