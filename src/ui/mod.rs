@@ -44,6 +44,21 @@ unsafe fn widget_get_str(w: &impl IsA<glib::Object>, key: &str) -> Option<String
     unsafe { w.data::<String>(key).map(|p| p.as_ref().clone()) }
 }
 
+/// Given a Picture widget inside a cover_overlay (Overlay), find and hide
+/// the placeholder DrawingArea overlay that sits on top of it.
+fn hide_cover_placeholder(pic: &Picture) {
+    if let Some(co) = pic.parent() {
+        let mut child = co.first_child();
+        while let Some(c) = child {
+            if let Ok(da) = c.clone().downcast::<gtk4::DrawingArea>() {
+                da.set_visible(false);
+                break;
+            }
+            child = c.next_sibling();
+        }
+    }
+}
+
 /// Pre-compute placeholder RGB from an artist name.
 fn placeholder_rgb(artist: &str) -> (f64, f64, f64) {
     let hash: u64 = artist.bytes().fold(0xcbf29ce484222325u64, |acc, b| {
@@ -2296,6 +2311,8 @@ impl App {
                                     if let Some(pic) = widgets.get(album) {
                                         log::info!("[UI] cover update: '{album}' -> {p}");
                                         pic.set_filename(Some(p));
+                                        // Hide the placeholder DrawingArea overlay on top
+                                        hide_cover_placeholder(pic);
                                         pic.queue_draw();
                                     } else {
                                         log::warn!("[UI] cover: no widget registered for '{album}'");
@@ -2314,6 +2331,7 @@ impl App {
                                 // Update album grid widget in-place (widget registry lookup)
                                 if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
                                     pic.set_paintable(Some(&texture));
+                                    hide_cover_placeholder(pic);
                                     pic.queue_draw();
                                 } else {
                                     log::warn!("[UI] cover refresh: no grid widget registered for '{album_id}'");
