@@ -499,7 +499,7 @@ last_profile = "local"
 - API churn risk — adw crate evolves rapidly (0.5 → 0.8 in ~18 months)
 - Requires Adwaita runtime on non-GNOME desktops
 
-**Status: NOT IMPLEMENTED — in-scope for V1.** Custom GTK4 widgets used throughout. libadwaita integration would replace Toast overlay, navigation stack, responsive sidebar, and mode switcher. Adds dependency but reduces custom widget maintenance.
+**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** ToastOverlay and ViewSwitcher are done (story 22-1). NavigationView evaluated as not applicable (flat view structure). MultiLayoutView + BottomSheet for responsive right-rail is a separate story (epic 27).
 
 
 
