@@ -561,7 +561,9 @@ impl App {
                             if let Some(ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
                                 if let Some(pic) = ov.child().and_then(|c| c.downcast::<Picture>().ok()) {
                                     if let Some(p) = bind_cp.borrow().get(&key).and_then(|o| o.as_deref()) {
-                                        pic.set_filename(Some(p));
+                                        if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
+                                            pic.set_paintable(Some(&gdk4::Texture::for_pixbuf(&pixbuf)));
+                                        }
                                     } else {
                                         let texture = placeholder_texture(artist);
                                         pic.set_paintable(Some(&texture));
@@ -2318,25 +2320,25 @@ impl App {
                                 cp.insert(album.clone(), path.clone());
                                 // Update grid Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
-                                    if let Some(pic) = widgets.get(album) {
-                                        log::info!("[UI] cover update: '{album}' -> {p}");
-                                        pic.set_filename(Some(p));
-                                        pic.queue_draw();
-                                    }
-                                    // Also update mini-queue Picture widget if registered
-                                    if let Some(pic) = mini_widgets.get(album) {
-                                        pic.set_filename(Some(p));
-                                        pic.set_visible(true);
-                                        pic.queue_draw();
-                                    }
-                                    // Also update now-playing cover if this is the current album
-                                    // Key is composite (artist||album), compare album-name suffix
-                                    let is_current = fc_current_album.borrow().as_deref()
-                                        .map(|a| album.ends_with(&format!("||{}", a)))
-                                        .unwrap_or(false);
-                                    if is_current {
-                                        fc_np_cover.set_filename(Some(p));
-                                        fc_np_cover.set_visible(true);
+                                    // Load at 200x200 to prevent GridView row expansion from native image dims
+                                    if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
+                                        let tex = gdk4::Texture::for_pixbuf(&pixbuf);
+                                        if let Some(pic) = widgets.get(album) {
+                                            pic.set_paintable(Some(&tex));
+                                            pic.queue_draw();
+                                        }
+                                        if let Some(pic) = mini_widgets.get(album) {
+                                            pic.set_paintable(Some(&tex));
+                                            pic.set_visible(true);
+                                            pic.queue_draw();
+                                        }
+                                        let is_current = fc_current_album.borrow().as_deref()
+                                            .map(|a| album.ends_with(&format!("||{}", a)))
+                                            .unwrap_or(false);
+                                        if is_current {
+                                            fc_np_cover.set_paintable(Some(&tex));
+                                            fc_np_cover.set_visible(true);
+                                        }
                                     }
                                 }
                             }
@@ -2348,7 +2350,9 @@ impl App {
                             let owned = data.to_vec();
                             let cursor = std::io::Cursor::new(owned);
                             if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_read(cursor) {
-                                let texture = gdk4::Texture::for_pixbuf(&pixbuf);
+                                let scaled = pixbuf.scale_simple(200, 200, gdk_pixbuf::InterpType::Bilinear)
+                                    .unwrap_or(pixbuf);
+                                let texture = gdk4::Texture::for_pixbuf(&scaled);
                                 // Update album grid widget in-place (widget registry lookup)
                                 if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
                                     pic.set_paintable(Some(&texture));
