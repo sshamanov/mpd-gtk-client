@@ -560,14 +560,18 @@ impl App {
                             let key = crate::coverart::cover_key(artist, name);
                             if let Some(ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
                                 if let Some(pic) = ov.child().and_then(|c| c.downcast::<Picture>().ok()) {
-                                    if let Some(p) = bind_cp.borrow().get(&key).and_then(|o| o.as_deref()) {
+                                    let cp = bind_cp.borrow();
+                                    let found = cp.get(&key).and_then(|o| o.as_deref());
+                                    if let Some(p) = found {
                                         if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
                                             pic.set_paintable(Some(&gdk4::Texture::for_pixbuf(&pixbuf)));
                                         }
                                     } else {
+                                        log::debug!("[UI] bind: no cover for key '{key}', cp has {} entries", cp.len());
                                         let texture = placeholder_texture(artist);
                                         pic.set_paintable(Some(&texture));
                                     }
+                                    drop(cp);
                                     bind_cw.borrow_mut().insert(key.clone(), pic.clone());
                                 }
                             }
@@ -2312,11 +2316,11 @@ impl App {
                             }
                         }
                         MpdEvent::CoverPaths(paths) => {
+                            log::info!("[UI] CoverPaths: {} covers, keys: {:?}", paths.len(), paths.keys().collect::<Vec<_>>());
                             let mut cp = fc_ev_cover_paths.borrow_mut();
                             let widgets = fc_ev_cover_widgets.borrow();
                             let mini_widgets = fc_mini_cw.borrow();
                             for (album, path) in &paths {
-                                log::info!("[UI] cover path: '{album}' -> {:?}", path);
                                 cp.insert(album.clone(), path.clone());
                                 // Update grid Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
