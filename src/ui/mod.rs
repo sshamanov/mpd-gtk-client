@@ -396,6 +396,7 @@ impl App {
                 cover_image.set_size_request(200, 200);
                 cover_image.set_halign(gtk4::Align::Center);
                 cover_image.set_valign(gtk4::Align::Center);
+                cover_image.set_content_fit(gtk4::ContentFit::ScaleDown);
                 cover_image.set_visible(false);
                 cover_area.append(&cover_image);
 
@@ -1714,25 +1715,29 @@ impl App {
             window.present();
 
             // --- Scroll-aware cover loading: debounce timer + vadjustment handler ---
-            let scroll_timer: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> =
-                std::rc::Rc::new(std::cell::Cell::new(None));
+            // Generation counter: each scroll event bumps the generation. The debounce
+            // callback checks if it's still the latest; old callbacks become no-ops.
+            // This avoids SourceId::remove() races (SourceId can become invalid if
+            // the callback fires before we finish setting up the next timer).
+            let scroll_gen: std::rc::Rc<std::sync::atomic::AtomicUsize> =
+                std::rc::Rc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let sv_adj = left_scroll.vadjustment();
             let sv_backing = album_grid_data.clone();
             let sv_grid = album_grid.clone();
             let sv_cmd = cmd_tx.clone();
-            let sv_timer = scroll_timer.clone();
             sv_adj.connect_value_changed(move |adj| {
-                // Cancel previous debounce timer (catch panic: source may already be invalid)
-                if let Some(id) = sv_timer.take() {
-                    let _ = std::panic::catch_unwind(|| id.remove());
-                }
-                // Start a new 300ms debounce timer; resets on each scroll event
+                let gen_id = scroll_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let backing = sv_backing.clone();
                 let grid = sv_grid.clone();
                 let cmd = sv_cmd.clone();
                 let adj_clone = adj.clone();
-                let id = glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+                let check_gen = scroll_gen.clone();
+                glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
+                    // Stale timer — a newer scroll event has already replaced us
+                    if check_gen.load(std::sync::atomic::Ordering::Relaxed) != gen_id {
+                        return glib::ControlFlow::Break;
+                    }
                     let albums = calculate_visible_albums(&backing, &adj_clone, &grid);
                     if !albums.is_empty() {
                         log::debug!(
@@ -1743,7 +1748,6 @@ impl App {
                     }
                     glib::ControlFlow::Break
                 });
-                sv_timer.set(Some(id));
             });
 
             // --- Frame clock tick callback for MPD events (replaces 30ms timer) ---
@@ -2356,6 +2360,7 @@ impl App {
                  #connection-indicator.error { background-color: #f44336; }
                  #connection-indicator.connecting { background-color: #FFC107; }
                  .album-cover-cell:selected { border: 2px solid @theme_selected_bg_color; }
+                 .album-cover-cell { min-height: 250px; min-width: 200px; }
                  .album-cover-hover-btn { opacity: 0; transition: opacity 150ms ease-in-out; min-width: 24px; min-height: 24px; padding: 2px; }
                  .album-cover-cell:hover .album-cover-hover-btn { opacity: 1; }
                  .album-group-header { font-weight: bold; font-size: 1.1em; padding: 4px 8px; }

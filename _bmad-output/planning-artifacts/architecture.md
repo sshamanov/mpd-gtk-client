@@ -499,7 +499,32 @@ last_profile = "local"
 - API churn risk — adw crate evolves rapidly (0.5 → 0.8 in ~18 months)
 - Requires Adwaita runtime on non-GNOME desktops
 
-**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** ToastOverlay and ViewSwitcher are done (story 22-1). NavigationView evaluated as not applicable (flat view structure). MultiLayoutView + BottomSheet for responsive right-rail is a separate story (epic 27).
+**Status: IMPLEMENTED.** ToastOverlay and ViewSwitcher are done (story 22-1). NavigationView evaluated as not applicable (flat view structure). MultiLayoutView + BottomSheet for responsive right-rail is a separate story (epic 27, backlog).
+
+## Architecture Decision Record: Now-Playing Consolidation
+
+**Decision:** Centralize all now-playing metadata (format badge, track info, playback state) through a single handler that writes to `SharedState` first (canonical), then pushes to UI and MPRIS from SharedState. Unify audio format parsing into a single function with prioritized MPD field sources.
+
+### Key Changes
+
+1. **Single format parser** (`parse_mpd_audio_format`): Takes three MPD fields in priority order — `currentsong.Audio` (file format, immutable) → `currentsong.Format` (file sample spec) → `status.audio` (DAC output, may be resampled). Returns `Option<AudioFormat>`. File format wins over output format: a DSD file shows "DSD64" even if MPD converts it to PCM for the DAC.
+
+2. **Structured `AudioFormat`** added to `PlaybackUpdate` alongside the existing display string. `AudioFormat::display_text()` derives the badge text. This populates `Track.format` in SharedState (currently always `None`).
+
+3. **Centralized `handle_now_playing` function**: Single entry point for `StateChanged` events — writes SharedState, then reads back to update UI via a `PlaybackDisplay` view model, then forwards to MPRIS. Three previous inline code paths become one.
+
+4. **CurrentSong uses cached status**: The `MpdCommand::CurrentSong` handler merges fresh song data with cached status fields (elapsed, duration, state) instead of sending partial `parse_song_update()` data that resets elapsed to `--:--`.
+
+5. **Cover art is independent**: The now-playing cover flows through `CoverPaths`/`CoverRefreshed` events directly to the cover widget — NOT through `handle_now_playing` or `SharedState.current.album.cover_path`. Covers arrive asynchronously after metadata and have their own pipeline.
+
+### Explicit Trade-offs Accepted
+
+- Extra `RwLock` acquisition per update (write + read) — negligible on GTK main thread
+- `PlaybackDisplay` view model struct adds a small indirection between state and UI
+- Cached status for CurrentSong may be ≤1s stale — acceptable for elapsed/duration fields during track transitions
+- Cover path not stored in SharedState — future consumers that need it must listen to CoverPaths events directly
+
+**Status: PLANNED — to be implemented as story 19-2 (or next available).**
 
 
 
