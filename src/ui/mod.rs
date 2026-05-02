@@ -2429,8 +2429,8 @@ impl App {
                  #connection-indicator.error { background-color: #f44336; }
                  #connection-indicator.connecting { background-color: #FFC107; }
                  .album-cover-cell:selected { border: 2px solid @theme_selected_bg_color; }
-                 .album-cover-cell { min-height: 250px; min-width: 200px; }
-                 .album-cover-cell { min-height: 250px; min-width: 200px; }
+                 .album-cover-cell { min-height: 250px; min-width: 200px; max-height: 250px; max-width: 200px; }
+                 .album-cover-cell { min-height: 250px; min-width: 200px; max-height: 250px; max-width: 200px; }
                  .album-cover-hover-btn { opacity: 0; transition: opacity 150ms ease-in-out; min-width: 24px; min-height: 24px; padding: 2px; }
                  .album-cover-cell:hover .album-cover-hover-btn { opacity: 1; }
                  .album-group-header { font-weight: bold; font-size: 1.1em; padding: 4px 8px; }
