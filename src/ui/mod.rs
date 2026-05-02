@@ -2349,6 +2349,11 @@ impl App {
                                         pic.set_visible(true);
                                         pic.queue_draw();
                                     }
+                                    // Also update now-playing cover if this is the current album
+                                    if fc_current_album.borrow().as_deref() == Some(album.as_str()) {
+                                        fc_np_cover.set_filename(Some(p));
+                                        fc_np_cover.set_visible(true);
+                                    }
                                 }
                             }
                         }
