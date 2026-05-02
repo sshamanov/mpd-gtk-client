@@ -106,16 +106,20 @@ impl ActualRead {
         };
 
         // Step 2: Primary — albumart
+        log::info!("[cover] '{album_name}': albumart={}, readpicture={}", caps.albumart, caps.readpicture);
         if caps.albumart {
             match adapter.albumart(&album_name) {
                 Ok(Some(data)) => {
+                    log::info!("[cover] '{album_name}': albumart returned {} bytes", data.len());
                     if self.handle_albumart_data(&album_name, &data, provider, event_tx) {
-                        return; // Handled successfully (emitted or skipped)
+                        return;
                     }
                 }
-                Ok(None) => { /* albumart returned no data, try readpicture */ }
+                Ok(None) => {
+                    log::info!("[cover] '{album_name}': albumart returned no data, trying readpicture");
+                }
                 Err(e) => {
-                    log::debug!("[actual_read] albumart failed for '{album_name}': {e}");
+                    log::info!("[cover] '{album_name}': albumart failed ({e}), trying readpicture");
                 }
             }
         }
@@ -124,13 +128,14 @@ impl ActualRead {
         if caps.readpicture {
             match adapter.readpicture(&uri) {
                 Ok(Some((data, mtime))) => {
+                    log::info!("[cover] '{album_name}': readpicture returned {} bytes", data.len());
                     self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
                 }
                 Ok(None) => {
-                    log::debug!("[actual_read] No cover found for '{album_name}' (albumart + readpicture both empty)");
+                    log::info!("[cover] '{album_name}': albumart + readpicture both empty");
                 }
                 Err(e) => {
-                    log::debug!("[actual_read] readpicture failed for '{album_name}': {e}");
+                    log::info!("[cover] '{album_name}': readpicture failed ({e})");
                 }
             }
         }

@@ -2462,6 +2462,7 @@ fn update_now_playing(
         }
     }
     if let Some(ref fmt) = update.format {
+        log::info!("[UI] format badge: '{fmt}'");
         w.format_badge.set_text(fmt);
         w.format_badge.set_visible(true);
     } else {

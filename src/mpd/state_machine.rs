@@ -377,6 +377,7 @@ fn connected_loop(
                     }
                     MpdCommand::FetchCovers(albums) => {
                         // Enqueue covers for background fetch; processed one per idle cycle below
+                        log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
                         actual_read.enqueue(albums);
                     }
                     MpdCommand::Search(query) => {
