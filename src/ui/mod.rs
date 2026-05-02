@@ -1750,6 +1750,7 @@ impl App {
             let sv_backing = album_grid_data.clone();
             let sv_grid = album_grid.clone();
             let sv_cmd = cmd_tx.clone();
+            let sv_cp = cover_paths.clone();
             sv_adj.connect_value_changed(move |adj| {
                 let gen_id = scroll_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let backing = sv_backing.clone();
@@ -1757,18 +1758,24 @@ impl App {
                 let cmd = sv_cmd.clone();
                 let adj_clone = adj.clone();
                 let check_gen = scroll_gen.clone();
+                let cp = sv_cp.clone();
                 glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
                     // Stale timer — a newer scroll event has already replaced us
                     if check_gen.load(std::sync::atomic::Ordering::Relaxed) != gen_id {
                         return glib::ControlFlow::Break;
                     }
                     let albums = calculate_visible_albums(&backing, &adj_clone, &grid);
-                    if !albums.is_empty() {
+                    // Filter out albums that already have covers (prevents replacing
+                    // full initial fetch with partial scroll-based fetch)
+                    let new_albums: Vec<_> = albums.into_iter()
+                        .filter(|(a, n)| !cp.borrow().contains_key(&crate::coverart::cover_key(a, n)))
+                        .collect();
+                    if !new_albums.is_empty() {
                         log::debug!(
                             "[ui] scroll stop: enqueuing {} visible albums for cover fetch",
-                            albums.len()
+                            new_albums.len()
                         );
-                        let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                        let _ = cmd.send(MpdCommand::FetchCovers(new_albums));
                     }
                     glib::ControlFlow::Break
                 });

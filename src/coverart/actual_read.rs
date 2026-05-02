@@ -46,14 +46,16 @@ impl ActualRead {
         }
     }
 
-    /// Replace the queue with a new set of albums to fetch.
-    ///
-    /// This replaces any pending fetches — the caller is responsible for providing
-    /// the complete set of albums that need covers.
+    /// Add albums to the fetch queue, skipping any already pending.
+    /// Does not clear the existing queue — merges new albums with pending.
     pub fn enqueue(&mut self, albums: Vec<(String, String)>) {
-        self.queue.clear();
-        self.queue.extend(albums);
-        log::debug!("[actual_read] Enqueued {} albums", self.queue.len());
+        let added = albums.len();
+        for a in albums {
+            if !self.queue.contains(&a) {
+                self.queue.push_back(a);
+            }
+        }
+        log::debug!("[actual_read] Enqueued {} albums ({} total pending)", added, self.queue.len());
     }
 
     /// Returns true if there are pending albums to fetch.
