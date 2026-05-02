@@ -47,25 +47,17 @@ unsafe fn widget_get_str(w: &impl IsA<glib::Object>, key: &str) -> Option<String
 /// Given a Picture widget inside a cover_overlay (Overlay), find and hide
 /// the placeholder DrawingArea overlay that sits on top of it.
 /// Generate a solid-color placeholder texture from an artist name.
-/// Both placeholder and real cover go through set_paintable() on the same
-/// Picture widget — no widget toggle, no size difference, no layout shift.
+/// Uses Pixbuf::fill() — one call fills the entire buffer with the color.
 fn placeholder_texture(artist: &str) -> gdk4::Texture {
     let (r, g, b) = placeholder_rgb(artist);
     let r8 = (r * 255.0) as u8;
     let g8 = (g * 255.0) as u8;
     let b8 = (b * 255.0) as u8;
-    let mut data = vec![0u8; 200 * 200 * 3];
-    for i in 0..(200 * 200) {
-        data[i * 3] = r8;
-        data[i * 3 + 1] = g8;
-        data[i * 3 + 2] = b8;
-    }
-    let pixbuf = gdk_pixbuf::Pixbuf::from_mut_slice(
-        data,
-        gdk_pixbuf::Colorspace::Rgb,
-        false, 8, 200, 200,
-        200 * 3,
-    );
+    let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 200, 200)
+        .expect("valid pixbuf params");
+    // Pack RGB into u32 (0xRRGGBB00 — alpha byte ignored for non-alpha pixbuf)
+    let pixel: u32 = ((r8 as u32) << 24) | ((g8 as u32) << 16) | ((b8 as u32) << 8);
+    pixbuf.fill(pixel);
     gdk4::Texture::for_pixbuf(&pixbuf)
 }
 
