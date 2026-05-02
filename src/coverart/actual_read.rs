@@ -157,12 +157,13 @@ impl ActualRead {
     ) -> bool {
         let md5 = format!("{:x}", Md5::digest(data));
 
-        // Check CoverProvider cache — if same hash, skip
+        // Check CoverProvider cache — if same hash, emit path from cache and skip refetch
         if let Some(cached) = provider.get(album_name) {
             if cached.md5 == md5 {
                 log::debug!(
-                    "[actual_read] '{album_name}': albumart hash unchanged, skipping"
+                    "[actual_read] '{album_name}': albumart hash unchanged, emitting cached path"
                 );
+                self.emit_cover_path(album_name, &cached.md5, event_tx);
                 return true;
             }
         }
@@ -529,8 +530,8 @@ mod tests {
 
         let handled = ar.handle_albumart_data("TestAlbum", &data, &provider, &tx);
         assert!(handled, "Should handle albumart data");
-        // Channel should be empty — no emission for identical hash
-        assert!(rx.try_recv().is_err(), "No event should be emitted for identical hash");
+        // CoverPaths should be emitted for cached covers (path-based delivery)
+        assert!(rx.try_recv().is_ok(), "CoverPaths should be emitted for cached hash");
     }
 
     #[test]
