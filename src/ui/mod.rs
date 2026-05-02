@@ -564,17 +564,17 @@ impl App {
                                 a.set_text(da);
                             }
                             // Update cover — single Picture, always visible.
-                            // Placeholder = generated colored texture; cover = loaded image.
-                            // Same widget, same size — no toggle, no layout shift.
+                            // Composite key: artist||album (album name alone isn't unique)
+                            let key = crate::coverart::cover_key(artist, name);
                             if let Some(ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
                                 if let Some(pic) = ov.child().and_then(|c| c.downcast::<Picture>().ok()) {
-                                    if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
+                                    if let Some(p) = bind_cp.borrow().get(&key).and_then(|o| o.as_deref()) {
                                         pic.set_filename(Some(p));
                                     } else {
                                         let texture = placeholder_texture(artist);
                                         pic.set_paintable(Some(&texture));
                                     }
-                                    bind_cw.borrow_mut().insert(name.clone(), pic.clone());
+                                    bind_cw.borrow_mut().insert(key.clone(), pic.clone());
                                 }
                             }
                         }
@@ -1415,15 +1415,16 @@ impl App {
                 };
 
                 // Cover image (or hidden if no cover available)
+                let mg_key = crate::coverart::cover_key(&item_data.artist, &item_data.album);
                 if let Some(cover) = children.first().and_then(|c| c.clone().downcast::<Picture>().ok()) {
-                    if let Some(path) = mg_bind_cover.borrow().get(&item_data.album).and_then(|o| o.as_deref()) {
+                    if let Some(path) = mg_bind_cover.borrow().get(&mg_key).and_then(|o| o.as_deref()) {
                         cover.set_filename(Some(path));
                         cover.set_visible(true);
                     } else {
                         cover.set_visible(false);
                     }
                     // Register for async cover updates (CoverPaths/CoverRefreshed)
-                    mg_bind_cw.borrow_mut().insert(item_data.album.clone(), cover.clone());
+                    mg_bind_cw.borrow_mut().insert(mg_key.clone(), cover.clone());
                 }
 
                 // Album name label
@@ -2337,7 +2338,11 @@ impl App {
                                         pic.queue_draw();
                                     }
                                     // Also update now-playing cover if this is the current album
-                                    if fc_current_album.borrow().as_deref() == Some(album.as_str()) {
+                                    // Key is composite (artist||album), compare album-name suffix
+                                    let is_current = fc_current_album.borrow().as_deref()
+                                        .map(|a| album.ends_with(&format!("||{}", a)))
+                                        .unwrap_or(false);
+                                    if is_current {
                                         fc_np_cover.set_filename(Some(p));
                                         fc_np_cover.set_visible(true);
                                     }
@@ -2364,7 +2369,10 @@ impl App {
                                     pic.queue_draw();
                                 }
                                 // Also update now-playing cover if this is the current album
-                                if fc_current_album.borrow().as_deref() == Some(&album_id) {
+                                let is_current = fc_current_album.borrow().as_deref()
+                                    .map(|a| album_id.ends_with(&format!("||{}", a)))
+                                    .unwrap_or(false);
+                                if is_current {
                                     fc_np_cover.set_paintable(Some(&texture));
                                     fc_np_cover.set_visible(true);
                                 }

@@ -19,6 +19,7 @@ use crate::coverart::CoverProvider;
 use crate::coverart::CoverOnlineProvider;
 use crate::mpd::MpdAdapter;
 use crate::mpd::state_machine::MpdEvent;
+use crate::coverart::cover_key;
 
 /// Shorthand for the event sender type used by the MPD state machine.
 type EventSender = mpsc::SyncSender<MpdEvent>;
@@ -87,42 +88,42 @@ impl ActualRead {
             return;
         };
 
+        let key = cover_key(&artist, &album_name);
         log::debug!(
-            "[actual_read] Processing '{album_name}' ({} remaining)",
+            "[actual_read] Processing '{key}' ({} remaining)",
             self.queue.len()
         );
 
         // Step 1: Find album URIs (needed only for readpicture fallback).
-        // Don't early-return on failure — albumart works by album name alone.
         let maybe_uri = match adapter.find_album_uris(&album_name) {
             Ok(uris) => {
                 let uri = uris.first().cloned();
                 if uri.is_none() {
-                    log::info!("[actual_read] No URIs found for '{album_name}', readpicture will be skipped");
+                    log::info!("[actual_read] No URIs found for '{key}', readpicture will be skipped");
                 }
                 uri
             }
             Err(e) => {
-                log::info!("[actual_read] find_album_uris for '{album_name}' failed ({e}), readpicture will be skipped");
+                log::info!("[actual_read] find_album_uris for '{key}' failed ({e}), readpicture will be skipped");
                 None
             }
         };
 
         // Step 2: Primary — albumart
-        log::info!("[cover] '{album_name}': albumart={}, readpicture={}", caps.albumart, caps.readpicture);
+        log::info!("[cover] '{key}': albumart={}, readpicture={}", caps.albumart, caps.readpicture);
         if caps.albumart {
             match adapter.albumart(&album_name) {
                 Ok(Some(data)) => {
-                    log::info!("[cover] '{album_name}': albumart returned {} bytes", data.len());
-                    if self.handle_albumart_data(&album_name, &data, provider, event_tx) {
+                    log::info!("[cover] '{key}': albumart returned {} bytes", data.len());
+                    if self.handle_albumart_data(&key, &data, provider, event_tx) {
                         return;
                     }
                 }
                 Ok(None) => {
-                    log::info!("[cover] '{album_name}': albumart returned no data, trying readpicture");
+                    log::info!("[cover] '{key}': albumart returned no data, trying readpicture");
                 }
                 Err(e) => {
-                    log::info!("[cover] '{album_name}': albumart failed ({e}), trying readpicture");
+                    log::info!("[cover] '{key}': albumart failed ({e}), trying readpicture");
                 }
             }
         }
@@ -132,14 +133,14 @@ impl ActualRead {
             if let Some(ref uri) = maybe_uri {
                 match adapter.readpicture(uri) {
                     Ok(Some((data, mtime))) => {
-                        log::info!("[cover] '{album_name}': readpicture returned {} bytes", data.len());
-                        self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
+                        log::info!("[cover] '{key}': readpicture returned {} bytes", data.len());
+                        self.handle_readpicture_data(&key, &data, mtime, provider, event_tx);
                     }
                     Ok(None) => {
-                        log::info!("[cover] '{album_name}': albumart + readpicture both empty");
+                        log::info!("[cover] '{key}': albumart + readpicture both empty");
                     }
                     Err(e) => {
-                        log::info!("[cover] '{album_name}': readpicture failed ({e})");
+                        log::info!("[cover] '{key}': readpicture failed ({e})");
                     }
                 }
             }
