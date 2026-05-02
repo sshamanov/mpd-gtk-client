@@ -392,6 +392,8 @@ impl App {
                 header_label.set_halign(gtk4::Align::Start);
                 header_label.set_valign(gtk4::Align::Center);
                 header_label.set_size_request(200, 250);
+                header_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                header_label.set_lines(1);
                 header_label.set_css_classes(&["album-group-header"]);
                 header_label.set_visible(false);
                 container.append(&header_label);
