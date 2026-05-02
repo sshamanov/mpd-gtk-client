@@ -383,24 +383,27 @@ impl App {
                 let album_section = Box::new(Orientation::Vertical, 0);
                 album_section.set_visible(false);
 
-                let overlay = Overlay::new();
-                let cover_area = Box::new(Orientation::Vertical, 0);
-                cover_area.set_size_request(200, 200);
-
-                let placeholder = gtk4::DrawingArea::new();
-                placeholder.set_size_request(200, 200);
-                cover_area.append(&placeholder);
+                // Cover area: Overlay so cover_image stays always-visible underneath.
+                // Only the placeholder toggles on top — no layout shift when covers load.
+                let cover_overlay = Overlay::new();
+                cover_overlay.set_size_request(200, 200);
 
                 let cover_image = Picture::new();
                 cover_image.set_widget_name("cover-image");
                 cover_image.set_size_request(200, 200);
-                cover_image.set_halign(gtk4::Align::Center);
-                cover_image.set_valign(gtk4::Align::Center);
+                cover_image.set_halign(gtk4::Align::Fill);
+                cover_image.set_valign(gtk4::Align::Fill);
                 cover_image.set_content_fit(gtk4::ContentFit::ScaleDown);
-                cover_image.set_visible(false);
-                cover_area.append(&cover_image);
+                // Always visible — avoids layout shift when set_filename is called
+                cover_overlay.add_overlay(&cover_image);
 
-                overlay.set_child(Some(&cover_area));
+                let placeholder = gtk4::DrawingArea::new();
+                placeholder.set_size_request(200, 200);
+                // Placeholder sits on top, hides when cover is available
+                cover_overlay.add_overlay(&placeholder);
+
+                let overlay = Overlay::new();
+                overlay.set_child(Some(&cover_overlay));
 
                 // Hover buttons — album name read from overlay at click time
                 let tx_add = setup_tx.clone();
@@ -542,31 +545,30 @@ impl App {
                                 let da = if artist.is_empty() { "Unknown Artist" } else { artist.as_str() };
                                 a.set_text(da);
                             }
-                            // Update cover area
-                            if let Some(overlay) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
-                                if let Some(ca) = overlay.child().and_then(|c| c.downcast::<Box>().ok()) {
+                            // Update cover area — cover_overlay is an Overlay, not a Box
+                            if let Some(outer_ov) = section.first_child().and_then(|c| c.downcast::<Overlay>().ok()) {
+                                if let Some(ca) = outer_ov.child().and_then(|c| c.downcast::<Overlay>().ok()) {
                                     let has_cov = bind_cp.borrow().get(name).and_then(|o| o.as_deref()).is_some();
-                                    // Placeholder (first child of cover_area)
-                                    if let Some(pl) = ca.first_child().and_then(|c| c.downcast::<gtk4::DrawingArea>().ok()) {
+                                    // Cover image: first child of cover_overlay (always visible — no toggle)
+                                    if let Some(pic) = ca.first_child().and_then(|c| c.downcast::<Picture>().ok()) {
+                                        if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
+                                            pic.set_filename(Some(p));
+                                        } else {
+                                            pic.set_filename(None::<&str>);
+                                        }
+                                        // Register for async cover updates
+                                        bind_cw.borrow_mut().insert(name.clone(), pic.clone());
+                                    }
+                                    // Placeholder: second child of cover_overlay (toggles on top)
+                                    if let Some(pl) = ca.first_child()
+                                        .and_then(|c| c.next_sibling())
+                                        .and_then(|c| c.downcast::<gtk4::DrawingArea>().ok()) {
                                         pl.set_visible(!has_cov);
                                         let (rp, gp, bp) = (*pr, *pg, *pb);
                                         pl.set_draw_func(move |_area, cr, _w, _h| {
                                             cr.set_source_rgb(rp, gp, bp);
                                             let _ = cr.paint();
                                         });
-                                    }
-                                    // Cover image (second child of cover_area)
-                                    if let Some(pic) = ca.first_child()
-                                        .and_then(|c| c.next_sibling())
-                                        .and_then(|c| c.downcast::<Picture>().ok()) {
-                                        if let Some(p) = bind_cp.borrow().get(name).and_then(|o| o.as_deref()) {
-                                            pic.set_filename(Some(p));
-                                            pic.set_visible(true);
-                                        } else {
-                                            pic.set_visible(false);
-                                        }
-                                        // Register for async cover updates
-                                        bind_cw.borrow_mut().insert(name.clone(), pic.clone());
                                     }
                                 }
                             }
@@ -2294,7 +2296,6 @@ impl App {
                                     if let Some(pic) = widgets.get(album) {
                                         log::info!("[UI] cover update: '{album}' -> {p}");
                                         pic.set_filename(Some(p));
-                                        pic.set_visible(true);
                                         pic.queue_draw();
                                     } else {
                                         log::warn!("[UI] cover: no widget registered for '{album}'");
@@ -2313,7 +2314,6 @@ impl App {
                                 // Update album grid widget in-place (widget registry lookup)
                                 if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
                                     pic.set_paintable(Some(&texture));
-                                    pic.set_visible(true);
                                     pic.queue_draw();
                                 } else {
                                     log::warn!("[UI] cover refresh: no grid widget registered for '{album_id}'");
