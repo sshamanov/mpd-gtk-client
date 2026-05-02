@@ -246,6 +246,8 @@ enum MpdEvent {
 - If `idle` returns transient error (connection reset, timeout): fall back to 100ms `status` polling for 10 cycles (1 second), then retry `idle`.
 - If `idle` returns "unknown command" (MPD < 0.19 or idle disabled): fall back to 500ms polling permanently.
 
+**Status: NOT IMPLEMENTED — in-scope for V1 (epic 25).** Currently uses 500ms polling in `connected_loop` (line 548). Idle protocol would replace this with event-driven updates via `TcpStream::try_clone()` for thread-safe socket access.
+
 **Proven pattern:** dead connection detection via 3 consecutive `fetch_full_update()` failures → return from `connected_loop` → outer state machine triggers reconnect with exponential backoff.
 
 ## Architecture Decision Record: Cover Art Pipeline
@@ -1156,7 +1158,7 @@ The following contracts define the guarantees, invariants, and fault behavior fo
 - Folder Mode filesystem-order may interleave albums split across directories
 - `ByLastPlayed` sort requires tracking play history, which MPD provides via `playlistinfo` but not as a persistent per-album attribute
 
-**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** Album grid uses MPD-returned order with session-only manual reorder support (story 11-4). Folder mode uses filesystem order. User-selectable sort modes (ByArtist, ByYear, ByAlbumName) and the dedicated sort presenter module still need to be built for V1.
+**Status: REPLACED by Metadata Caching (epic 26).** The original ADR proposed a dedicated sort presenter module. Instead, the approach is to pull all album metadata (year, genre, format, artist, cover paths) into a local cache, similar to the cover art cache. Sorting and grouping then operate on the cached metadata without MPD round-trips. This supersedes the dedicated sort module approach. See epic 26 for details.
 
 ## Architecture Decision Record: Crate & Module Organization
 
