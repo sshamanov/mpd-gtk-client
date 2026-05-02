@@ -2370,27 +2370,26 @@ impl App {
                             let owned = data.to_vec();
                             let cursor = std::io::Cursor::new(owned);
                             if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_read(cursor) {
-                                let scaled = pixbuf.scale_simple(200, 200, gdk_pixbuf::InterpType::Bilinear)
-                                    .unwrap_or(pixbuf);
-                                let texture = gdk4::Texture::for_pixbuf(&scaled);
-                                // Update album grid widget in-place (widget registry lookup)
-                                if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
-                                    pic.set_paintable(Some(&texture));
-                                    pic.queue_draw();
-                                }
-                                // Also update mini-queue widget if registered
-                                if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
-                                    pic.set_paintable(Some(&texture));
-                                    pic.set_visible(true);
-                                    pic.queue_draw();
-                                }
-                                // Also update now-playing cover if this is the current album
-                                let is_current = fc_current_album.borrow().as_deref()
-                                    .map(|a| album_id.ends_with(&format!("||{}", a)))
-                                    .unwrap_or(false);
-                                if is_current {
-                                    fc_np_cover.set_paintable(Some(&texture));
-                                    fc_np_cover.set_visible(true);
+                                if let Some(scaled) = pixbuf.scale_simple(200, 200, gdk_pixbuf::InterpType::Bilinear) {
+                                    let texture = gdk4::Texture::for_pixbuf(&scaled);
+                                    if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
+                                        pic.set_paintable(Some(&texture));
+                                        pic.queue_draw();
+                                    }
+                                    if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
+                                        pic.set_paintable(Some(&texture));
+                                        pic.set_visible(true);
+                                        pic.queue_draw();
+                                    }
+                                    let is_current = fc_current_album.borrow().as_deref()
+                                        .map(|a| album_id.ends_with(&format!("||{}", a)))
+                                        .unwrap_or(false);
+                                    if is_current {
+                                        fc_np_cover.set_paintable(Some(&texture));
+                                        fc_np_cover.set_visible(true);
+                                    }
+                                } else {
+                                    log::warn!("[UI] cover refresh: scale_simple failed for '{album_id}', skipping");
                                 }
                             } else {
                                 log::warn!("[UI] cover refresh failed: couldn't decode image for '{album_id}'");
@@ -2429,8 +2428,9 @@ impl App {
                  #connection-indicator.error { background-color: #f44336; }
                  #connection-indicator.connecting { background-color: #FFC107; }
                  .album-cover-cell:selected { border: 2px solid @theme_selected_bg_color; }
-                 .album-cover-cell { min-height: 250px; min-width: 200px; max-height: 250px; max-width: 200px; }
-                 .album-cover-cell { min-height: 250px; min-width: 200px; max-height: 250px; max-width: 200px; }
+                 .album-cover-cell { min-height: 250px; min-width: 200px; max-height: 250px; }
+                 gridview { border-spacing: 0; }
+                 listitemwidget { padding: 0; margin: 0; }
                  .album-cover-hover-btn { opacity: 0; transition: opacity 150ms ease-in-out; min-width: 24px; min-height: 24px; padding: 2px; }
                  .album-cover-cell:hover .album-cover-hover-btn { opacity: 1; }
                  .album-group-header { font-weight: bold; font-size: 1.1em; padding: 4px 8px; }
@@ -2462,7 +2462,7 @@ impl App {
             gtk4::style_context_add_provider_for_display(
                 &gtk4::prelude::WidgetExt::display(&window),
                 &css,
-                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                gtk4::STYLE_PROVIDER_PRIORITY_USER,
             );
 
             // High contrast CSS support (accessibility)
