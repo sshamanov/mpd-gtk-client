@@ -40,6 +40,8 @@ pub enum MpdCommand {
     ListAlbumTracks(String),
     /// Send the MPD `close` command and exit the connected loop gracefully.
     Close,
+    /// Trigger MPD's `update` (rescan the music library).
+    Update,
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -522,6 +524,14 @@ fn connected_loop(
                     MpdCommand::Reconnect => {
                         log::info!("[MPD] received Reconnect command, restarting connection");
                         return;
+                    }
+                    MpdCommand::Update => {
+                        if let Err(e) = adapter.update_library() {
+                            log::error!("Update failed: {e}");
+                        } else {
+                            log::info!("[MPD] library update triggered, refreshing grid");
+                            let _ = event_tx.try_send(MpdEvent::LibraryChanged);
+                        }
                     }
                     MpdCommand::Close => {
                         log::info!("[MPD] received Close command, sending close to MPD");

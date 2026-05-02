@@ -484,6 +484,11 @@ impl MpdAdapter {
         Ok(())
     }
 
+    pub fn update_library(&mut self) -> Result<(), Error> {
+        self.send_command("update")?;
+        Ok(())
+    }
+
     pub fn seek(&mut self, position: i64) -> Result<(), Error> {
         self.send_command(&format!("seekcur {}", position))?;
         Ok(())

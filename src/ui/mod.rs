@@ -817,8 +817,19 @@ impl App {
             left_pane_box.append(&mode_content);
 
             // Album content: group bar + search + grid
-            album_content.append(&group_switcher);
-            album_content.append(&sort_dropdown);
+            let group_bar = gtk4::Box::new(Orientation::Horizontal, 4);
+            group_bar.set_halign(gtk4::Align::Center);
+            group_bar.append(&group_switcher);
+            group_bar.append(&sort_dropdown);
+            // Update library button
+            let update_btn = gtk4::Button::with_label("↻");
+            update_btn.set_tooltip_text(Some("Rescan MPD music library"));
+            let update_cmd = cmd_tx.clone();
+            update_btn.connect_clicked(move |_| {
+                let _ = update_cmd.send(MpdCommand::Update);
+            });
+            group_bar.append(&update_btn);
+            album_content.append(&group_bar);
 
             // Album search entry
             let search_entry = gtk4::SearchEntry::new();

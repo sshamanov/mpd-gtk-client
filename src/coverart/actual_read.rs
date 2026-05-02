@@ -92,17 +92,20 @@ impl ActualRead {
             self.queue.len()
         );
 
-        // Step 1: Find album URIs
-        let uris = match adapter.find_album_uris(&album_name) {
-            Ok(uris) => uris,
-            Err(e) => {
-                log::error!("[actual_read] find_album_uris failed for '{album_name}': {e}");
-                return;
+        // Step 1: Find album URIs (needed only for readpicture fallback).
+        // Don't early-return on failure — albumart works by album name alone.
+        let maybe_uri = match adapter.find_album_uris(&album_name) {
+            Ok(uris) => {
+                let uri = uris.first().cloned();
+                if uri.is_none() {
+                    log::info!("[actual_read] No URIs found for '{album_name}', readpicture will be skipped");
+                }
+                uri
             }
-        };
-        let Some(uri) = uris.first().cloned() else {
-            log::debug!("[actual_read] No URIs found for '{album_name}'");
-            return;
+            Err(e) => {
+                log::info!("[actual_read] find_album_uris for '{album_name}' failed ({e}), readpicture will be skipped");
+                None
+            }
         };
 
         // Step 2: Primary — albumart
@@ -124,18 +127,20 @@ impl ActualRead {
             }
         }
 
-        // Step 3: Fallback — readpicture
+        // Step 3: Fallback — readpicture (only if we found a URI)
         if caps.readpicture {
-            match adapter.readpicture(&uri) {
-                Ok(Some((data, mtime))) => {
-                    log::info!("[cover] '{album_name}': readpicture returned {} bytes", data.len());
-                    self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
-                }
-                Ok(None) => {
-                    log::info!("[cover] '{album_name}': albumart + readpicture both empty");
-                }
-                Err(e) => {
-                    log::info!("[cover] '{album_name}': readpicture failed ({e})");
+            if let Some(ref uri) = maybe_uri {
+                match adapter.readpicture(uri) {
+                    Ok(Some((data, mtime))) => {
+                        log::info!("[cover] '{album_name}': readpicture returned {} bytes", data.len());
+                        self.handle_readpicture_data(&album_name, &data, mtime, provider, event_tx);
+                    }
+                    Ok(None) => {
+                        log::info!("[cover] '{album_name}': albumart + readpicture both empty");
+                    }
+                    Err(e) => {
+                        log::info!("[cover] '{album_name}': readpicture failed ({e})");
+                    }
                 }
             }
         }
