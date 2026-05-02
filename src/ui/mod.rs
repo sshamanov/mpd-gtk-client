@@ -261,13 +261,15 @@ impl App {
         menubar.append_submenu(Some("_File"), &file_menu);
         menubar.append_submenu(Some("_View"), &view_menu);
         menubar.append_submenu(Some("_Help"), &help_menu);
-        application.set_menubar(Some(&menubar));
+        let app_menubar = menubar;
 
         // Mode switching actions — application.add_action will be called inside connect_activate
 
         let mpris_update_tx = self.mpris_update_tx.clone();
 
         application.connect_activate(move |window_app| {
+            // Set menubar after application is registered (avoids GTK critical warning)
+            window_app.set_menubar(Some(&app_menubar));
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
             let shutdown_app = window_app.clone();
             let cfg = Config::load();
@@ -1721,9 +1723,9 @@ impl App {
             let sv_cmd = cmd_tx.clone();
             let sv_timer = scroll_timer.clone();
             sv_adj.connect_value_changed(move |adj| {
-                // Cancel previous debounce timer
+                // Cancel previous debounce timer (catch panic: source may already be invalid)
                 if let Some(id) = sv_timer.take() {
-                    id.remove();
+                    let _ = std::panic::catch_unwind(|| id.remove());
                 }
                 // Start a new 300ms debounce timer; resets on each scroll event
                 let backing = sv_backing.clone();
