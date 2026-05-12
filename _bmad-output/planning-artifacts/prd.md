@@ -83,13 +83,13 @@ Config supports `[profiles.<name>]` sections. `--profile <name>` CLI flag. Auto-
 
 MPRIS v2.1 Player interface via `zbus` crate. D-Bus bus name `org.mpris.MediaPlayer2.mpdclient`. Player interface only (Play/Pause/Stop/Next/Previous/Seek/SetPosition + standard properties). **Disabled by default** — `[mpris] enabled = false` in config. Connect MPRIS method calls to existing MpdCommand channel — no new code paths.
 
-### libadwaita Integration (new)
+### libadwaita Integration
 
 Added `adw` crate dependency. Replaces:
 - Custom toast → `Adw.ToastOverlay`
 - Manual navigation stack → `Adw.NavigationView`
 - Responsive breakpoint CSS → `Adw.MultiLayoutView` + `Adw.BottomSheet`
-- Mode switch → `Adw.ViewSwitcher`
+- Mode switch → linked `ToggleButton`s (`.linked` CSS class) — replaced `Adw.ViewSwitcher` due to icon removal limitations
 
 Requires libadwaita >= 1.6 at runtime (included in GNOME runtime, available in all major distros).
 
@@ -104,7 +104,7 @@ See `_bmad-output/implementation-artifacts/deferred-work.md` for the full histor
 - ReadPictureProvider timestamp comparison edge cases on some MPD versions
 
 ### Tests
-11 integration tests with mock MPD server. Scoped test additions:
+17 integration tests with mock MPD server. Scoped test additions:
 - MPD idle protocol (idle/noidle handshake, socket clone behavior)
 - Cover art binary protocol (albumart/readpicture parsing, partial reads)
 - CoverProvider cache hit/miss/refresh

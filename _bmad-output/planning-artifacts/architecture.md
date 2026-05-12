@@ -342,9 +342,11 @@ UI thread: receives CoverRefreshed → decode bytes → GdkTexture → redraw wi
 - No GPU-side texture cache — covers are re-decoded when scrolled back into view
 - Cache size on disk bounded only by available space
 
-### Cover Art Image Pipeline (proposed 2026-05-06)
+### Cover Art Image Pipeline
 
-**Decision:** Offload all JPEG decoding and scaling from GTK/glycin to the `image` crate. GTK handles only GPU texture upload and display compositing. This eliminates the glycin sandbox overhead entirely.
+**Decision:** Offload all JPEG decoding and scaling from GTK/glycin to the `image` crate. GTK handles only GPU texture upload and display compositing via `gdk4::MemoryTexture`. This eliminates the glycin sandbox overhead entirely.
+
+**Status:** Committed design. The `image` crate is already compiled into the binary (jpeg/png/webp features) but unused. Implementation phases below.
 
 **Motivation:** The current pipeline routes all cover images through `gdk-pixbuf` → glycin, which spawns sandboxed `bwrap` subprocesses, communicates over D-Bus, and applies ICC color management. For album covers — which are universally RGB JPEGs that don't need color management — this machinery is pure overhead: 11–65ms per cold decode, sandbox lifecycle noise, and ICC conversion that the `strip_jpeg_icc()` function was added to work around.
 
@@ -390,7 +392,7 @@ Cache reads (bind callback):
 
 **Estimated performance:**
 
-| Metric | glycin (current) | image crate (proposed) |
+| Metric | glycin (current) | image crate (committed) |
 |--------|------------|-------------------|
 | Cold decode | 11–65ms | 3–10ms |
 | Warm decode | 3–10ms | 2–6ms |
@@ -434,13 +436,15 @@ The following patterns were validated against a real MPD instance and are incorp
 
 ### Issues (2026-05-06)
 
-The original design was never fully realized — the codebase uses `pad_groups()` with `AlbumGridItem::Filler` items directly in the ListModel, not a separate `LayoutService`. The filler-in-model approach has proven unfixable for resize due to allocation propagation lag (see debug-session-2026-05-06.md).
+The original design was never fully realized — the codebase uses `pad_groups()` with `AlbumGridItem::Filler` items directly in the ListModel, not a separate `LayoutService`. The filler-in-model approach has proven unfixable for resize due to allocation propagation lag. **Superseded by the GtkLayout coordinate-based grid ADR (§441).**
 
 ---
 
-## Architecture Decision Record: Grid Layout — coordinate-based album grid (proposed 2026-05-06, not yet implemented)
+## Architecture Decision Record: Grid Layout — coordinate-based album grid
 
 **Decision:** Replace the single-GridView-with-fillers architecture with a flat `GtkLayout` where all album cover cells and group captions are positioned by pure Rust coordinate math. No GridView, no ListModel, no factories, no bind/unbind callbacks, no fillers.
+
+**Status:** Committed design. Implementation pending — replaces current GridView+fillers approach documented as broken (see Issues §437).
 
 ### Motivation
 
@@ -456,7 +460,7 @@ Two clean alternatives exist:
 
 **Option B: Coordinate math (GtkLayout).**
 
-### Widget tree (proposed)
+### Widget tree
 
 ```
 Window → Box → Paned (left | right)
@@ -570,7 +574,93 @@ Widget overhead is negligible against the 200MB budget. Cover textures dominate 
 5. **Wire click/hover/context menu**: connect signals on `AlbumCoverCell` widgets as before — they're GTK widgets with full event support.
 6. **Delete old machinery**: `pad_groups`, `batch_populate`, filler system, ListModel boilerplate, resize signal handlers, widget registry.
 
-## Architecture Decision Record: Search Architecture
+## Architecture Decision Record: AlbumCoverCell Custom Widget
+
+**Decision:** Grid cells use a single custom `GtkWidget` subclass (`AlbumCoverCell`) with `HEIGHT_FOR_WIDTH` sizing instead of nested Box containers.
+
+### Rationale
+
+The original 5-layer widget nesting (`Widget → Box → Widget → Overlay → Picture`) caused GTK internal sibling-list corruption during factory recycling (`gtk_widget_insert_after: previous_sibling parent mismatch`). A single custom widget subclass avoids all nesting — Picture and labels are direct children laid out via `size_allocate`.
+
+**Pattern (from plattenalbum):**
+- `request_mode()` returns `HeightForWidth` — forces square cells
+- `measure()` reports explicit natural size (200×200 horizontal, 250×250 vertical)
+- Child widgets (Picture, labels, group captions, year badge) positioned in `size_allocate()`
+- Stores `album_key` in internal `RefCell<String>` for context menu / DnD access
+- Hover buttons created in `constructed()`, wired after `cmd_tx` set via `new()`
+
+### What This Replaces
+
+~130 lines of nested Box/Overlay/Picture construction in factory setup, replaced by ~5 lines: `let cell = AlbumCoverCell::new(); cell.set_album(...)`.
+
+### GTK4 GridView Cell Sizing Rules (from debug validation)
+
+These rules were discovered through debugging the height-jump-to-1200px issue:
+
+1. **`max-height` and `max-width` are NOT valid GTK4 CSS properties** — silently ignored by the GTK4 CSS parser. Only `min-height` and `min-width` work.
+2. **`set_size_request(w, h)` sets minimum, not natural size** — GridView may still overallocate.
+3. **Every GridView cell widget MUST override `WidgetImpl::measure()`** to report explicit natural width/height. Without it, natural size defaults to 0 and GridView gives cells all available width.
+4. **`set_can_shrink(true)` on Picture** allows GTK to allocate less than the texture's natural size — required for cover images that may report larger dimensions than the cell.
+5. **`ContentFit::ScaleDown`** preferred over `Contain` — prevents upscaling small covers.
+6. **CSS `min-height`/`min-width` are safety floors only** — not allocation targets.
+
+## Architecture Decision Record: Atomic Model Population (splice)
+
+**Decision:** Populate ListStore models in a single `model.splice(0, n_items, &all_new_items)` call rather than incrementally via `idle_add_local` batches.
+
+### Rationale
+
+Incremental population (16 items per idle cycle) causes multiple sequential GridView layout passes. Each pass sees different model content → different column counts → stepped height growth (250→1200px). The gradual stepped growth exactly matched the batch cadence.
+
+With `splice()`, all items arrive in one atomic operation → one `items-changed` signal → one layout pass. No generation counter needed. No stale cancellation needed.
+
+### Proven Pattern
+
+```rust
+fn batch_populate(model: &ListStore, items: &[T]) {
+    let new_items: Vec<StringObject> = (0..items.len())
+        .map(|i| StringObject::new(&i.to_string()))
+        .collect();
+    model.splice(0, model.n_items(), &new_items);
+}
+```
+
+One signal, one layout pass, deterministic column count.
+
+## Architecture Decision Record: MPD Cover Fetch Optimizations
+
+**Decision:** Two MPD protocol optimizations for cover art fetching.
+
+### albumart_by_uri saves one round-trip
+
+`albumart(album_name)` calls `find_album_uris()` + `albumart <uri> 0` = 2 MPD round-trips. `albumart_by_uri(uri)` skips the find when the URI is already known from `ActualRead.process_one()` = 1 round-trip. `ActualRead` calls `find_album_uris()` once, caches the result, and passes the URI to `albumart_by_uri()`.
+
+### Reuse first chunk from initial offset-0 response
+
+The first `albumart <uri> 0` request returns both the size header AND the first binary chunk. Only `parse_albumart_size()` was called on the response — the binary data was discarded, requiring a re-request at offset 0. `readpicture` correctly extracted the first chunk. `albumart` should do the same.
+
+### readpicture MPD version check: 0.22, not 0.24
+
+`readpicture` was added in MPD 0.22, not 0.24. The version check `self.minor >= 24` incorrectly disables readpicture for MPD 0.22 and 0.23. Fix: change to `self.minor >= 22`.
+
+### MPD "Conflicting group" error
+
+MPD supports only a single `group` keyword per `list` command. Multiple group keywords (`list album group Album group AlbumArtist group Date group Genre`) produce ACK `{list} Conflicting group`. Fix: split into separate queries merged locally by album name via HashMap.
+
+## Architecture Decision Record: Now-Playing Consolidation
+
+**Decision:** Single function handles now-playing updates: write SharedState → update all UI widgets → forward to MPRIS. Previously three separate code paths handled state update, cover update, and MPRIS emission independently.
+
+### Key Changes
+
+- **Single entry point**: `update_now_playing(PlaybackUpdate)` — writes `SharedState.current`, updates all GTK labels/cover/seekbar, forwards to MPRIS emitter
+- **Cover is independent from playback metadata**: `CoverPaths`/`CoverRefreshed` handler updates `np_cover` directly, not through `handle_now_playing`. Cover arrival doesn't re-trigger the full now-playing update.
+- **Year normalized to year only**: `normalize_year()` splits on `-` to extract year from full dates like "2024-03-15"
+- **Year displayed inline with artist**: "Artist · 2024" with middle-dot separator, saving vertical space
+
+### Status
+
+Implementation deferred to next story. ADR documented and merged into architecture.
 
 **Decision:** Single omnibox search bar (Chrome-style) with off-thread full-text matching across all metadata fields, 150ms input debounce, immediate visual feedback on keystroke. Artist/album/year/genre results uncapped; track results hard-capped at 100. No dropdowns, rails, or separate search UI elements.
 
@@ -996,30 +1086,44 @@ last_profile = "local"
 
 ## Architecture Decision Record: Concurrency & Threading Model
 
-**Decision:** Two dedicated threads (MPD IO, compute worker) communicating with the GTK main loop via typed channels, with minimal shared mutable state behind `Arc<RwLock<>>`.
+**Decision:** Three Kingdoms thread architecture — MPD connections (separated by purpose), GTK UI (display only, zero computation), and Computation workers (offloaded from both). Six threads total, each with a single responsibility. The authoritative specification is in Consolidated Refinements §3 (Thread Model).
+
+**Note (2026-05-12):** This ADR's original "compute worker" (combined cover+search on one priority queue) has been superseded by the 6-thread model in §2071-2148. The principles below remain valid; the thread count and responsibilities are updated in the Consolidated Refinements.
+
+### Design Principles
+
+**Three Kingdoms:**
+
+| Kingdom | Threads | Rule |
+|---------|---------|------|
+| **MPD** | MPD IO, MPD Cover, MPD Metadata | Separate TCP connections per purpose. Command/status on IO — never blocked by binary cover data or list queries. |
+| **GTK** | GTK main | Display only. No computation, no blocking I/O, no JPEG decode, no search index. Receives processed data via channels, paints widgets. |
+| **Computation** | Cover Proc, Search worker | Everything expensive offloaded from both MPD and GTK. JPEG decode, MD5 hash, disk cache, search index build/query, relevance scoring. |
+
+**Speed principles:**
+- Thread separation must reduce latency, never add it
+- Channels carry pre-processed data — no serialization/deserialization in the hot path
+- MPD command/status path must be uncontended (no binary cover data, no list queries on the same connection)
+- GTK main thread never blocks — all work that could take >1ms runs off-thread
+- Cover Proc receives raw bytes, returns GdkTexture-ready RGBA — GTK does zero-copy GPU upload only
 
 ### Key Details
 
-- **Thread topology:**
-  - **GTK main loop thread** — UI rendering, event handling, presenter projections (always runs on the main thread per GTK4 requirements)
-  - **MPD IO thread** — TCP stream read/write, idle loop, reconnection state machine. Communicates via `mpsc::Receiver<MpdCommand>` (inbound) and `mpsc::Sender<MpdEvent>` (outbound to main thread)
-  - **Compute worker** — Cover art fetch/decode/image processing and search query execution on a shared priority queue. Cover art has priority (visible items first); search yields every 5 cover jobs. Communicates via priority job queue (inbound) and typed result channels (outbound). Replaces dedicated search thread and cover art thread pool from earlier design — see Elicitation-Driven Refinements → Thread Model.
+- **Thread topology:** 6 threads as specified in Consolidated Refinements §3 (§2071-2148)
 - **Synchronization primitives:**
-  - `Arc<Mutex<QueueStore>>` — guarded by the main thread's event loop; all mutations happen on the main thread in response to MPD events or user actions
-  - `Arc<RwLock<SessionCache>>` — read-heavy cover art cache; multiple threads read, only cover art thread pool writes
-  - `Arc<AtomicBool>` — connection status flag, cancellation tokens for background operations
+  - `Arc<RwLock<AppState>>` — read by GTK widgets, written by `reduce()` on GTK main thread
+  - `Arc<AtomicBool>` — `ShuttingDown` flag, connection status
   - All other state is single-threaded on the main thread (config, browsing state, drag state)
-- **Channel types:** `mpsc` for multi-producer streams (MPD events, toast notifications), `oneshot` for request-response (search queries, cover art lookups)
-- **No shared mutable state across threads** beyond the explicitly listed caches — prefer message passing over locks
-- **Deadlock prevention:** lock ordering established (SessionCache before QueueStore); no nested lock acquisitions; all locks held for <1ms
+- **Channel types:** `mpsc` for event streams, `mpsc::sync_channel` for backpressure on binary data
+- **No shared mutable state across threads** beyond the explicitly listed references — prefer message passing over locks
+- **Deadlock prevention:** no nested lock acquisitions; all locks held for <1ms
 
 ### Explicit Trade-offs Accepted
 
-- Three-thread architecture is heavier than a single-threaded async approach (~1MB stack per thread)
-- Thread pool for cover art complicates cancellation (in-flight HTTP request can't be aborted cheaply)
-- Arc<Mutex<>> on QueueStore is a contention point during rapid MPD updates (mitigated by event batching)
+- 6 threads × ~2MB stack = ~12MB thread overhead — acceptable against 200MB budget
+- Multiple MPD connections = 3 TCP sockets to the same host — MPD handles this routinely
 - Channel backpressure must be explicitly managed — an overwhelmed main thread can't "drop" GTK events
-- **Future migration path:** If state-to-widget binding complexity grows (multiple widgets observing the same state), migrate `SharedState` to a `glib::Object` subclass with `ParamSpec` properties. This enables GTK4's native `bind_property()` cross-thread binding, eliminating manual `idle_add` wiring. Out of scope — the channel approach is simpler and sufficient for the current widget count.
+- **Future migration path:** If state-to-widget binding complexity grows, migrate `SharedState` to a `glib::Object` subclass with `ParamSpec` properties for GTK4's native `bind_property()`. Out of scope — channels are simpler and sufficient.
 
 ## Architecture Decision Record: Async Runtime Decision
 
@@ -2068,77 +2172,97 @@ The following represent the final state of all pattern refinements. **Where thes
 - **Expected vs. exceptional outcomes:** Expected outcomes (cover not found, search no results, album empty) are handled locally by calling code — return `Option` or `Result::Ok(None)`, never emit a Toast. Exceptional conditions (network timeout, parse failure, rate limit) emit `AppEvent::Toast`. Rule of thumb: if you'd `match` on it in normal flow, it's expected; if you'd `unwrap()` in a prototype, it's exceptional.
 - **Any thread can emit `AppEvent::Toast`** — MPD thread (connection errors), Cover Proc (decode failures), Search worker (index corruption), GTK thread (user action confirmation). All go through the same channel, the same `reduce()`, the same notification routing.
 
-**3. Thread Model**
+**3. Thread Model (Authoritative — supersedes Concurrency ADR §997)**
+
+**Design principle — Three Kingdoms:** MPD connections separated by purpose (command/status never blocked by binary data). GTK does display only — zero computation, zero blocking I/O. Computation offloaded from both MPD and GTK. Thread separation must reduce latency, never add it.
 
 **3a. Thread Topology**
 
 ```
-                 ┌──────────────────────────────────────────────┐
-                 │            GTK main thread                    │
-                 │  AppEvent → reduce(AppState, AppEvent)        │
-                 │  Shows in-app toast overlay from toast_queue  │
-                 │  No blocking I/O, no decode, no model builds  │
-                 │  NO D-Bus, NO desktop notifications           │
-                 └────┬──────┬──────┬──────┬────────────────────┘
-                      │      │      │      │
-              mpsc channels (events/results)
-                      │      │      │      │
-                 ┌────┴──┐ ┌┴─────┐ ┌┴────┐ ┌┴──────────────┐ ┌┴────────────────┐
-                 │ MPD   │ │ MPD  │ │Cover│ │  Search       │ │Notification    │
-                 │ IO    │ │Cover │ │Proc │ │  Worker       │ │Router          │
-                 │(pers.)│ │(tmp) │ │     │ │               │ │(lightweight)   │
-                 │ idle  │ │album-│ │MD5  │ │ index rebuild │ │ reads toast     │
-                 │ cmds  │ │art   │ │dec  │ │ query exec    │ │ events, fires   │
-                 │ state │ │read  │ │cach │ │ rank & filter │ │ D-Bus notifs    │
-                 └───────┘ └──────┘ └─────┘ └───────────────┘ └─────────────────┘
+            ┌────────────────────────────────────────────────────┐
+            │                  GTK main thread                    │
+            │    AppEvent → reduce(AppState, AppEvent)            │
+            │    Shows in-app toast overlay from toast_queue      │
+            │    No blocking I/O, no decode, no search, no hash   │
+            │    NO D-Bus, NO desktop notifications               │
+            └──────┬───────┬────────┬────────┬───────────────────┘
+                   │       │        │        │
+           mpsc channels (events/results — pre-processed data)
+                   │       │        │        │
+    ┌──────────────┴─┐ ┌──┴──────┐ ┌┴──────┐ ┌┴────────────┐ ┌──┴──────────────┐
+    │ MPD IO         │ │MPD Cover│ │Cover  │ │ Search      │ │Notification    │
+    │ (persistent)   │ │(on-dem.)│ │Proc   │ │ Worker      │ │Router          │
+    │                │ │         │ │       │ │             │ │(lightweight)   │
+    │ idle loop      │ │albumart │ │JPEG→  │ │ index build │ │ reads toast     │
+    │ command disp.  │ │readpic  │ │RGBA   │ │ query exec  │ │ events, fires   │
+    │ status/queue   │ │raw bytes│ │MD5    │ │ rank & cap  │ │ D-Bus notifs    │
+    │ NEVER blocked  │ │→Cover  │ │cache  │ │             │ │                 │
+    │ by binary data │ │Proc    │ │write  │ │             │ │                 │
+    └────────────────┘ └─────────┘ └───────┘ └─────────────┘ └─────────────────┘
+         MPD Kingdom                  Computation Kingdom
+    (separate TCP connections)    (offloaded from MPD & GTK)
 ```
 
 **6 threads total:**
 
-| Thread | Role | Type | Communication |
-|--------|------|------|---------------|
-| **GTK main** | UI rendering, `reduce()`, in-app toast overlay | Single-threaded per GTK4 | Receives `AppEvent` via channel. NO D-Bus. |
-| **MPD IO** | Idle loop, command dispatch, status, queue | Persistent connection | `mpsc::Sender<MpdCommand>` in, `mpsc::Sender<AppEvent>` out |
-| **MPD Cover** | `albumart`/`readpicture` binary fetch | Created on demand, dropped when idle | Receives cover URIs via channel, sends raw bytes to Cover Proc |
-| **Cover Proc** | Decode bytes → pixbuf, MD5 hash, disk cache write, thumbnail | Persistent worker | Receives raw bytes, emits `AppEvent::CoverRefreshed` |
-| **Search** | Index rebuild, query execution, ranking | Persistent worker | Receives search/index commands, emits `AppEvent::SearchResults` |
-| **NotificationRouter** | Reads Toast events, fires D-Bus desktop notifications | Lightweight, on-demand | Receives cloned `AppEvent::Toast` via channel receiver |
+| Thread | Kingdom | Role | Type | Communication |
+|--------|---------|------|------|---------------|
+| **GTK main** | GTK | UI rendering, `reduce()`, in-app toast overlay | Single-threaded per GTK4 | Receives `AppEvent` via channel. NO D-Bus. |
+| **MPD IO** | MPD | Idle loop, command dispatch, status, queue | Persistent connection | `mpsc::Sender<MpdCommand>` in, `mpsc::Sender<AppEvent>` out |
+| **MPD Cover** | MPD | `albumart`/`readpicture` binary fetch | On-demand, 30s idle timeout | Receives cover URIs via channel, sends raw bytes to Cover Proc |
+| **Cover Proc** | Computation | JPEG decode → RGBA, MD5 hash, disk cache write | Persistent worker | Receives raw bytes, emits `AppEvent::CoverRefreshed` |
+| **Search** | Computation | Index rebuild, query execution, ranking | Persistent worker | Receives search/index commands, emits `AppEvent::SearchResults` |
+| **NotificationRouter** | Computation | Reads Toast events, fires D-Bus desktop notifications | Lightweight, on-demand | Receives cloned `AppEvent::Toast` via channel receiver |
 
 **3b. Thread Responsibilities**
 
 **MPD IO thread (1 thread, 1 connection):**
-- Runs the idle loop. Only MPD protocol commands and responses.
-- Never decodes images, never writes to disk, never touches `AppState`.
-- Emits `MpdEvent` (state, queue, playlist, album data) via channel.
-- Cover art handling: on receiving `FetchCovers` command, sends the `albumart`/`readpicture` MPD commands, reads raw binary, forwards bytes to the MPD Cover thread via a dedicated channel. The MPD IO thread never decodes or processes cover data — it only ships raw bytes off-thread.
+- Runs the idle loop. Only MPD protocol commands and responses (status, playlistinfo, list, add, play, etc.).
+- Connection dedicated to command/status path — never blocked by binary cover data.
+- Never decodes images, never computes hashes, never writes to disk, never touches `AppState`.
+- Emits `AppEvent` (StateChanged, Queue, Albums, AlbumsGrouped) via channel.
+- Cover art handling: on receiving `FetchCovers` command, forwards `(artist, album, uri)` tuples to the MPD Cover thread via channel. The MPD IO thread never sends `albumart`/`readpicture` itself.
 
 **MPD Cover thread (0-1, created on demand):**
-- Opens a separate MPD connection for binary cover data. No idle loop, no state tracking.
-- Receives `(uri, offset)` pairs, sends `albumart <uri> <offset>` on its socket, reads binary response, forwards to Cover Proc.
-- Connection is created when covers need fetching, dropped after a configurable idle timeout (30s of no work).
-- If the main MPD connection gets a new epoch (reconnect), this thread's connection is also dropped and recreated — stale connection data is useless.
+- Opens a separate MPD TCP connection for binary cover data. No idle loop, no state tracking.
+- Receives `(artist, album, uri)` tuples, sends `albumart <uri> <offset>` on its socket, reads binary response in offset-loop, forwards raw JPEG bytes to Cover Proc.
+- Falls back to `readpicture <uri>` if `albumart` returns error 50 (no embedded art).
+- Connection created when covers need fetching, dropped after 30s idle timeout.
+- If main MPD connection reconnects (new epoch), this thread's connection is also dropped and recreated.
 
 **Cover Proc worker (1 thread):**
-- Receives raw binary cover data.
-- Decodes via `gdk-pixbuf` or `image` crate. Computes MD5 hash. Compares to cache hash.
-- Writes to disk cache if new/different. Emits `AppEvent::CoverRefreshed(id, Vec<u8>)`.
+- Receives raw binary JPEG data from MPD Cover thread.
+- Decodes via `image` crate (see Cover Art Image Pipeline ADR §345). Computes MD5 hash. Compares to cache hash.
+- If new/different: writes JPEG to disk cache, emits `AppEvent::CoverRefreshed(id, RGBA_bytes)`.
+- RGBA bytes pre-scaled to 200×200 (Lanczos3) — GTK does zero-copy GPU upload only.
 - No MPD protocol knowledge. No GTK widget access. Filesystem access for cache only.
 
 **Search worker (1 thread):**
 - Owns the search index. Rebuilds on library change events.
-- Receives search queries, runs full-text match, computes relevance scores, caps results.
-- Emits `AppEvent::SearchResults`.
+- Receives search queries, runs full-text match, computes relevance scores, caps results at 100 tracks.
+- Emits `AppEvent::SearchResults(Vec<SearchResult>)`.
 - No MPD protocol knowledge. No GTK access.
 
 **NotificationRouter (lightweight, on-demand):**
 - Spawned as a minimal thread with a cloned receiver for `AppEvent::Toast`.
 - Receives `Toast` events. Checks `[notifications] mode` setting.
-- If mode is `"desktop"` or `"both"`: fires desktop notification via D-Bus (org.freedesktop.Notifications).
-- If mode is `"toast"` or `"both"`: does nothing — the GTK thread handles in-app toasts independently.
-- No GTK dependency. No widget access. Filesystem/dependencies: only if D-Bus (`zbus`) is linked.
-- Falls back silently to no-op if D-Bus session bus is unavailable or MPRIS is not enabled.
+- If mode is `"desktop"` or `"both"`: fires desktop notification via D-Bus.
+- If mode is `"toast"` or `"both"`: does nothing — GTK thread handles in-app toasts independently.
+- No GTK dependency. Falls back silently to no-op if D-Bus is unavailable.
 
-**3c. Shutdown Coordination**
+**3c. MPD Connection Architecture**
+
+Three separate TCP connections to the same MPD host, each for a single purpose:
+
+| Connection | Thread | Purpose | Contention |
+|-----------|--------|---------|------------|
+| Command/Status | MPD IO | `status`, `currentsong`, `playlistinfo`, `add`, `play`, `list`, `idle` | Never blocked |
+| Cover binary | MPD Cover | `albumart <uri> <offset>`, `readpicture <uri> <offset>` | Binary data only |
+| Metadata (future) | MPD Metadata | `list album group ...`, `lsinfo`, bulk queries | Never blocks commands |
+
+The command/status connection is the fast path — it must never wait on binary cover transfers or large list queries. Each connection is a separate TCP socket to the same MPD instance. MPD handles multiple concurrent connections routinely.
+
+**3d. Shutdown Coordination**
 
 All workers check a shared `ShuttingDown` flag (`AtomicBool`). When set:
 - MPD IO thread: exits idle loop, closes socket, terminates.

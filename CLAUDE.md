@@ -34,7 +34,7 @@ No async runtime — `std::thread` over tokio (4.2MB vs 15MB binary).
 
 ## Development Status
 
-- **Phase**: Initial release implementation complete — all epics done
+- **Phase**: Initial release — epics 0-24 done, epics 25-30 scoped/backlog
 - **Tests**: 17 integration tests with mock MPD server (`cargo test`)
 - **BMad**: installed for project management (`_bmad/` directory)
 
