@@ -5,4 +5,5 @@ pub mod coverart;
 pub mod search;
 pub mod config;
 pub mod errors;
+pub mod metadata;
 

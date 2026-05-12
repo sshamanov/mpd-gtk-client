@@ -169,11 +169,11 @@ development_status:
   epic-24: done
   24-1-user-selectable-sort-modes: done
 
-  epic-25: backlog
-  25-1-mpd-idle-protocol: backlog
+  epic-25: done
+  25-1-mpd-idle-protocol: done
 
-  epic-26: backlog
-  26-1-metadata-caching: backlog
+  epic-26: done
+  26-1-metadata-caching: done
 
   epic-28: backlog
   28-1-mpd-cover-thread: backlog

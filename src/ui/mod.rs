@@ -4,7 +4,7 @@ pub mod widgets;
 
 use crate::ui::widgets::AlbumCoverCell;
 use crate::config::Config;
-use crate::mpd::state_machine::{MpdCommand, MpdEvent, PlaybackUpdate};
+use crate::mpd::state_machine::{CommandSender, MpdCommand, MpdEvent, PlaybackUpdate};
 use crate::mpd::AlbumMeta;
 use crate::search::SearchIndex;
 use crate::state::SharedState;
@@ -72,7 +72,7 @@ fn rebuild_mini_fixed(
     cover_paths: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
     cover_widgets: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>>,
     current_album: &Option<String>,
-    cmd_tx: &std::sync::mpsc::Sender<MpdCommand>,
+    cmd_tx: &CommandSender,
     viewport_width: i32,
 ) -> Vec<MiniCell> {
     let mut cells = Vec::new();
@@ -429,19 +429,21 @@ const HC_CSS: &str = "\
 pub struct App {
     state: SharedState,
     event_rx: Arc<Mutex<mpsc::Receiver<MpdEvent>>>,
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
     conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
     /// Sender for MPRIS PropertiesChanged signal emissions (drops unused when !mpris feature).
     mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
+    metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
 }
 
 impl App {
     pub fn new(
         state: SharedState,
         event_rx: mpsc::Receiver<MpdEvent>,
-        cmd_tx: mpsc::Sender<MpdCommand>,
+        cmd_tx: CommandSender,
         conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
         mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
+        metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     ) -> Self {
         Self {
             state,
@@ -449,6 +451,7 @@ impl App {
             cmd_tx,
             conn_params,
             mpris_update_tx,
+            metadata_cache,
         }
     }
 
@@ -477,6 +480,7 @@ impl App {
         // Mode switching actions
 
         let mpris_update_tx = self.mpris_update_tx.clone();
+        let metadata_cache = self.metadata_cache.clone();
 
         application.connect_activate(move |window_app| {
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
@@ -2049,6 +2053,7 @@ impl App {
             let fc_queue_popover = queue_popover.clone();
             let fc_ids = item_ids_w.clone();
             let fc_si = search_index.clone();
+            let fc_mc = metadata_cache.clone();
             let fc_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
             let fc_ev_cover_widgets = cover_widgets.clone();
@@ -2461,14 +2466,18 @@ impl App {
                                 let items: Vec<AlbumGridItem> = results.iter()
                                     .enumerate()
                                     .map(|(i, (artist, name))| {
+                                        let year = fc_mc.get(artist, name)
+                                            .and_then(|m| m.year.clone());
+                                        let year_badge = year.as_deref()
+                                            .and_then(|y_str| format_year_badge(Some(y_str)));
                                         AlbumGridItem::Album {
                                             artist: artist.clone(),
                                             name: name.clone(),
                                             album_id: format!("search-{i}"),
-                                            year: None,
+                                            year,
                                             group_label: None,
                                             caption: None,
-                                            year_badge: None,
+                                            year_badge,
                                         }
                                     })
                                     .collect();

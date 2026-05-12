@@ -7,12 +7,11 @@
 //! ratio — pattern from plattenalbum's AlbumCover.do_measure returning
 //! (for_size, for_size, -1, -1).
 
-use crate::mpd::state_machine::MpdCommand;
+use crate::mpd::state_machine::{CommandSender, MpdCommand};
 use glib::prelude::*;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use std::cell::RefCell;
-use std::sync::mpsc;
 
 mod square_cover_imp {
     use super::*;
@@ -111,7 +110,7 @@ mod imp {
 
     #[derive(Default)]
     pub struct AlbumCoverCell {
-        pub cmd_tx: RefCell<Option<mpsc::Sender<MpdCommand>>>,
+        pub cmd_tx: RefCell<Option<CommandSender>>,
         pub album_key: RefCell<String>,
         pub album_section: RefCell<Option<gtk4::Box>>,
         pub cover_picture: RefCell<Option<gtk4::Picture>>,
@@ -263,7 +262,7 @@ glib::wrapper! {
 }
 
 impl AlbumCoverCell {
-    pub fn new(cmd_tx: mpsc::Sender<MpdCommand>) -> Self {
+    pub fn new(cmd_tx: CommandSender) -> Self {
         let obj: Self = glib::Object::new();
         obj.imp().cmd_tx.replace(Some(cmd_tx));
         obj.wire_buttons();

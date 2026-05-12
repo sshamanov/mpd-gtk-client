@@ -18,6 +18,8 @@ pub struct MockMpdServer {
     received: Arc<Mutex<Vec<String>>>,
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    idle_subsystems: Arc<Mutex<Vec<String>>>,
+    idle_unknown_cmd: Arc<AtomicBool>,
 }
 
 #[doc(hidden)]
@@ -29,6 +31,11 @@ impl MockMpdServer {
         let received_clone = received.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+
+        let idle_subsystems_clone = Arc::new(Mutex::new(vec!["player".to_string()]));
+        let idle_for_client = idle_subsystems_clone.clone();
+        let idle_unknown_cmd = Arc::new(AtomicBool::new(false));
+        let idle_unknown_for_client = idle_unknown_cmd.clone();
 
         let handle = thread::spawn(move || {
             listener
@@ -44,7 +51,7 @@ impl MockMpdServer {
                             eprintln!("MockMpdServer: set_nonblocking(false) failed: {e}");
                             continue;
                         }
-                        handle_client(stream, &received_clone);
+                        handle_client(stream, &received_clone, &idle_for_client, &idle_unknown_for_client);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(std::time::Duration::from_millis(50));
@@ -62,11 +69,25 @@ impl MockMpdServer {
             received,
             handle: Some(handle),
             stop,
+            idle_subsystems: idle_subsystems_clone,
+            idle_unknown_cmd,
         }
     }
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// Set the subsystems that the mock returns when `noidle` is sent.
+    /// Defaults to `["player"]`.
+    /// When enabled, the mock returns "unknown command" for the `idle` command
+    /// to simulate MPD < 0.19.
+    pub fn set_idle_unknown_command(&self, enabled: bool) {
+        self.idle_unknown_cmd.store(enabled, Ordering::Release);
+    }
+
+    pub fn set_idle_subsystems(&self, subsystems: Vec<String>) {
+        *self.idle_subsystems.lock().unwrap() = subsystems;
     }
 
     pub fn assert_received(&self, cmd: &str) {
@@ -93,54 +114,98 @@ impl Drop for MockMpdServer {
     }
 }
 
-fn handle_client(stream: TcpStream, received: &Arc<Mutex<Vec<String>>>) {
-    let reader = BufReader::new(stream.try_clone().expect("Failed to clone stream"));
+fn handle_client(
+    stream: TcpStream,
+    received: &Arc<Mutex<Vec<String>>>,
+    idle_subsystems: &Arc<Mutex<Vec<String>>>,
+    idle_unknown_cmd: &AtomicBool,
+) {
+    let mut reader = BufReader::new(stream.try_clone().expect("Failed to clone stream"));
     let mut writer = stream;
 
     let _ = writeln!(writer, "OK MPD 0.24.0");
 
     let mut batch_mode = false;
     let mut batch_responses: Vec<String> = Vec::new();
+    let mut line_buf = String::new();
 
-    for line_result in reader.lines() {
-        match line_result {
-            Ok(line) => {
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() || trimmed == "close" {
-                    if trimmed == "close" {
-                        received.lock().unwrap().push("close".to_string());
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        let trimmed = line_buf.trim().to_string();
+        if trimmed.is_empty() || trimmed == "close" {
+            if trimmed == "close" {
+                received.lock().unwrap().push("close".to_string());
+            }
+            break;
+        }
+        if trimmed == "command_list_begin" {
+            batch_mode = true;
+            batch_responses.clear();
+            continue;
+        }
+        if trimmed == "command_list_end" {
+            for resp_line in &batch_responses {
+                let _ = writeln!(writer, "{resp_line}");
+            }
+            let _ = writeln!(writer, "OK");
+            batch_mode = false;
+            batch_responses.clear();
+            continue;
+        }
+        let cmd = trimmed.split_whitespace().next().unwrap_or(&trimmed).to_string();
+
+        // -- Idle handling --
+        if cmd == "idle" {
+            if idle_unknown_cmd.load(Ordering::Acquire) {
+                received.lock().unwrap().push("idle".to_string());
+                let _ = writeln!(writer, "ACK [5@0] {} unknown command", "idle");
+                continue;
+            }
+            received.lock().unwrap().push("idle".to_string());
+            let mut idle_buf = String::new();
+            loop {
+                idle_buf.clear();
+                match reader.read_line(&mut idle_buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let t = idle_buf.trim().to_string();
+                        if t == "noidle" {
+                            received.lock().unwrap().push("noidle".to_string());
+                            let subsystems = idle_subsystems.lock().unwrap().clone();
+                            for sub in &subsystems {
+                                let _ = writeln!(writer, "changed: {sub}");
+                            }
+                            let _ = writeln!(writer, "OK");
+                            break;
+                        }
                     }
-                    break;
-                }
-                if trimmed == "command_list_begin" {
-                    batch_mode = true;
-                    batch_responses.clear();
-                    continue;
-                }
-                if trimmed == "command_list_end" {
-                    for resp_line in &batch_responses {
-                        let _ = writeln!(writer, "{resp_line}");
-                    }
-                    let _ = writeln!(writer, "OK");
-                    batch_mode = false;
-                    batch_responses.clear();
-                    continue;
-                }
-                let cmd = trimmed.split_whitespace().next().unwrap_or(&trimmed).to_string();
-                received.lock().unwrap().push(cmd);
-                let response = get_response(&trimmed);
-                if batch_mode {
-                    for resp_line in response {
-                        batch_responses.push(resp_line);
-                    }
-                } else {
-                    for resp_line in response {
-                        let _ = writeln!(writer, "{resp_line}");
-                    }
-                    let _ = writeln!(writer, "OK");
+                    Err(_) => break,
                 }
             }
-            Err(_) => break,
+            continue;
+        }
+        if cmd == "noidle" {
+            received.lock().unwrap().push("noidle".to_string());
+            let _ = writeln!(writer, "OK");
+            continue;
+        }
+
+        received.lock().unwrap().push(cmd);
+        let response = get_response(&trimmed);
+        if batch_mode {
+            for resp_line in response {
+                batch_responses.push(resp_line);
+            }
+        } else {
+            for resp_line in response {
+                let _ = writeln!(writer, "{resp_line}");
+            }
+            let _ = writeln!(writer, "OK");
         }
     }
 }

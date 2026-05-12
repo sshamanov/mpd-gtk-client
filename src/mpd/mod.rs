@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Serialize, Deserialize};
 
 /// Unified stream type supporting both TCP and Unix sockets.
-enum MpdStream {
+pub enum MpdStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -56,6 +56,15 @@ impl MpdStream {
         }
     }
 
+    /// Create a new stream handle sharing the same underlying connection.
+    /// Write to one clone, read from the other — safe because MPD protocol is half-duplex.
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            MpdStream::Tcp(s) => s.try_clone().map(MpdStream::Tcp),
+            #[cfg(unix)]
+            MpdStream::Unix(s) => s.try_clone().map(MpdStream::Unix),
+        }
+    }
 }
 
 /// Describes how to connect to an MPD server — used internally and in the state machine.
@@ -443,6 +452,66 @@ impl MpdAdapter {
             log::warn!("[adapter] send_command({command:?}) took {:?}, {} lines", elapsed, lines.len());
         }
         Ok(lines)
+    }
+
+    /// Return a cloned stream handle for writing `noidle` from another thread.
+    /// The clone shares the same underlying TCP connection — writing to it
+    /// while the worker thread blocks on `idle` is safe because MPD protocol
+    /// is half-duplex and the reader/writer never contend.
+    pub fn stream_clone(&self) -> std::io::Result<MpdStream> {
+        self.stream.try_clone()
+    }
+
+    /// Send the MPD `idle` command and block until MPD responds with
+    /// subsystem changes. Returns the list of changed subsystems.
+    /// Returns `Err` on transient errors (connection reset, timeout).
+    /// Returns `Ok(vec![])` if `noidle` was sent externally (empty response).
+    pub fn idle(&mut self) -> Result<Vec<String>, Error> {
+        // Flush any buffered data before sending idle
+        self.stream.write_all(b"idle\n")?;
+        self.stream.flush()?;
+
+        // Send idle — errors are retryable (transient)
+        let t0 = std::time::Instant::now();
+        let mut subsystems = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line)?;
+            if n == 0 {
+                return Err(Error::Protocol("Connection closed during idle".into()));
+            }
+            let trimmed = line.trim_end();
+            if trimmed.starts_with("OK") {
+                break;
+            }
+            if trimmed.starts_with("ACK") {
+                // Check for "unknown command" (MPD < 0.19 or idle disabled)
+                if trimmed.contains("unknown") {
+                    log::info!("[adapter] MPD does not support idle command, falling back to polling");
+                    return Err(Error::MpdError(trimmed.to_string()));
+                }
+                return Err(Error::MpdError(trimmed.to_string()));
+            }
+            if let Some(subsystem) = trimmed.strip_prefix("changed: ") {
+                subsystems.push(subsystem.to_string());
+            }
+        }
+        let elapsed = t0.elapsed();
+        log::debug!("[adapter] idle returned {:?} subsystems in {:?}", subsystems.len(), elapsed);
+        Ok(subsystems)
+    }
+
+    /// Write `noidle\n` to break MPD out of an idle session.
+    /// Safe to call from any thread holding a stream clone.
+    /// Ignores the response (the original stream's reader will see it).
+    pub fn noidle(&mut self) -> Result<(), Error> {
+        self.stream.write_all(b"noidle\n")?;
+        self.stream.flush()?;
+        // Read the "OK" response so the BufReader stays in sync
+        let mut line = String::new();
+        self.reader.read_line(&mut line)?;
+        Ok(())
     }
 
     pub fn status(&mut self) -> Result<HashMap<String, String>, Error> {
@@ -967,6 +1036,51 @@ fn normalize_year(date: &str) -> String {
         // Use the full metadata query for all album listing.
         // Kept as a thin wrapper for backward compat.
         self.list_albums_full()
+    }
+
+    /// Fetch file paths for all albums using a single `listallinfo` MPD command.
+    /// Parses `file:`, `Album:` and `Artist:` lines to build album→file_paths mapping.
+    /// Returns `Vec<(album_artist, album_name, file_paths)>`.
+    pub fn fetch_album_file_paths(&mut self) -> Result<Vec<(String, String, Vec<String>)>, Error> {
+        let lines = self.send_command("listallinfo")?;
+        let mut current_file: Option<String> = None;
+        let mut current_album: Option<String> = None;
+        let mut current_artist: Option<String> = None;
+        // Intermediate: (artist, album) → file paths
+        let mut map: std::collections::HashMap<(String, String), Vec<String>> = std::collections::HashMap::new();
+
+        for line in &lines {
+            if let Some(file) = line.strip_prefix("file: ") {
+                // Flush previous file before starting a new one
+                if let (Some(artist), Some(album), Some(file_path)) =
+                    (current_artist.take(), current_album.take(), current_file.take())
+                {
+                    map.entry((artist, album))
+                        .or_default()
+                        .push(file_path);
+                }
+                current_file = Some(file.to_string());
+                current_album = None;
+                current_artist = None;
+            } else if let Some(album) = line.strip_prefix("Album: ") {
+                current_album = Some(album.to_string());
+            } else if let Some(artist) = line.strip_prefix("Artist: ") {
+                current_artist = Some(artist.to_string());
+            }
+        }
+        // Flush the last file
+        if let (Some(artist), Some(album), Some(file_path)) =
+            (current_artist, current_album, current_file)
+        {
+            map.entry((artist, album))
+                .or_default()
+                .push(file_path);
+        }
+
+        Ok(map
+            .into_iter()
+            .map(|((artist, album), paths)| (artist, album, paths))
+            .collect())
     }
 
     /// Group cached album metadata locally by the given tag ("Artist", "AlbumArtist",

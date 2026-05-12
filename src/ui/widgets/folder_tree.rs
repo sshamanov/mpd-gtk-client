@@ -3,14 +3,13 @@
 //! Thread: UI (GTK main loop).
 
 use crate::mpd::DirEntry;
-use crate::mpd::state_machine::MpdCommand;
+use crate::mpd::state_machine::{CommandSender, MpdCommand};
 use gtk4::prelude::*;
 use gtk4::{Box, EventControllerKey, Image, Label, ListBox, Orientation, ScrolledWindow};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::mpsc;
 
 pub struct FolderBrowser {
     pub container: Box,
@@ -18,7 +17,7 @@ pub struct FolderBrowser {
     breadcrumb: Box,
     pub shared_path: Rc<RefCell<String>>,
     #[allow(dead_code)]
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
     /// Loaded directory contents: full MPD path → entries
     dir_cache: Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
     /// Which directory paths are currently expanded
@@ -30,7 +29,7 @@ pub struct FolderBrowser {
 }
 
 impl FolderBrowser {
-    pub fn new(cmd_tx: mpsc::Sender<MpdCommand>) -> Self {
+    pub fn new(cmd_tx: CommandSender) -> Self {
         let container = Box::new(Orientation::Vertical, 0);
         container.set_vexpand(true);
         container.set_hexpand(true);

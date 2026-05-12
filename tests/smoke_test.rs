@@ -1,6 +1,8 @@
 #[path = "common.rs"]
 mod common;
 
+use std::io::Write;
+
 #[test]
 fn smoke_test_connect_and_status() {
     let (server, mut client) = common::with_mpd_server();
@@ -121,7 +123,7 @@ fn test_list_albums_full() {
 
 #[test]
 fn test_list_albums_grouped() {
-    let (server, mut client) = common::with_mpd_server();
+    let (_server, mut client) = common::with_mpd_server();
     // First fetch the full metadata
     let albums = client.list_albums_full().unwrap();
     // Then group locally by Artist
@@ -223,4 +225,96 @@ fn test_send_batch_empty() {
     // Empty batch — just command_list_begin/end, should return OK
     let result = client.send_batch(&[]);
     assert!(result.is_ok(), "empty batch should succeed, got: {:?}", result.err());
+}
+
+/// Test basic idle → noidle cycle.
+/// `idle()` blocks until `noidle` is sent via a stream clone.
+#[test]
+fn test_idle_noidle_cycle() {
+    let (server, mut client) = common::with_mpd_server();
+
+    // Create stream clone BEFORE moving client into the spawn closure
+    let mut clone = client.stream_clone().expect("stream_clone should succeed");
+
+    // Spawn idle on a background thread (it blocks until noidle)
+    let idle_result = std::thread::spawn(move || {
+        client.idle()
+    });
+
+    // Give idle a moment to reach the server
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Send noidle via stream clone (simulates what CommandSender does)
+    clone.write_all(b"noidle\n").expect("write noidle should succeed");
+
+    // Wait for idle to return
+    let subsystems = idle_result.join().expect("idle thread panicked")
+        .expect("idle should succeed");
+
+    // Default mock returns player subsystem
+    assert_eq!(subsystems, vec!["player"]);
+
+    server.assert_received("idle");
+    server.assert_received("noidle");
+}
+
+/// Test that idle returns multiple subsystems when configured.
+#[test]
+fn test_idle_multiple_subsystems() {
+    let (server, mut client) = common::with_mpd_server();
+    server.set_idle_subsystems(vec![
+        "player".to_string(),
+        "playlist".to_string(),
+        "mixer".to_string(),
+    ]);
+
+    // Create stream clone BEFORE moving client
+    let mut clone = client.stream_clone().expect("stream_clone should succeed");
+
+    let idle_result = std::thread::spawn(move || {
+        client.idle()
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    clone.write_all(b"noidle\n").expect("write noidle should succeed");
+
+    let subsystems = idle_result.join().expect("idle thread panicked")
+        .expect("idle should succeed");
+
+    assert_eq!(subsystems.len(), 3);
+    assert!(subsystems.contains(&"player".to_string()));
+    assert!(subsystems.contains(&"playlist".to_string()));
+    assert!(subsystems.contains(&"mixer".to_string()));
+
+    server.assert_received("idle");
+}
+
+/// Test that idle returns a descriptive error when MPD reports "unknown command".
+#[test]
+fn test_idle_unknown_command_fallback() {
+    let (server, mut client) = common::with_mpd_server();
+    server.set_idle_unknown_command(true);
+
+    let result = client.idle();
+    assert!(result.is_err(), "idle should fail with unknown command error");
+    let err = result.unwrap_err().to_string();
+    assert!(err.to_lowercase().contains("unknown command"),
+        "error should mention unknown command, got: {err}");
+
+    server.assert_received("idle");
+}
+
+/// Test noidle without prior idle is accepted (MPD spec: returns OK without subsystems).
+#[test]
+fn test_noidle_without_idle() {
+    let (server, mut client) = common::with_mpd_server();
+
+    // noidle without a prior idle should succeed (MPD spec allows it)
+    client.noidle().expect("noidle without idle should succeed");
+
+    // Give the server thread time to process
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    server.assert_received("noidle");
 }

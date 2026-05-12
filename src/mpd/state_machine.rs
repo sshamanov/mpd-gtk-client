@@ -2,10 +2,11 @@
 
 #![allow(clippy::expect_used)]
 
-use crate::mpd::{ConnectionTarget, DirEntry, MpdAdapter};
+use crate::mpd::{ConnectionTarget, DirEntry, MpdAdapter, MpdStream};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -145,6 +146,44 @@ impl ExponentialBackoff {
     }
 }
 
+/// Thread-safe MPD command sender that writes `noidle\n` to a stream clone
+/// before forwarding each command. Breaks the worker thread out of MPD `idle`
+/// mode so it can process the command immediately.
+///
+/// The stream clone is stored after the connection is established inside
+/// `connected_loop`. Before that, commands are queued in the mpsc channel
+/// normally (worker isn't in idle mode yet).
+#[derive(Clone)]
+pub struct CommandSender {
+    inner: mpsc::Sender<MpdCommand>,
+    noidle_socket: Arc<Mutex<Option<MpdStream>>>,
+}
+
+impl CommandSender {
+    fn new(inner: mpsc::Sender<MpdCommand>) -> Self {
+        Self {
+            inner,
+            noidle_socket: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Forward a command to the MPD background thread. Writes `noidle\n`
+    /// to a temporary stream clone to break the worker out of `idle` mode
+    /// before the command is processed.
+    pub fn send(&self, cmd: MpdCommand) -> Result<(), mpsc::SendError<MpdCommand>> {
+        if let Ok(guard) = self.noidle_socket.lock() {
+            if let Some(ref stream) = *guard {
+                if let Ok(clone) = stream.try_clone() {
+                    drop(guard);
+                    let mut write_clone = clone;
+                    let _ = write_clone.write_all(b"noidle\n");
+                }
+            }
+        }
+        self.inner.send(cmd)
+    }
+}
+
 /// The MPD event loop runs on a background thread, owning the adapter and state machine.
 pub struct MpdEventLoop {
     stop: Arc<AtomicBool>,
@@ -156,10 +195,14 @@ impl MpdEventLoop {
     pub fn spawn(
         event_tx: mpsc::SyncSender<MpdEvent>,
         conn_params: Arc<std::sync::Mutex<ConnectionTarget>>,
-    ) -> (Self, mpsc::Sender<MpdCommand>) {
+    ) -> (Self, CommandSender, std::sync::Arc<crate::metadata::MetadataCache>) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<MpdCommand>();
+        let cmd_sender = CommandSender::new(cmd_tx);
+        let noidle_socket = cmd_sender.noidle_socket.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let metadata_cache = std::sync::Arc::new(crate::metadata::MetadataCache::new());
+        let mc_thread = metadata_cache.clone();
 
         let handle = thread::Builder::new()
             .name("mpd-event-loop".into())
@@ -203,7 +246,8 @@ impl MpdEventLoop {
                             match MpdAdapter::connect(&target) {
                                 Ok(adapter) => {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
-                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone);
+                                    mc_thread.clear();
+                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread);
                                     // When connected_loop exits, connection was lost.
                                     // Preserve backoff across the reconnect cycle.
                                     let backoff = ExponentialBackoff::new();
@@ -247,7 +291,8 @@ impl MpdEventLoop {
                 stop,
                 handle: Some(handle),
             },
-            cmd_tx,
+            cmd_sender,
+            metadata_cache,
         )
     }
 
@@ -274,12 +319,16 @@ impl MpdEventLoop {
     }
 }
 
-/// Run the connected phase: command processing and independent status polling.
+/// Run the connected phase: command processing with MPD idle protocol.
+/// Blocks on MPD `idle` when no commands are pending — instant subsystem notification
+/// instead of 500ms polling. Falls back to polling for MPD < 0.19 or transient errors.
 fn connected_loop(
     mut adapter: MpdAdapter,
     cmd_rx: &mpsc::Receiver<MpdCommand>,
     event_tx: &mpsc::SyncSender<MpdEvent>,
     stop: &AtomicBool,
+    noidle_socket: Arc<Mutex<Option<MpdStream>>>,
+    metadata_cache: &crate::metadata::MetadataCache,
 ) {
     let mut last_status = Instant::now();
     let mut last_song_pos: Option<u32>;
@@ -293,6 +342,17 @@ fn connected_loop(
     let cover_provider = std::sync::Arc::new(std::sync::RwLock::new(crate::coverart::CoverProvider::new()));
     let mut actual_read = crate::coverart::ActualRead::new(cache_dir);
     let mut cached_flat_albums: Vec<crate::mpd::AlbumMeta> = Vec::new();
+    let mut use_idle = true;
+    let mut transient_failures: u32 = 0;
+
+    // Set the stream clone for the main thread's CommandSender
+    if let Ok(clone) = adapter.stream_clone() {
+        *noidle_socket.lock().expect("noidle_socket lock") = Some(clone);
+        log::info!("[MPD] stream clone ready for idle break");
+    } else {
+        log::warn!("[MPD] stream_clone failed, disabling idle protocol");
+        use_idle = false;
+    }
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -309,490 +369,625 @@ fn connected_loop(
             return;
         }
 
-        // Process commands with a short timeout so status polling runs independently
-        match cmd_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(cmd) => {
-                if stop.load(Ordering::Acquire) {
-                    return;
-                }
-                match cmd {
-                    MpdCommand::Play => {
-                        if let Err(e) = adapter.play() { log::error!("Play failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Pause => {
-                        if let Err(e) = adapter.pause() { log::error!("Pause failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Stop => {
-                        if let Err(e) = adapter.stop() { log::error!("Stop failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Next => {
-                        if let Err(e) = adapter.next_track() { log::error!("Next failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Previous => {
-                        if let Err(e) = adapter.previous() { log::error!("Previous failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Seek(pos) => {
-                        if let Err(e) = adapter.seek(pos) { log::error!("Seek failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Status => {
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::CurrentSong => {
-                        if let Ok(Some(song)) = adapter.current_song() {
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(
-                                parse_song_update(&song)));
-                        }
-                    }
-                    MpdCommand::ListAlbums => {
-                        if let Ok(albums) = adapter.list_albums() {
-                            let _ = event_tx.try_send(MpdEvent::Albums(albums));
-                        }
-                    }
-                    MpdCommand::ListAlbumsGrouped(group) => {
-                        // Populate cache on first call — one MPD query for all metadata
-                        if cached_flat_albums.is_empty() {
-                            match adapter.list_albums_full() {
-                                Ok(albums) => {
-                                    log::info!("[MPD] ListAlbumsGrouped: fetched {} albums with full metadata", albums.len());
-                                    cached_flat_albums = albums;
-                                }
-                                Err(e) => {
-                                    log::error!("[MPD] ListAlbumsGrouped: failed to fetch albums: {e}");
-                                    let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(Vec::new()));
-                                    continue;
+        // ── Idle phase ──
+        if use_idle {
+            match adapter.idle() {
+                Ok(subsystems) => {
+                    transient_failures = 0;
+                    consecutive_failures = 0;
+                    // Subsystem-specific refresh
+                    let mut needs_full_status = false;
+                    for subsystem in &subsystems {
+                        match subsystem.as_str() {
+                            "player" => {
+                                if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let new_song = update.song;
+                                    let song_changed = new_song != last_song_pos;
+                                    let pv = update.playlist_version.clone();
+                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    last_status = Instant::now();
+                                    if song_changed {
+                                        last_song_pos = new_song;
+                                        if let Some(ref ver) = pv {
+                                            sync_queue(&mut adapter, event_tx, &mut local_queue,
+                                                &mut last_playlist_version, Some(ver));
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            log::info!("[MPD] ListAlbumsGrouped({group}): using cache ({})", cached_flat_albums.len());
+                            "playlist" | "options" => {
+                                if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let pv = update.playlist_version.clone();
+                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    last_status = Instant::now();
+                                    sync_queue(&mut adapter, event_tx, &mut local_queue,
+                                        &mut last_playlist_version, pv.as_deref());
+                                }
+                            }
+                            "mixer" => {
+                                // Only volume changed — lightweight status check
+                                if let Ok(status) = adapter.status() {
+                                    let mut update = parse_status_update(&status);
+                                    if let Ok(Some(song)) = adapter.current_song() {
+                                        let song_update = parse_song_update(&song);
+                                        if update.artist.is_none() { update.artist = song_update.artist; }
+                                        if update.title.is_none() { update.title = song_update.title; }
+                                        if update.album.is_none() { update.album = song_update.album; }
+                                        if update.year.is_none() { update.year = song_update.year; }
+                                    }
+                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    last_status = Instant::now();
+                                }
+                            }
+                            "database" | "update" | "stored_playlist" => {
+                                let _ = event_tx.try_send(MpdEvent::LibraryChanged);
+                                needs_full_status = true;
+                            }
+                            _ => {
+                                log::debug!("[MPD] idle: unknown subsystem '{subsystem}', full refresh");
+                                needs_full_status = true;
+                            }
                         }
-                        let groups = adapter.list_albums_grouped(&group, &cached_flat_albums);
-                        let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                     }
-                    MpdCommand::FetchCovers(albums) => {
-                        log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
-                        actual_read.enqueue(albums);
-                        // Fetch up to 16 covers immediately in bulk — avoids
-                        // the 1-per-idle-cycle bottleneck for initial load.
+                    if needs_full_status {
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            last_status = Instant::now();
+                        }
+                    }
+                    // Drain pending commands (non-blocking)
+                    loop {
+                        if stop.load(Ordering::Acquire) { return; }
+                        match cmd_rx.try_recv() {
+                            Ok(cmd) => {
+                                if process_command(cmd, &mut adapter, event_tx, &mut actual_read, &cover_provider,
+                                    &mut last_status, &mut last_song_pos, &mut last_playlist_version,
+                                    &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
+                                    stop, metadata_cache,
+                                ) {
+                                    return;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    // Process one cover fetch per idle cycle
+                    if actual_read.has_pending() {
                         let caps = adapter.capabilities.clone();
-                        actual_read.process_batch(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx, 16);
-                    }
-                    MpdCommand::Search(query) => {
-                        if let Ok(results) = adapter.search_albums(&query) {
-                            let _ = event_tx.try_send(MpdEvent::SearchResults(results));
-                        }
-                    }
-                    MpdCommand::SearchFiles(query) => {
-                        if let Ok(results) = adapter.search_files(&query) {
-                            let _ = event_tx.try_send(MpdEvent::FileSearchResults(results));
-                        }
-                    }
-                    MpdCommand::ListDirectory(path) => {
-                        if let Ok(entries) = adapter.lsinfo(&path) {
-                            let _ = event_tx.try_send(MpdEvent::DirectoryListing(path, entries));
-                        }
-                    }
-                    MpdCommand::ListAlbumTracks(album) => {
-                        if let Ok(tracks) = adapter.find_album_tracks(&album) {
-                            let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks));
-                        }
-                    }
-                    MpdCommand::PlayFile(path) => {
-                        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
-                        let cmds = vec![
-                            "clear".to_string(),
-                            format!("add \"{escaped}\""),
-                            "play 0".to_string(),
-                        ];
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayFile failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::ListQueue => {
-                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
-                    }
-                    MpdCommand::PlayPosition(pos) => {
-                        if let Err(e) = adapter.send_command(&format!("play {}", pos)) {
-                            log::error!("PlayPosition failed: {e}");
-                        }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::DeleteId(id) => {
-                        if let Err(e) = adapter.send_command(&format!("deleteid {}", id)) {
-                            log::error!("DeleteId failed: {e}");
-                        }
-                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
-                    }
-                    MpdCommand::MoveId(id, to_pos) => {
-                        if let Err(e) = adapter.send_command(&format!("moveid {} {}", id, to_pos)) {
-                            log::error!("MoveId failed: {e}");
-                        }
-                        sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, None);
-                    }
-                    MpdCommand::Add(album) => {
-                        match adapter.find_album_uris(&album) {
-                            Ok(uris) => {
-                                if uris.is_empty() { continue; }
-                                let cmds: Vec<String> = uris.iter()
-                                    .map(|uri| format!("addid \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
-                                    .collect();
-                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("Add album failed: {e}"); }
-                                if let Some(update) = fetch_full_update(&mut adapter) {
-                                    let pv = update.playlist_version.clone();
-                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                                }
-                                last_status = Instant::now();
-                            }
-                            Err(e) => log::error!("Add album failed: {e}"),
-                        }
-                    }
-                    MpdCommand::AddAt(album, pos) => {
-                        match adapter.find_album_uris(&album) {
-                            Ok(uris) => {
-                                if uris.is_empty() { continue; }
-                                let mut position = pos;
-                                let cmds: Vec<String> = uris.iter()
-                                    .map(|uri| {
-                                        let cmd = format!("addid \"{}\" {}", uri.replace('\\', "\\\\").replace('"', "\\\""), position);
-                                        position += 1;
-                                        cmd
-                                    })
-                                    .collect();
-                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddAt album failed: {e}"); }
-                                if let Some(update) = fetch_full_update(&mut adapter) {
-                                    let pv = update.playlist_version.clone();
-                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                                }
-                                last_status = Instant::now();
-                            }
-                            Err(e) => log::error!("AddAt album failed: {e}"),
-                        }
-                    }
-                    MpdCommand::InsertNext(album) => {
-                        match adapter.find_album_uris(&album) {
-                            Ok(uris) => {
-                                if uris.is_empty() { continue; }
-                                let current_pos = adapter.status()
-                                    .ok()
-                                    .and_then(|s| s.get("song").cloned())
-                                    .and_then(|s| s.parse::<i32>().ok())
-                                    .unwrap_or(-1);
-                                if current_pos < 0 {
-                                    log::warn!("InsertNext: no current track, skipping insert");
-                                    let _ = event_tx.try_send(MpdEvent::Error(
-                                        "Cannot insert after current track: nothing is playing".into()
-                                    ));
-                                    continue;
-                                }
-                                // Batch all addid calls with position parameter to avoid per-item
-                                // round-trips and eliminate the race between addid and moveid.
-                                let mut cmds = Vec::with_capacity(uris.len());
-                                for (i, uri) in uris.iter().enumerate() {
-                                    let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-                                    let target = current_pos + 1 + i as i32;
-                                    cmds.push(format!("addid \"{escaped}\" {target}"));
-                                }
-                                if let Err(e) = adapter.send_batch(&cmds) {
-                                    log::error!("InsertNext batch failed: {e}");
-                                }
-                                if let Some(update) = fetch_full_update(&mut adapter) {
-                                    let pv = update.playlist_version.clone();
-                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                                }
-                                last_status = Instant::now();
-                            }
-                            Err(e) => log::error!("InsertNext find failed: {e}"),
-                        }
-                    }
-                    MpdCommand::PlayAlbum(album) => {
-                        match adapter.find_album_uris(&album) {
-                            Ok(uris) => {
-                                let mut cmds = vec!["clear".to_string()];
-                                for uri in &uris {
-                                    let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-                                    cmds.push(format!("addid \"{escaped}\""));
-                                }
-                                cmds.push("play 0".to_string());
-                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayAlbum failed: {e}"); }
-                                if let Some(update) = fetch_full_update(&mut adapter) {
-                                    let pv = update.playlist_version.clone();
-                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                                }
-                                last_status = Instant::now();
-                            }
-                            Err(e) => log::error!("PlayAlbum failed: {e}"),
-                        }
-                    }
-                    MpdCommand::PlayUris(uris) => {
-                        if uris.is_empty() { continue; }
-                        let mut cmds: Vec<String> = vec!["clear".to_string()];
-                        for uri in uris {
-                            let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-                            cmds.push(format!("add \"{escaped}\""));
-                        }
-                        cmds.push("play 0".to_string());
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayUris failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::AddUris(uris) => {
-                        if uris.is_empty() { continue; }
-                        let cmds: Vec<String> = uris.iter()
-                            .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
-                            .collect();
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddUris failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::InsertNextUris(uris) => {
-                        if uris.is_empty() { continue; }
-                        let current_pos = adapter.status()
-                            .ok()
-                            .and_then(|s| s.get("song").cloned())
-                            .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(-1);
-                        if current_pos < 0 {
-                            log::warn!("InsertNextUris: no current track, falling back to AddUris");
-                            let cmds: Vec<String> = uris.iter()
-                                .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
-                                .collect();
-                            if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris fallback failed: {e}"); }
-                        } else {
-                            let mut cmds = Vec::with_capacity(uris.len());
-                            for (i, uri) in uris.iter().enumerate() {
-                                let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-                                let target = current_pos + 1 + i as i32;
-                                cmds.push(format!("addid \"{escaped}\" {target}"));
-                            }
-                            if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris failed: {e}"); }
-                        }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::PlayDirectory(dir) => {
-                        match adapter.lsinfo(&dir) {
-                            Ok(entries) => {
-                                let uris: Vec<String> = entries.iter()
-                                    .filter_map(|e| match e {
-                                        DirEntry::File { path, .. } => Some(path.clone()),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                if !uris.is_empty() {
-                                    let mut cmds: Vec<String> = vec!["clear".to_string()];
-                                    for uri in &uris {
-                                        cmds.push(format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")));
-                                    }
-                                    cmds.push("play 0".to_string());
-                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayDirectory failed: {e}"); }
-                                }
-                            }
-                            Err(e) => log::error!("PlayDirectory lsinfo failed: {e}"),
-                        }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::AddDirectory(dir) => {
-                        match adapter.lsinfo(&dir) {
-                            Ok(entries) => {
-                                let uris: Vec<String> = entries.iter()
-                                    .filter_map(|e| match e {
-                                        DirEntry::File { path, .. } => Some(path.clone()),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                if !uris.is_empty() {
-                                    let cmds: Vec<String> = uris.iter()
-                                        .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
-                                        .collect();
-                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddDirectory failed: {e}"); }
-                                }
-                            }
-                            Err(e) => log::error!("AddDirectory lsinfo failed: {e}"),
-                        }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::InsertNextDirectory(dir) => {
-                        match adapter.lsinfo(&dir) {
-                            Ok(entries) => {
-                                let uris: Vec<String> = entries.iter()
-                                    .filter_map(|e| match e {
-                                        DirEntry::File { path, .. } => Some(path.clone()),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                if !uris.is_empty() {
-                                    let current_pos = adapter.status()
-                                        .ok()
-                                        .and_then(|s| s.get("song").cloned())
-                                        .and_then(|s| s.parse::<i32>().ok())
-                                        .unwrap_or(-1);
-                                    let mut cmds = Vec::with_capacity(uris.len());
-                                    if current_pos < 0 {
-                                        for uri in &uris {
-                                            cmds.push(format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")));
-                                        }
-                                    } else {
-                                        for (i, uri) in uris.iter().enumerate() {
-                                            let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
-                                            cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
-                                        }
-                                    }
-                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextDirectory failed: {e}"); }
-                                }
-                            }
-                            Err(e) => log::error!("InsertNextDirectory lsinfo failed: {e}"),
-                        }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Clear => {
-                        if let Err(e) = adapter.send_command("clear") { log::error!("Clear failed: {e}"); }
-                        if let Some(update) = fetch_full_update(&mut adapter) {
-                            let pv = update.playlist_version.clone();
-                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
-                        }
-                        last_status = Instant::now();
-                    }
-                    MpdCommand::Reconnect => {
-                        log::info!("[MPD] received Reconnect command, restarting connection");
-                        return;
-                    }
-                    MpdCommand::Update => {
-                        if let Err(e) = adapter.update_library() {
-                            log::error!("Update failed: {e}");
-                        } else {
-                            log::info!("[MPD] library update triggered, refreshing grid");
-                            let _ = event_tx.try_send(MpdEvent::LibraryChanged);
-                        }
-                    }
-                    MpdCommand::Close => {
-                        log::info!("[MPD] received Close command, sending close to MPD");
-                        let _ = adapter.send_command("close");
-                        // Prevent the outer state machine from attempting reconnection
-                        stop.store(true, Ordering::Release);
-                        return;
+                        actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
                     }
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Process one pending cover fetch per idle cycle to avoid blocking
-                if actual_read.has_pending() {
-                    let caps = adapter.capabilities.clone();
-                    actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
+                Err(ref e) if e.to_string().contains("unknown command") => {
+                    log::info!("[MPD] idle not supported, falling back to 500ms polling");
+                    use_idle = false;
                 }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return;
+                Err(e) => {
+                    // Transient error — poll briefly then retry idle
+                    log::warn!("[MPD] idle transient error: {e}, polling fallback");
+                    transient_failures += 1;
+                    if transient_failures >= 10 {
+                        log::info!("[MPD] transient window passed, retrying idle");
+                        transient_failures = 0;
+                    }
+                }
             }
         }
 
-        // Independent status polling every 500ms — not tied to command arrival
-        if last_status.elapsed() >= Duration::from_millis(500) {
-            last_status = Instant::now();
-            if let Some(update) = fetch_full_update(&mut adapter) {
-                consecutive_failures = 0;
-                let new_song = update.song;
-                let song_changed = new_song != last_song_pos;
-                let current_version = update.playlist_version.clone();
-                let playlist_changed = current_version != last_playlist_version;
-                if playlist_changed && current_version.is_some() {
-                    last_playlist_version = current_version.clone();
-                    let _ = event_tx.try_send(MpdEvent::LibraryChanged);
-                }
-                match event_tx.try_send(MpdEvent::StateChanged(update)) {
-                    Ok(()) => {
-                        if song_changed {
-                            last_song_pos = new_song;
-                        }
-                    }
-                    Err(mpsc::TrySendError::Full(_)) => {
-                        log::warn!("[MPD] channel FULL — StateChanged event DROPPED");
-                    }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        log::error!("[MPD] channel disconnected");
+        // ── Poll fallback cycle ──
+        if !use_idle || transient_failures > 0 {
+            match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(cmd) => {
+                    if stop.load(Ordering::Acquire) { return; }
+                    if process_command(cmd, &mut adapter, event_tx, &mut actual_read, &cover_provider,
+                        &mut last_status, &mut last_song_pos, &mut last_playlist_version,
+                        &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
+                        stop, metadata_cache,
+                    ) {
                         return;
                     }
                 }
-                if song_changed && last_song_pos == new_song {
-                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, current_version.as_deref());
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if actual_read.has_pending() {
+                        let caps = adapter.capabilities.clone();
+                        actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
+                    }
                 }
-            } else {
-                consecutive_failures += 1;
-                log::error!("[MPD] status poll failed ({consecutive_failures}/3)");
-                if consecutive_failures >= 3 {
-                    log::error!("[MPD] connection dead after 3 consecutive poll failures, triggering reconnect");
-                    return;
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+
+            // Independent status polling every 500ms (only in permanent polling fallback)
+            if !use_idle {
+                if last_status.elapsed() >= Duration::from_millis(500) {
+                    last_status = Instant::now();
+                    if let Some(update) = fetch_full_update(&mut adapter) {
+                        consecutive_failures = 0;
+                        let new_song = update.song;
+                        let song_changed = new_song != last_song_pos;
+                        let current_version = update.playlist_version.clone();
+                        let playlist_changed = current_version != last_playlist_version;
+                        if playlist_changed && current_version.is_some() {
+                            last_playlist_version = current_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::LibraryChanged);
+                        }
+                        match event_tx.try_send(MpdEvent::StateChanged(update)) {
+                            Ok(()) => {
+                                if song_changed {
+                                    last_song_pos = new_song;
+                                }
+                            }
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                log::warn!("[MPD] channel FULL — StateChanged event DROPPED");
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => return,
+                        }
+                        if song_changed && last_song_pos == new_song {
+                            sync_queue(&mut adapter, event_tx, &mut local_queue,
+                                &mut last_playlist_version, current_version.as_deref());
+                        }
+                    } else {
+                        consecutive_failures += 1;
+                        log::error!("[MPD] status poll failed ({consecutive_failures}/3)");
+                        if consecutive_failures >= 3 {
+                            log::error!("[MPD] connection dead after 3 consecutive poll failures, triggering reconnect");
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
 }
+
+/// Process a single MPD command — dispatch to the appropriate adapter method
+/// and emit events. Extracted so both idle and poll paths can call it.
+/// Returns `true` if the caller should exit the connected loop (Reconnect/Close).
+#[allow(clippy::too_many_arguments)]
+fn process_command(
+    cmd: MpdCommand,
+    adapter: &mut MpdAdapter,
+    event_tx: &mpsc::SyncSender<MpdEvent>,
+    actual_read: &mut crate::coverart::ActualRead,
+    cover_provider: &std::sync::Arc<std::sync::RwLock<crate::coverart::CoverProvider>>,
+    last_status: &mut Instant,
+    _last_song_pos: &mut Option<u32>,
+    last_playlist_version: &mut Option<String>,
+    local_queue: &mut Vec<crate::mpd::QueueEntry>,
+    cached_flat_albums: &mut Vec<crate::mpd::AlbumMeta>,
+    _consecutive_failures: &mut u32,
+    stop: &AtomicBool,
+    metadata_cache: &crate::metadata::MetadataCache,
+) -> bool {
+    match cmd {
+        MpdCommand::Play => {
+            if let Err(e) = adapter.play() { log::error!("Play failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Pause => {
+            if let Err(e) = adapter.pause() { log::error!("Pause failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Stop => {
+            if let Err(e) = adapter.stop() { log::error!("Stop failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Next => {
+            if let Err(e) = adapter.next_track() { log::error!("Next failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Previous => {
+            if let Err(e) = adapter.previous() { log::error!("Previous failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Seek(pos) => {
+            if let Err(e) = adapter.seek(pos) { log::error!("Seek failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Status => {
+            if let Some(update) = fetch_full_update(adapter) {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::CurrentSong => {
+            if let Ok(Some(song)) = adapter.current_song() {
+                let _ = event_tx.try_send(MpdEvent::StateChanged(
+                    parse_song_update(&song)));
+            }
+        }
+        MpdCommand::ListAlbums => {
+            if let Ok(albums) = adapter.list_albums() {
+                let _ = event_tx.try_send(MpdEvent::Albums(albums));
+            }
+        }
+        MpdCommand::ListAlbumsGrouped(group) => {
+            if cached_flat_albums.is_empty() {
+                match adapter.list_albums_full() {
+                    Ok(albums) => {
+                        log::info!("[MPD] ListAlbumsGrouped: fetched {} albums with full metadata", albums.len());
+                        metadata_cache.build(albums.clone());
+                        *cached_flat_albums = albums;
+
+                        // Second pass: batch fetch file paths for all albums
+                        match adapter.fetch_album_file_paths() {
+                            Ok(paths) => {
+                                log::info!("[MPD] fetched file paths for {} albums", paths.len());
+                                metadata_cache.load_file_paths(paths);
+                            }
+                            Err(e) => log::warn!("[MPD] file path batch fetch failed: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[MPD] ListAlbumsGrouped: failed to fetch albums: {e}");
+                        let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(Vec::new()));
+                        return false;
+                    }
+                }
+            } else {
+                log::info!("[MPD] ListAlbumsGrouped({group}): using cache ({})", cached_flat_albums.len());
+            }
+            let groups = adapter.list_albums_grouped(&group, cached_flat_albums);
+            let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+        }
+        MpdCommand::FetchCovers(albums) => {
+            log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
+            actual_read.enqueue(albums);
+            let caps = adapter.capabilities.clone();
+            actual_read.process_batch(adapter, &caps, &cover_provider.read().unwrap(), event_tx, 16);
+        }
+        MpdCommand::Search(query) => {
+            if let Ok(results) = adapter.search_albums(&query) {
+                let _ = event_tx.try_send(MpdEvent::SearchResults(results));
+            }
+        }
+        MpdCommand::SearchFiles(query) => {
+            if let Ok(results) = adapter.search_files(&query) {
+                let _ = event_tx.try_send(MpdEvent::FileSearchResults(results));
+            }
+        }
+        MpdCommand::ListDirectory(path) => {
+            if let Ok(entries) = adapter.lsinfo(&path) {
+                let _ = event_tx.try_send(MpdEvent::DirectoryListing(path, entries));
+            }
+        }
+        MpdCommand::ListAlbumTracks(album) => {
+            if let Ok(tracks) = adapter.find_album_tracks(&album) {
+                let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks));
+            }
+        }
+        MpdCommand::PlayFile(path) => {
+            let escaped = path.replace("\\", "\\\\").replace("\"", "\\\"");
+            let cmds = vec![
+                "clear".to_string(),
+                format!("add \"{escaped}\""),
+                "play 0".to_string(),
+            ];
+            if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayFile failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::ListQueue => {
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+        }
+        MpdCommand::PlayPosition(pos) => {
+            if let Err(e) = adapter.send_command(&format!("play {}", pos)) {
+                log::error!("PlayPosition failed: {e}");
+            }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::DeleteId(id) => {
+            if let Err(e) = adapter.send_command(&format!("deleteid {}", id)) {
+                log::error!("DeleteId failed: {e}");
+            }
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+        }
+        MpdCommand::MoveId(id, to_pos) => {
+            if let Err(e) = adapter.send_command(&format!("moveid {} {}", id, to_pos)) {
+                log::error!("MoveId failed: {e}");
+            }
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+        }
+        MpdCommand::Add(album) => {
+            match adapter.find_album_uris(&album) {
+                Ok(uris) => {
+                    if uris.is_empty() { return false; }
+                    let cmds: Vec<String> = uris.iter()
+                        .map(|uri| format!("addid \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                        .collect();
+                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("Add album failed: {e}"); }
+                    if let Some(update) = fetch_full_update(adapter) {
+                        let pv = update.playlist_version.clone();
+                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                    }
+                    *last_status = Instant::now();
+                }
+                Err(e) => log::error!("Add album failed: {e}"),
+            }
+        }
+        MpdCommand::AddAt(album, pos) => {
+            match adapter.find_album_uris(&album) {
+                Ok(uris) => {
+                    if uris.is_empty() { return false; }
+                    let mut position = pos;
+                    let cmds: Vec<String> = uris.iter()
+                        .map(|uri| {
+                            let cmd = format!("addid \"{}\" {}", uri.replace("\\", "\\\\").replace("\"", "\\\""), position);
+                            position += 1;
+                            cmd
+                        })
+                        .collect();
+                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddAt album failed: {e}"); }
+                    if let Some(update) = fetch_full_update(adapter) {
+                        let pv = update.playlist_version.clone();
+                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                    }
+                    *last_status = Instant::now();
+                }
+                Err(e) => log::error!("AddAt album failed: {e}"),
+            }
+        }
+        MpdCommand::InsertNext(album) => {
+            match adapter.find_album_uris(&album) {
+                Ok(uris) => {
+                    if uris.is_empty() { return false; }
+                    let current_pos = adapter.status()
+                        .ok()
+                        .and_then(|s| s.get("song").cloned())
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(-1);
+                    if current_pos < 0 {
+                        log::warn!("InsertNext: no current track, skipping insert");
+                        let _ = event_tx.try_send(MpdEvent::Error(
+                            "Cannot insert after current track: nothing is playing".into()
+                        ));
+                        return false;
+                    }
+                    let mut cmds = Vec::with_capacity(uris.len());
+                    for (i, uri) in uris.iter().enumerate() {
+                        let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
+                        let target = current_pos + 1 + i as i32;
+                        cmds.push(format!("addid \"{escaped}\" {target}"));
+                    }
+                    if let Err(e) = adapter.send_batch(&cmds) {
+                        log::error!("InsertNext batch failed: {e}");
+                    }
+                    if let Some(update) = fetch_full_update(adapter) {
+                        let pv = update.playlist_version.clone();
+                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                    }
+                    *last_status = Instant::now();
+                }
+                Err(e) => log::error!("InsertNext find failed: {e}"),
+            }
+        }
+        MpdCommand::PlayAlbum(album) => {
+            match adapter.find_album_uris(&album) {
+                Ok(uris) => {
+                    let mut cmds = vec!["clear".to_string()];
+                    for uri in &uris {
+                        let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
+                        cmds.push(format!("addid \"{escaped}\""));
+                    }
+                    cmds.push("play 0".to_string());
+                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayAlbum failed: {e}"); }
+                    if let Some(update) = fetch_full_update(adapter) {
+                        let pv = update.playlist_version.clone();
+                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                    }
+                    *last_status = Instant::now();
+                }
+                Err(e) => log::error!("PlayAlbum failed: {e}"),
+            }
+        }
+        MpdCommand::PlayUris(uris) => {
+            if uris.is_empty() { return false; }
+            let mut cmds: Vec<String> = vec!["clear".to_string()];
+            for uri in uris {
+                let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
+                cmds.push(format!("add \"{escaped}\""));
+            }
+            cmds.push("play 0".to_string());
+            if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayUris failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::AddUris(uris) => {
+            if uris.is_empty() { return false; }
+            let cmds: Vec<String> = uris.iter()
+                .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                .collect();
+            if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddUris failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::InsertNextUris(uris) => {
+            if uris.is_empty() { return false; }
+            let current_pos = adapter.status()
+                .ok()
+                .and_then(|s| s.get("song").cloned())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(-1);
+            if current_pos < 0 {
+                log::warn!("InsertNextUris: no current track, falling back to AddUris");
+                let cmds: Vec<String> = uris.iter()
+                    .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                    .collect();
+                if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris fallback failed: {e}"); }
+            } else {
+                let mut cmds = Vec::with_capacity(uris.len());
+                for (i, uri) in uris.iter().enumerate() {
+                    let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
+                    cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
+                }
+                if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris failed: {e}"); }
+            }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::PlayDirectory(dir) => {
+            match adapter.lsinfo(&dir) {
+                Ok(entries) => {
+                    let uris: Vec<String> = entries.iter()
+                        .filter_map(|e| match e {
+                            DirEntry::File { path, .. } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !uris.is_empty() {
+                        let mut cmds: Vec<String> = vec!["clear".to_string()];
+                        for uri in &uris {
+                            cmds.push(format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")));
+                        }
+                        cmds.push("play 0".to_string());
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayDirectory failed: {e}"); }
+                    }
+                }
+                Err(e) => log::error!("PlayDirectory lsinfo failed: {e}"),
+            }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::AddDirectory(dir) => {
+            match adapter.lsinfo(&dir) {
+                Ok(entries) => {
+                    let uris: Vec<String> = entries.iter()
+                        .filter_map(|e| match e {
+                            DirEntry::File { path, .. } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !uris.is_empty() {
+                        let cmds: Vec<String> = uris.iter()
+                            .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                            .collect();
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddDirectory failed: {e}"); }
+                    }
+                }
+                Err(e) => log::error!("AddDirectory lsinfo failed: {e}"),
+            }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::InsertNextDirectory(dir) => {
+            match adapter.lsinfo(&dir) {
+                Ok(entries) => {
+                    let uris: Vec<String> = entries.iter()
+                        .filter_map(|e| match e {
+                            DirEntry::File { path, .. } => Some(path.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !uris.is_empty() {
+                        let current_pos = adapter.status()
+                            .ok()
+                            .and_then(|s| s.get("song").cloned())
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(-1);
+                        let mut cmds = Vec::with_capacity(uris.len());
+                        if current_pos < 0 {
+                            for uri in &uris {
+                                cmds.push(format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")));
+                            }
+                        } else {
+                            for (i, uri) in uris.iter().enumerate() {
+                                let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
+                                cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
+                            }
+                        }
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextDirectory failed: {e}"); }
+                    }
+                }
+                Err(e) => log::error!("InsertNextDirectory lsinfo failed: {e}"),
+            }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Clear => {
+            if let Err(e) = adapter.send_command("clear") { log::error!("Clear failed: {e}"); }
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+            }
+            *last_status = Instant::now();
+        }
+        MpdCommand::Reconnect => {
+            log::info!("[MPD] received Reconnect command, restarting connection");
+            return true;
+        }
+        MpdCommand::Update => {
+            if let Err(e) = adapter.update_library() {
+                log::error!("Update failed: {e}");
+            } else {
+                log::info!("[MPD] library update triggered, refreshing grid");
+                let _ = event_tx.try_send(MpdEvent::LibraryChanged);
+            }
+        }
+        MpdCommand::Close => {
+            log::info!("[MPD] received Close command, sending close to MPD");
+            let _ = adapter.send_command("close");
+            stop.store(true, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
 
 /// Sync the local queue copy from MPD when the playlist version has changed.
 /// Skips the round-trip when the version matches (`last_version == current_version`).

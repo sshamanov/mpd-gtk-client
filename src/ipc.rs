@@ -156,7 +156,7 @@ fn string_to_action(s: &str) -> Option<MpdCommand> {
 ///
 /// The listener stops when `stop` is set to `true`.
 pub fn start_listener(
-    cmd_tx: std::sync::mpsc::Sender<MpdCommand>,
+    cmd_tx: crate::mpd::state_machine::CommandSender,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let path = socket_path();

@@ -1,6 +1,6 @@
 //! Album cover widget helpers — grid cells with cover art, hover buttons, labels. Thread: UI (GTK main loop).
 
-use crate::mpd::state_machine::MpdCommand;
+use crate::mpd::state_machine::{CommandSender, MpdCommand};
 use gtk4::gdk::Key;
 use gtk4::prelude::*;
 use gtk4::{Box, Button, DrawingArea, EventControllerKey, Label, Orientation, Overlay, Picture};
@@ -18,7 +18,7 @@ pub fn create_album_cover(
     artist: &str,
     cover_path: Option<&str>,
     cover_widgets: &std::cell::RefCell<std::collections::HashMap<String, gtk4::Picture>>,
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
 ) -> Box {
     let container = Box::new(Orientation::Vertical, 0);
     container.set_size_request(200, 250);

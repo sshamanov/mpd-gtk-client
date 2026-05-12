@@ -6,11 +6,11 @@
 //!
 //! Thread safety: interface methods receive D-Bus calls on zbus's internal IO thread.
 //! `SharedState` (`Arc<RwLock<AppState>>`) is `Send + Sync` — safe to read from any thread.
-//! `mpsc::Sender<MpdCommand>` is `Send` — safe to send from any thread.
+//! `CommandSender` is `Send` — safe to send from any thread.
 
 #![cfg(feature = "mpris")]
 
-use crate::mpd::state_machine::{MpdCommand, PlaybackUpdate};
+use crate::mpd::state_machine::{CommandSender, MpdCommand, PlaybackUpdate};
 use crate::state::{AppState, PlaybackState, SharedState};
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -56,7 +56,7 @@ fn file_uri(path: &std::path::Path) -> String {
 
 #[allow(dead_code)]
 struct MprisRoot {
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
     state: SharedState,
 }
 impl MprisRoot {
@@ -111,7 +111,7 @@ impl MprisRoot {
 // Command dispatch helpers (no MpdCommand refs in the zbus interface impl)
 
 struct MprisPlayer {
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
     state: SharedState,
 }
 
@@ -341,7 +341,7 @@ impl MprisPlayer {
 /// The monitoring thread reconnects automatically if the D-Bus session bus
 /// restarts (up to 3 retries with backoff).
 pub fn init(
-    cmd_tx: mpsc::Sender<MpdCommand>,
+    cmd_tx: CommandSender,
     state: SharedState,
     enabled: bool,
     update_rx: mpsc::Receiver<PlaybackUpdate>,
@@ -389,7 +389,7 @@ pub fn init(
 /// Register MPRIS interfaces on a connection. Returns `Some(())` on success.
 fn register_interfaces(
     conn: &Connection,
-    cmd_tx: &mpsc::Sender<MpdCommand>,
+    cmd_tx: &CommandSender,
     state: &SharedState,
 ) -> Option<()> {
     let root = MprisRoot {
@@ -427,7 +427,7 @@ fn conn_is_alive(conn: &Connection) -> bool {
 }
 
 /// Monitor D-Bus connection health. Reconnects up to 3 times on session bus restart.
-fn monitor_loop(mut conn: Connection, cmd_tx: mpsc::Sender<MpdCommand>, state: SharedState) {
+fn monitor_loop(mut conn: Connection, cmd_tx: CommandSender, state: SharedState) {
     const CHECK_INTERVAL: Duration = Duration::from_secs(5);
     const MAX_RETRIES: u32 = 3;
 
