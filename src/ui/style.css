@@ -1,0 +1,92 @@
+
+.album-cover-cell:selected { border: 2px solid @theme_selected_bg_color; }
+.album-cover-cell { min-height: 250px; min-width: 200px; padding: 4px; margin: 2px; border-radius: 6px; background-color: alpha(@theme_base_color, 0.4); }
+.album-cover-cell:hover { background-color: alpha(@theme_selected_bg_color, 0.12); }
+.album-cover-section { padding: 0; margin: 0; }
+
+#cover-image { border-radius: 4px; box-shadow: 2px 4px 3px alpha(black, 0.18); }
+
+.album-cover-cell label { font-size: 1em; padding: 0 4px; }
+.album-cell-artist { font-weight: bold; }
+.group-caption {
+    background-color: alpha(@theme_bg_color, 0.75);
+    color: @theme_fg_color;
+    font-weight: bold;
+    font-size: 0.85em;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+
+.year-badge {
+    background-color: alpha(@theme_fg_color, 0.65);
+    color: alpha(@theme_bg_color, 0.7);
+    font-weight: bold;
+    font-size: 0.75em;
+    padding: 1px 4px;
+    border-width: 0;
+}
+
+gridview { border-spacing: 0; padding: 4px; }
+gridview > child { padding: 2px; }
+listitemwidget { padding: 0; margin: 0; }
+
+.album-cover-hover-btn { opacity: 0; min-width: 28px; min-height: 28px; padding: 2px; border-radius: 4px; background: alpha(@theme_bg_color, 0.85); font-weight: bold; font-size: 1.1em; }
+.album-cover-cell:hover .album-cover-hover-btn { opacity: 1; }
+
+.group-select-btn:checked { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }
+
+#album-grid-status { color: gray; font-style: italic; padding: 24px; }
+
+.breadcrumb-current { font-weight: bold; }
+.breadcrumb-segment { color: @theme_link_color; }
+.breadcrumb-segment:hover { text-decoration: underline; }
+.breadcrumb-root { color: @theme_link_color; }
+.breadcrumb-root:hover { text-decoration: underline; }
+.breadcrumb-sep { color: gray; }
+
+.queue-current { background-color: @theme_selected_bg_color; }
+.queue-artist { font-size: 0.85em; color: gray; }
+
+.shortcut-key { font-weight: bold; }
+.error-label { color: #f44336; font-size: 0.85em; }
+.format-badge { font-size: 0.85em; color: gray; padding: 2px 0; }
+.track-year { opacity: 0.7; font-size: 0.9em; }
+.seekbar { margin: 4px 0; min-height: 12px; }
+
+.mini-queue-cell { padding: 4px; border-radius: 4px; }
+.mini-queue-current { border: 2px solid @theme_selected_bg_color; border-radius: 4px; }
+.mini-queue-cover { border-radius: 2px; }
+
+.status-dot { border-radius: 50%; min-width: 12px; min-height: 12px; }
+.status-dot.playing { background-color: #4CAF50; }
+.status-dot.paused { background-color: #FFC107; }
+.status-dot.stopped { background-color: #888888; }
+.track-title-btn { background: none; border: none; padding: 0; font-size: 1em; }
+.track-title-btn:hover { text-decoration: underline; }
+.tech-data { font-size: 0.85em; color: gray; padding: 2px 0; font-family: monospace; }
+.time-display { font-family: monospace; }
+.track-artist { font-weight: bold; }
+
+.queue-drop-highlight { background-color: rgba(76, 175, 80, 0.12); border-radius: 4px; }
+.drag-remove-zone { background-color: rgba(244, 67, 54, 0.08); }
+.drop-indicator-row { border-top: 3px solid @theme_selected_bg_color; }
+.mini-queue-drop-target { outline: 2px solid @theme_selected_bg_color; outline-offset: 1px; }
+
+.album-cover-cell:focus-visible { outline: 2px solid @theme_selected_bg_color; outline-offset: 2px; }
+.album-cover-hover-btn:focus-visible { opacity: 1; outline: 2px solid @theme_selected_bg_color; }
+
+
+/* Folder browser — Ario-style inset frame, clean compact rows */
+#folder-content { padding: 0; }
+#folder-content scrolledwindow { border-style: inset; border-width: 1px; border-color: @borders; }
+.dir-entry { padding: 2px 0; }
+.dir-icon, .file-icon { margin-right: 4px; opacity: 0.65; }
+.folder-file-row { padding: 2px 0; }
+listbox row { padding: 0; margin: 0; min-height: 24px; }
+listbox row:hover { background-color: alpha(@theme_selected_bg_color, 0.06); }
+listbox row:selected { background-color: @theme_selected_bg_color; }
+listbox row:selected label { color: @theme_selected_fg_color; }
+listbox row:selected image { color: @theme_selected_fg_color; }
+
+/* Bottom panel — visible when right rail is hidden on narrow windows */
+.bottom-panel { background-color: @theme_bg_color; border-top: 1px solid @borders; min-height: 44px; }
