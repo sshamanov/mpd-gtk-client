@@ -1,63 +1,76 @@
-## Deferred Work (Current)
+## Scoped Work
 
-This file lists known issues, bugs, and missing features that are deferred. Items marked **[RESOLVED]** have been addressed by architecture decisions in `architecture.md` or `prd.md` and remain as implementation items only.
+Items planned for the release — may be in-progress or pending.
 
-### Resolved
+### Epics (in sprint backlog)
 
-| Deferred Item | Resolution | Date |
-|---------------|------------|------|
-| Dead MPD connection never triggers reconnect | **[RESOLVED in architecture.md §4-5]** Connection lifecycle: 3 consecutive failures → reconnect. | 2026-04-29 |
-| `MpdEvent::Reconnected` dead code | **[RESOLVED]** Variant removed. | 2026-04-29 |
-| Settings changes require app restart | **[RESOLVED in architecture.md §5a]** Live reconnect via `MpdCommand::Reconnect` with epoch counter. | 2026-04-29 |
-| Search index not rebuilt on library update | **[RESOLVED in architecture.md §9c, §10a]** Index rebuild lifecycle defined. | 2026-04-29 |
-| Cover art `set_cover_path` dead code | **[RESOLVED in architecture.md]** Full pipeline designed with widget registry pattern. | 2026-04-29 |
-| Toast auto-dismiss race | **[RESOLVED]** Generation counter fix. | 2026-04-29 |
-| `search_albums` misses `AlbumArtist` tag | **[RESOLVED in code]** Commit `68f3593` — `AlbumArtist:` lines parsed, used as fallback when per-track `Artist:` missing. | 2026-04-29 |
+| Epic | Story | What |
+|------|-------|------|
+| epic 25 | 25-1-mpd-idle-protocol | Replace 500ms polling with MPD `idle`/`noidle` protocol + `TcpStream::try_clone()` |
+| epic 26 | 26-1-metadata-caching | Pull album metadata into local cache for fast sorting/grouping without MPD round-trips |
+| epic 27 | 27-1-responsive-right-rail | MultiLayoutView + BottomSheet for responsive right rail on narrow windows |
+| epic 20 | 20-1-install-desktop-file | `.desktop` file installation |
+| epic 21 | 21-1-performance-profiling | Profiling tool integration for large libraries |
 
-### Skipped (2026-04-29)
+### Architecture — designed, not yet implemented
 
-These items are real but not worth implementing at this stage — zero or negligible impact:
+- **MPD idle protocol** (same as epic 25)
+- **Centralized KeybindingService** — compile-time conflict detection; currently ad-hoc GTK accelerators
+- **Undo stack** — queue mutation undo
+- **Runtime theme switcher** — user-facing theme toggle (dark/light)
+- **CoverProvider + ActualRead pipeline refinement** — two-layer architecture (CoverProvider index + ActualRead fetch queue) is implemented; potential enhancements: multi-source cover aggregation, configurable cache eviction
+
+### Bugs & Gaps
+
+- **Queue key handler stale `item_ids`** — race window on rapid Shift+Up/Down
+- **`batch_populate` runs synchronously on GTK thread** — large libraries may freeze UI
+- **`search_albums` stale artist across tracks** — partial fix in commit 68f3593, edge cases remain
+- **`MpdAdapter` has no `Drop`** — no clean MPD close on shutdown
+- **SIGINT cleanup via `process::exit(0)`** — skips graceful MPD disconnect
+- **D-Bus session bus reconnection** — MPRIS silently stops if D-Bus restarts
+- **Config loaded twice during startup** — I/O waste on TOML file
+- **BackSpace at root sends `ListDirectory("")`** — harmless but wrong; should be no-op
+
+---
+
+## Out of Scope (Historical)
+
+Items explicitly excluded from the release, kept for reference.
+
+### Design Decisions
+
+- **Three-tier session persistence** — only last active mode persists; full session restore/window geometry out of scope
+- **User-configurable keybindings** — compile-time mapping only; runtime customization out of scope
+- **Flatpak/CI/.deb/.rpm packaging** — build via `cargo build`; no packaging pipeline
+- **Plugin/extension system** — all functionality compiled in; no dynamic loading
+- **i18n/l10n** — English-only UI; no gettext/fluent framework
+- **RTL language support** — layout testing for Arabic/Hebrew not planned
+- **Touchscreen hover controls** — CSS hover overlays don't work on touch
+- **Workspace sub-crates** — single crate; may split when module boundaries proven
+- **System tray icon** — inconsistent across Linux DEs; MPRIS provides equivalent
+
+### Resolved (fixed in code)
+
+| Item | Resolution | Date |
+|------|------------|------|
+| Dead MPD connection never triggers reconnect | 3 consecutive failures → reconnect | 2026-04-29 |
+| `MpdEvent::Reconnected` dead code | Variant removed | 2026-04-29 |
+| Settings changes require app restart | Live reconnect via `MpdCommand::Reconnect` | 2026-04-29 |
+| Search index not rebuilt on library update | Index rebuild lifecycle defined | 2026-04-29 |
+| Cover art `set_cover_path` dead code | Full pipeline + widget registry designed | 2026-04-29 |
+| Toast auto-dismiss race | Generation counter fix | 2026-04-29 |
+| `search_albums` misses `AlbumArtist` tag | Commit 68f3593 | 2026-04-29 |
+| Grouped-mode double-click plays wrong album | Cannot reproduce, fixed | 2026-05-07 |
+| Cue/DSD rows clickable no-ops | Fixed (PlayUris, AddUris, Play Next for CUE) | 2026-05-07 |
+| 30ms timer starves GTK main loop | Replaced with frame clock callback | 2026-05-07 |
+| `list_albums_grouped` loses artist for Date/Genre | Cannot reproduce, fixed | 2026-05-07 |
+| `InsertNext` uses stale `current_pos` | Cannot reproduce, fixed | 2026-05-07 |
+| MPRIS PropertiesChanged signal emission | Emitter exists (ui/mod.rs:318, 2089) | 2026-05-07 |
+| SharedState playback fields never populated | Now populated (ui/mod.rs:2061-2077) | 2026-05-07 |
+
+### Skipped (negligible impact)
 
 | Item | Reason |
 |------|--------|
-| `ExponentialBackoff` derive(Clone) is misleading | Never actually cloned. Maintenance risk only. |
-| Config loaded twice during startup | Minor I/O waste on a tiny TOML file. |
-| Folder tree Left/BackSpace at root sends `ListDirectory("")` | Harmless MPD no-op. |
-| Unicode symbols in GTK labels may not render | Portability concern. All modern Linux systems render them. |
-
-### Active Backlog
-
-#### UI & Interaction
-
-- **Grouped-mode double-click plays wrong album** — FlowBox child index includes group headers but `album_names` doesn't. Reindexing needed. [src/ui/]
-- **Queue key handler uses stale `item_ids` after rapid Shift+Up/Down** — Race window <10ms. Queue event rebuilds map. [src/ui/]
-- **`populate_album_grid` and `populate_grouped_grid` run synchronously on GTK thread** — Large libraries may freeze UI. GtkGridView factory pattern designed but not implemented. [src/ui/]
-- **Cue/DSD rows clickable but navigate to same directory (no-op)** — Needs proper navigation/playback. [src/ui/widgets/folder_tree.rs]
-- **`glib::timeout_add_local` at 30ms can starve GTK main loop under heavy load** — 64-event batch limit mitigates. Full fix needs GTK4 frame clock integration.
-
-#### MPD Protocol & Data
-
-- **`list_albums_grouped` loses artist for Date/Genre groupings** — MPD protocol limitation. Per-album fetch needed for non-Artist groupings. [src/mpd/]
-- **`InsertNext` uses potentially stale `current_pos` from last poll** — Command response is immediate; poll staleness is bounded by idle response time.
-- **`search_albums` stale artist across tracks when Artist tag missing** — Rare edge case. `file:` line reset added but edge cases remain.
-
-#### Infrastructure
-
-- **`MpdAdapter` has no `Drop` — no clean MPD close on shutdown** — Socket closes on process exit. Graceful close adds ~50ms to shutdown.
-- **SIGINT cleanup via `process::exit(0)` skips graceful MPD disconnect** — `idle_add` defers exit. Full cleanup needs GTK lifecycle work.
-
-#### Cover Art (v2 pipeline)
-
-Current `src/coverart/mod.rs` is a basic single-file fetcher (v1). The v2 architecture in `architecture.md` designs a full `CoverProvider + ActualRead` two-layer pipeline that remains unimplemented:
-- CoverProvider cache read (synchronous, no fallthrough)
-- AlbumArtProvider MPD binary fetch (content-addressed via MD5)
-- ReadPictureProvider fallback (timestamp-compared)
-- ActualRead priority queue with scroll-aware loading (one album per idle cycle)
-- Online cover lookup support (opt-in, rate-limited)
-- Widget registry integration for in-place cell updates
-
-#### Deferred from: code review of story 14-2 (2026-05-01)
-
-- **MPRIS PropertiesChanged signal emission** — Property getters read SharedState directly, sufficient for playerctl/mpris-remote. Lock screen and GNOME Shell media controls don't auto-update without signal emission.
-- **SharedState playback fields never populated** — Pre-existing: MPD StateChanged handler in ui/mod.rs extracts metadata to local variables but never writes to SharedState. `s.current.track`, `s.current.album` always None. Affects any code reading current track metadata from SharedState, including MPRIS, not just this story.
-- **D-Bus session bus disconnection mid-session** — No monitoring or reconnection for D-Bus session bus drops. MPRIS silently stops responding if D-Bus restarts.
+| `ExponentialBackoff` derive(Clone) is misleading | Never actually cloned; maintenance risk only |
+| Unicode symbols in GTK labels may not render | All modern Linux systems render them |

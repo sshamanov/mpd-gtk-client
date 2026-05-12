@@ -52,7 +52,7 @@ impl MpdStream {
         match self {
             MpdStream::Tcp(s) => s.set_read_timeout(timeout),
             #[cfg(unix)]
-            MpdStream::Unix(_) => Ok(()), // Unix sockets don't need timeouts
+            MpdStream::Unix(s) => s.set_read_timeout(timeout),
         }
     }
 
@@ -165,8 +165,19 @@ pub struct QueueItem {
     pub album_id: String,
 }
 
-/// A group of albums: (group_name, [(artist, album_name), ...]).
-pub type AlbumGroup = Vec<(String, Vec<(String, String)>)>;
+/// Cached album metadata — fetched once from MPD, reused for all group views.
+/// Cover art is cached separately via the coverart module.
+#[derive(Debug, Clone)]
+pub struct AlbumMeta {
+    pub album: String,
+    pub album_artist: String,
+    pub track_artists: Vec<String>,
+    pub year: Option<String>,
+    pub genre: Option<String>,
+}
+
+/// A group of albums: (group_name, [AlbumMeta, ...]).
+pub type AlbumGroup = Vec<(String, Vec<AlbumMeta>)>;
 
 /// An item in the MPD playback queue with display metadata.
 #[derive(Debug, Clone)]
@@ -238,7 +249,7 @@ impl MpdVersion {
     }
 
     fn supports_readpicture(&self) -> bool {
-        self.major >= 1 || (self.major == 0 && self.minor >= 24)
+        self.major >= 1 || (self.major == 0 && self.minor >= 22)
     }
 
     fn supports_albumart(&self) -> bool {
@@ -548,28 +559,33 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
     /// Issues multiple commands with increasing offsets to reassemble large images.
     pub fn albumart(&mut self, album: &str) -> Result<Option<Vec<u8>>, Error> {
         let uris = self.find_album_uris(album)?;
-        let uri = match uris.first() {
-            Some(u) => u.clone(),
-            None => return Ok(None),
-        };
+        match uris.first() {
+            Some(uri) => self.albumart_by_uri(uri, album),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch album art for a known URI — skips the `find_album_uris` round-trip.
+    pub fn albumart_by_uri(&mut self, uri: &str, log_label: &str) -> Result<Option<Vec<u8>>, Error> {
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+        let cmd = format!("albumart \"{}\" 0\n", escaped);
 
         // First request: get total size and first chunk
-        let total_size = {
-            let cmd = format!("albumart \"{}\" 0\n", escaped);
+        let (total_size, first_chunk) = {
             self.stream.write_all(cmd.as_bytes())?;
             self.stream.flush()?;
             let raw = self.read_albumart_response()?;
             if raw.is_empty() { return Ok(None); }
-            Self::parse_albumart_size(&raw)
+            let size = Self::parse_albumart_size(&raw);
+            let chunk = Self::parse_albumart_chunk(&raw);
+            (size, chunk)
         };
         let Some(total_size) = total_size else { return Ok(None); };
 
-        // Fetch all chunks with increasing offsets
-        let mut data = Vec::with_capacity(total_size);
-        let mut offset = 0usize;
+        // Fetch remaining chunks with increasing offsets
+        let mut data = first_chunk;
         while data.len() < total_size {
-            let cmd = format!("albumart \"{}\" {offset}\n", escaped);
+            let cmd = format!("albumart \"{}\" {}\n", escaped, data.len());
             self.stream.write_all(cmd.as_bytes())?;
             self.stream.flush()?;
             let raw = self.read_albumart_response()?;
@@ -577,15 +593,14 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
             let chunk = Self::parse_albumart_chunk(&raw);
             if chunk.is_empty() { break; }
             data.extend_from_slice(&chunk);
-            offset += chunk.len();
         }
         if data.is_empty() { return Ok(None); }
-        log::info!("[adapter] albumart: got {}/{} bytes for '{album}'", data.len(), total_size);
+        log::info!("[adapter] albumart: got {}/{} bytes for '{log_label}'", data.len(), total_size);
         Ok(Some(data))
     }
 
     /// Fetch embedded album art via MPD's `readpicture` command. Returns raw JPEG/PNG bytes
-    /// plus the mtime timestamp. Requires MPD >= 0.24.
+    /// plus the mtime timestamp. Requires MPD >= 0.22.
     /// Issues multiple commands with increasing offsets to reassemble large images.
     pub fn readpicture(&mut self, uri: &str) -> Result<Option<(Vec<u8>, u64)>, Error> {
         let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
@@ -841,106 +856,169 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         Ok(entries)
     }
 
-    /// Fetch all albums with their artist names.
-    pub fn list_albums(&mut self) -> Result<Vec<(String, String)>, Error> {
-        let lines = self.send_command("list album group AlbumArtist")?;
-        let mut albums: Vec<(String, String)> = Vec::new();
-        let mut current_artist = String::new();
-        for line in lines {
-            // AlbumArtist takes priority; fall back to Artist if AlbumArtist is absent
-            if let Some(artist) = line.strip_prefix("AlbumArtist: ") {
-                current_artist = artist.to_string();
-            } else if let Some(artist) = line.strip_prefix("Artist: ") {
-                if current_artist.is_empty() {
-                    current_artist = artist.to_string();
-                }
+    /// Extract just the year (first 4 digits) from a Date tag that may be
+/// a full date like "2024-03-15" or just "2024".
+fn normalize_year(date: &str) -> String {
+    date.split('-').next().unwrap_or(date).to_string()
+}
+
+/// Fetch all albums with full metadata (AlbumArtist, Date, Genre).
+    /// Uses 3 separate MPD `list` commands (MPD only supports single `group`).
+    /// Merges locally by album name — each query is one round-trip.
+    pub fn list_albums_full(&mut self) -> Result<Vec<AlbumMeta>, Error> {
+        // 1. Album→AlbumArtist mapping
+        let lines_aa = self.send_command("list album group AlbumArtist")?;
+        let mut album_to_artist: HashMap<String, String> = HashMap::new();
+        let mut current_aa = String::new();
+        for line in &lines_aa {
+            if let Some(aa) = line.strip_prefix("AlbumArtist: ") {
+                current_aa = aa.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
-                albums.push((current_artist.clone(), album.to_string()));
+                album_to_artist.insert(album.to_string(), current_aa.clone());
             }
         }
-        albums.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-        Ok(albums)
+
+        // 2. Album→Date mapping
+        let lines_date = self.send_command("list album group Date")?;
+        let mut album_to_date: HashMap<String, String> = HashMap::new();
+        let mut current_date = String::new();
+        for line in &lines_date {
+            if let Some(date) = line.strip_prefix("Date: ") {
+                current_date = Self::normalize_year(date);
+            } else if let Some(album) = line.strip_prefix("Album: ") {
+                album_to_date.insert(album.to_string(), current_date.clone());
+            }
+        }
+
+        // 3. Album→Genre mapping
+        let lines_genre = self.send_command("list album group Genre")?;
+        let mut album_to_genre: HashMap<String, String> = HashMap::new();
+        let mut current_genre = String::new();
+        for line in &lines_genre {
+            if let Some(genre) = line.strip_prefix("Genre: ") {
+                current_genre = genre.to_string();
+            } else if let Some(album) = line.strip_prefix("Album: ") {
+                album_to_genre.insert(album.to_string(), current_genre.clone());
+            }
+        }
+
+        // 4. Album→TrackArtists mapping (artists that appear on each album's tracks)
+        let lines_ta = self.send_command("list artist group album")?;
+        let mut album_to_artists: HashMap<String, Vec<String>> = HashMap::new();
+        let mut current_album_for_artist = String::new();
+        for line in &lines_ta {
+            if let Some(album) = line.strip_prefix("Album: ") {
+                current_album_for_artist = album.to_string();
+            } else if let Some(artist) = line.strip_prefix("Artist: ") {
+                album_to_artists
+                    .entry(current_album_for_artist.clone())
+                    .or_default()
+                    .push(artist.to_string());
+            }
+        }
+
+        // Merge: collect unique album names from all sources
+        let mut all_albums: Vec<AlbumMeta> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new(); // album name → index
+
+        let build_meta = |album: &str, aa: &str| -> AlbumMeta {
+            let track_artists = album_to_artists.get(album)
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            AlbumMeta {
+                album: album.to_string(),
+                album_artist: aa.to_string(),
+                track_artists,
+                year: album_to_date.get(album).cloned(),
+                genre: album_to_genre.get(album).cloned(),
+            }
+        };
+
+        for album in album_to_artist.keys() {
+            let aa = album_to_artist.get(album).cloned().unwrap_or_default();
+            seen.insert(album.clone(), all_albums.len());
+            all_albums.push(build_meta(album, &aa));
+        }
+        // Albums that appear in date/genre/artists but not album_artist
+        for album in album_to_date.keys() {
+            if !seen.contains_key(album) {
+                seen.insert(album.clone(), all_albums.len());
+                all_albums.push(build_meta(album, ""));
+            }
+        }
+        for album in album_to_genre.keys() {
+            if !seen.contains_key(album) {
+                seen.insert(album.clone(), all_albums.len());
+                all_albums.push(build_meta(album, ""));
+            }
+        }
+        for album in album_to_artists.keys() {
+            if !seen.contains_key(album) {
+                seen.insert(album.clone(), all_albums.len());
+                all_albums.push(build_meta(album, ""));
+            }
+        }
+
+        all_albums.sort_by(|a, b| a.album.to_lowercase().cmp(&b.album.to_lowercase()));
+        Ok(all_albums)
     }
 
-    /// Fetch albums grouped by the given type ("Artist", "Date", "Genre", or "Albums" for flat).
-    pub fn list_albums_grouped(&mut self, group: &str) -> Result<AlbumGroup, Error> {
+    pub fn list_albums(&mut self) -> Result<Vec<AlbumMeta>, Error> {
+        // Use the full metadata query for all album listing.
+        // Kept as a thin wrapper for backward compat.
+        self.list_albums_full()
+    }
+
+    /// Group cached album metadata locally by the given tag ("Artist", "AlbumArtist",
+    /// "Date", "Genre", or "Albums" for flat). No MPD round-trip — uses the provided slice.
+    pub fn list_albums_grouped(&self, group: &str, all_albums: &[AlbumMeta]) -> AlbumGroup {
         if group == "Albums" || group.is_empty() {
-            let flat = self.list_albums()?;
-            return Ok(vec![("All Albums".into(), flat)]);
+            return vec![("All Albums".into(), all_albums.to_vec())];
         }
-        let lines = self.send_command(&format!("list album group {group}"))?;
 
-        // For Date/Genre groupings, fetch the flat album list to build an artist lookup map.
-        // MPD's `list album group {group}` does not include Artist metadata for Date/Genre,
-        // so we backfill from the flat list grouped by AlbumArtist.
-        // Artist and AlbumArtist groupings include artist metadata inline — no backfill needed.
-        let flat_albums: Option<Vec<(String, String)>> = if group != "Artist" && group != "AlbumArtist" {
-            Some(self.list_albums()?)
-        } else {
-            None
-        };
-        let artist_lookup: std::collections::HashMap<&str, &str> = flat_albums
-            .as_ref()
-            .map(|albums| albums.iter().map(|(a, b)| (b.as_str(), a.as_str())).collect())
-            .unwrap_or_default();
-
-        let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let mut current_header = String::new();
-        let mut current_items: Vec<(String, String)> = Vec::new();
-        let header_prefix = format!("{group}: ");
-        for line in lines {
-            if let Some(name) = line.strip_prefix(&header_prefix) {
-                if !current_header.is_empty() {
-                    groups.push((current_header.clone(), std::mem::take(&mut current_items)));
+        let group_key = |a: &AlbumMeta| -> String {
+            match group {
+                "Artist" | "AlbumArtist" => {
+                    if a.album_artist.is_empty() {
+                        "Unknown Artist".into()
+                    } else {
+                        a.album_artist.clone()
+                    }
                 }
-                current_header = name.to_string();
-            } else if let Some(album) = line.strip_prefix("Album: ") {
-                // Artist/AlbumArtist grouping: header IS the artist
-                // Date/Genre grouping: look up artist from the flat album list
-                let artist = if group == "Artist" || group == "AlbumArtist" {
-                    current_header.clone()
-                } else {
-                    artist_lookup
-                        .get(album)
-                        .unwrap_or(&"Unknown Artist")
-                        .to_string()
-                };
-                current_items.push((artist, album.to_string()));
+                "Date" => a.year.clone().unwrap_or_else(|| "Unknown Year".into()),
+                "Genre" => a.genre.clone().unwrap_or_else(|| "Unknown Genre".into()),
+                _ => "Unknown".into(),
             }
+        };
+
+        let mut groups: Vec<(String, Vec<AlbumMeta>)> = Vec::new();
+        let mut current_header = String::new();
+        let mut current_items: Vec<AlbumMeta> = Vec::new();
+
+        // Sort by group key first, then by album name
+        let mut sorted = all_albums.to_vec();
+        sorted.sort_by(|a, b| {
+            let ka = group_key(a);
+            let kb = group_key(b);
+            ka.to_lowercase()
+                .cmp(&kb.to_lowercase())
+                .then_with(|| a.album.to_lowercase().cmp(&b.album.to_lowercase()))
+        });
+
+        for album in sorted {
+            let key = group_key(&album);
+            if key != current_header {
+                if !current_header.is_empty() {
+                    groups.push((std::mem::take(&mut current_header), std::mem::take(&mut current_items)));
+                }
+                current_header = key;
+            }
+            current_items.push(album);
         }
         if !current_header.is_empty() {
             groups.push((current_header, current_items));
         }
 
-        // Collect all album names that appear in any group
-        let mut grouped_albums: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (_, albums) in &groups {
-            for (_, name) in albums {
-                grouped_albums.insert(name.clone());
-            }
-        }
-
-        // Find albums from the flat list that are not in any group
-        let unknown_label = match group {
-            "Date" => "Unknown Year",
-            "Genre" => "Unknown Genre",
-            _ => "Unknown",
-        };
-        let untagged: Vec<(String, String)> = if let Some(albums) = flat_albums {
-            albums
-                .into_iter()
-                .filter(|(_, name)| !grouped_albums.contains(name))
-                .collect()
-        } else {
-            self.list_albums()?
-                .into_iter()
-                .filter(|(_, name)| !grouped_albums.contains(name))
-                .collect()
-        };
-        if !untagged.is_empty() {
-            groups.push((unknown_label.into(), untagged));
-        }
-
-        Ok(groups)
+        groups
     }
 }

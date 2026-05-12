@@ -1,7 +1,7 @@
 //! Application entry point — CLI parsing, initializes env_logger, creates state, starts GTK main loop. Thread: UI (startup then GTK main loop).
 
 pub mod config;
-pub mod constants;
+
 pub mod coverart;
 pub mod errors;
 pub mod ipc;
@@ -27,9 +27,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use ui::App;
-
-/// Set by SIGINT/SIGTERM signal handlers to request a graceful GTK main loop exit.
-pub(crate) static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Print usage information to stdout.
 fn print_usage() {
@@ -103,15 +100,27 @@ where
                 }
             }
             "--start-playing" => {
+                if action.is_some() {
+                    eprintln!("warning: --start-playing overrides previous action flag");
+                }
                 action = Some(MpdCommand::Play);
             }
             "--toggle-playback" => {
+                if action.is_some() {
+                    eprintln!("warning: --toggle-playback overrides previous action flag");
+                }
                 action = Some(MpdCommand::Pause);
             }
             "--next" => {
+                if action.is_some() {
+                    eprintln!("warning: --next overrides previous action flag");
+                }
                 action = Some(MpdCommand::Next);
             }
             "--prev" => {
+                if action.is_some() {
+                    eprintln!("warning: --prev overrides previous action flag");
+                }
                 action = Some(MpdCommand::Previous);
             }
             unknown => {
@@ -245,10 +254,9 @@ fn main() {
         log::warn!("MPRIS: enabled in config but not compiled (rebuild with --features mpris)");
     }
 
-    // Signal handlers are no longer registered directly (glib::source::unix_signal_add
-    // was removed in glib 0.22). The SHUTDOWN_REQUESTED flag is set by Ctrl+Q
-    // (registered in App::run). On window close, the GTK main loop exits normally
-    // and the shutdown sequence below runs.
+    // Signal handlers (SIGINT/SIGTERM) were removed — glib::source::unix_signal_add
+    // was dropped in glib 0.22. Ctrl+Q calls app.quit() directly. On window close,
+    // the GTK main loop exits normally and the shutdown sequence below runs.
 
     // Dispatch deferred action commands after event loop is running.
     // Commands sit in the mpsc channel until connected_loop begins processing them,

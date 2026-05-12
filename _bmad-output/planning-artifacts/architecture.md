@@ -20,7 +20,7 @@ date: '2026-04-23'
 
 _This document builds collaboratively through step-by-step discovery. Sections are appended as we work through each architectural decision together._
 
-**V2 refinements (2026-04-28):** Cover art pipeline, MPD idle protocol, command batching, Unix socket detection, multi-profile connections, libadwaita integration, and MPRIS configuration are now documented inline in their respective ADR sections below.
+**Scoped refinements (2026-04-28):** Cover art pipeline, MPD idle protocol, command batching, Unix socket detection, multi-profile connections, libadwaita integration, and MPRIS configuration are now documented inline in their respective ADR sections below.
 
 ## Project Context Analysis
 
@@ -236,7 +236,7 @@ enum MpdEvent {
 - Binary data (cover art) requires dedicated channel
 - Thread lifecycle must be managed on app shutdown
 
-### v2 Refinement: Idle Protocol (2026-04-28)
+### Scoped Refinement: Idle Protocol (2026-04-28)
 
 **Decision:** True MPD `idle`/`noidle` protocol with `TcpStream::try_clone()` for thread-safe socket access. CoverGrid pattern: worker thread blocks on `idle` when queue empty; main thread writes `noidle\n` to socket clone to break idle.
 
@@ -246,18 +246,18 @@ enum MpdEvent {
 - If `idle` returns transient error (connection reset, timeout): fall back to 100ms `status` polling for 10 cycles (1 second), then retry `idle`.
 - If `idle` returns "unknown command" (MPD < 0.19 or idle disabled): fall back to 500ms polling permanently.
 
-**Status: NOT IMPLEMENTED — in-scope for V1 (epic 25).** Currently uses 500ms polling in `connected_loop` (line 548). Idle protocol would replace this with event-driven updates via `TcpStream::try_clone()` for thread-safe socket access.
+**Status: NOT IMPLEMENTED — scoped (epic 25).** Currently uses 500ms polling in `connected_loop` (line 548). Idle protocol would replace this with event-driven updates via `TcpStream::try_clone()` for thread-safe socket access.
 
 **Proven pattern:** dead connection detection via 3 consecutive `fetch_full_update()` failures → return from `connected_loop` → outer state machine triggers reconnect with exponential backoff.
 
 ## Architecture Decision Record: Cover Art Pipeline
 
-**Decision (v2, 2026-04-28):** Two-layer split: **CoverProvider** (fast synchronous cache read) and **ActualRead** (background fetch queue). Replaces the earlier layered-provider-chain design which was never implemented.
+**Decision (2026-04-28):** Two-layer split: **CoverProvider** (fast synchronous cache read) and **ActualRead** (background fetch queue). Replaces the earlier layered-provider-chain design which was never implemented.
 
 ### Options Considered
 
 1. **CoverProvider + ActualRead two-layer split** — CoverProvider reads disk cache synchronously, returns immediately or not at all. ActualRead runs in idle cycles, fetches via MPD protocol, writes cache, emits events. No cascading fallback chain.
-2. **Layered provider chain with deduplication** — Original v1 design: `LocalLookupProvider` → `EmbeddedArtProvider` → `OnlineLookupProvider` with session + disk caches. Replaced by Option 1 — the two-layer split decouples cache reads from fetching, allowing any provider (including online) to be added to ActualRead without affecting the fast cache path.
+2. **Layered provider chain with deduplication** — Original design: `LocalLookupProvider` → `EmbeddedArtProvider` → `OnlineLookupProvider` with session + disk caches. Replaced by Option 1 — the two-layer split decouples cache reads from fetching, allowing any provider (including online) to be added to ActualRead without affecting the fast cache path.
 3. **Event-driven cover resolution** — Cover requests emitted as events; multiple handlers process independently. Flexible but risks duplicate work.
 
 ### Decision
@@ -327,7 +327,7 @@ UI thread: receives CoverRefreshed → decode bytes → GdkTexture → redraw wi
 - Cover art loads incrementally (one per idle cycle) — visible items may take several cycles on first load
 - Revalidation on reconnect emits only on actual change — but the first revalidation pass requires fetching all visible album covers
 
-### Cover Art Image Pipeline (v2 refinement)
+### Cover Art Image Pipeline (superseded)
 
 **Decision:** Single-resolution disk cache with on-demand decode to GdkTexture. No multi-resolution thumbnail pre-generation.
 
@@ -336,11 +336,74 @@ UI thread: receives CoverRefreshed → decode bytes → GdkTexture → redraw wi
 - **Scale:** GTK4's `GtkPicture` handles aspect-ratio-aware display natively — no manual downscale needed.
 - **No session cache:** The widget registry holds `GtkPicture` references for visible items only. Non-visible items are dropped by GTK's widget hierarchy.
 
-### Explicit Trade-offs Accepted (Image Pipeline)
+### Explicit Trade-offs Accepted (Image Pipeline — superseded)
 
 - On-demand decode per cover load (~5ms for JPEG decode) — acceptable since covers load one per idle cycle (100ms)
 - No GPU-side texture cache — covers are re-decoded when scrolled back into view
 - Cache size on disk bounded only by available space
+
+### Cover Art Image Pipeline (proposed 2026-05-06)
+
+**Decision:** Offload all JPEG decoding and scaling from GTK/glycin to the `image` crate. GTK handles only GPU texture upload and display compositing. This eliminates the glycin sandbox overhead entirely.
+
+**Motivation:** The current pipeline routes all cover images through `gdk-pixbuf` → glycin, which spawns sandboxed `bwrap` subprocesses, communicates over D-Bus, and applies ICC color management. For album covers — which are universally RGB JPEGs that don't need color management — this machinery is pure overhead: 11–65ms per cold decode, sandbox lifecycle noise, and ICC conversion that the `strip_jpeg_icc()` function was added to work around.
+
+The `image` crate is already compiled into the binary (jpeg/png/webp features enabled) but completely unused. Replacing glycin with it is a net code deletion.
+
+**Architecture:**
+
+```
+MPD ──[TCP]──► raw JPEG bytes
+                  │
+                  ├──► write_cache() ──► disk (JPEG for persistence)
+                  │
+                  └──► CoverRefreshed event (raw bytes)
+                           │
+                           ▼
+                      image::load_from_memory(bytes)   ← Rust JPEG decoder, no sandbox
+                           │
+                           ▼
+                      DynamicImage (RGBA pixels)
+                           │
+                           ├──► image::resize_exact(200, 200, Lanczos3)
+                           │
+                           ▼
+                      raw RGBA → gdk4::MemoryTexture::new(w,h,R8g8b8a8,&bytes,stride)
+                           │                                    ← zero-copy GPU upload
+                           ▼
+                      gtk4::Picture.set_paintable()
+
+Cache reads (bind callback):
+  image::open(path) ──► resize_exact ──► MemoryTexture ──► Picture
+```
+
+**What is removed:**
+- `gdk-pixbuf` crate dependency (entirely)
+- `Pixbuf::from_file_at_size`, `Pixbuf::from_read`, `Pixbuf::scale_simple`, `Texture::for_pixbuf`
+- `strip_jpeg_icc()` function — `image` crate decodes directly to sRGB, no ICC path exists
+- glycin sandbox subprocesses (bwrap), D-Bus IPC, ICC conversion, pool lifecycle
+- glycin debug log noise (`glycin::icc`, `glycin::pool`, `glycin::dbus`)
+
+**What stays in GTK:**
+- `gdk4::MemoryTexture` — zero-copy GPU upload from raw RGBA bytes. No I/O, no sandbox.
+- `gtk4::Picture.set_paintable()` — pure display compositing.
+
+**Estimated performance:**
+
+| Metric | glycin (current) | image crate (proposed) |
+|--------|------------|-------------------|
+| Cold decode | 11–65ms | 3–10ms |
+| Warm decode | 3–10ms | 2–6ms |
+| Per-image memory | ~20MB sandbox + pixbuf | ~0.4MB (200×200×4) |
+| Log output | glycin pool/icc/dbus lines | None |
+
+**Trade-off:** The `image` crate's JPEG decoder does not support CMYK JPEGs. Album covers are universally RGB. If a CMYK cover is encountered, `image` returns `UnsupportedColorSpace` and the existing placeholder fallback handles it gracefully. Probability estimate: <0.01%.
+
+**Implementation phases:**
+1. Replace `Pixbuf::from_read` + `scale_simple` in CoverRefreshed handler with `image` crate + `MemoryTexture`
+2. Replace `Pixbuf::from_file_at_size` in bind callback and now-playing with `image::open` + `MemoryTexture`
+3. Replace `Pixbuf::new` + `fill` placeholder with `image::RgbImage::from_pixel` + `MemoryTexture`
+4. Remove `strip_jpeg_icc()`, its call sites, and the `gdk-pixbuf` dependency
 
 ### Proven Patterns from Validation Session
 
@@ -368,6 +431,144 @@ The following patterns were validated against a real MPD instance and are incorp
 - Responsive re-flow during window resize triggers full grid re-projection
 - Mitigated by 150ms debounce on resize events and projection caching per breakpoint
 - User override of min column width can produce layouts that look sparse on wide screens
+
+### Issues (2026-05-06)
+
+The original design was never fully realized — the codebase uses `pad_groups()` with `AlbumGridItem::Filler` items directly in the ListModel, not a separate `LayoutService`. The filler-in-model approach has proven unfixable for resize due to allocation propagation lag (see debug-session-2026-05-06.md).
+
+---
+
+## Architecture Decision Record: Grid Layout — coordinate-based album grid (proposed 2026-05-06, not yet implemented)
+
+**Decision:** Replace the single-GridView-with-fillers architecture with a flat `GtkLayout` where all album cover cells and group captions are positioned by pure Rust coordinate math. No GridView, no ListModel, no factories, no bind/unbind callbacks, no fillers.
+
+### Motivation
+
+The current grid architecture places layout artifacts (`AlbumGridItem::Filler`) inside the data model. On window resize, column count changes → filler positions change everywhere → the entire ListModel must be rebuilt via `model.splice()` → GTK destroys and recreates visible widgets → bind callbacks re-decode cover textures. This is slow (5–50ms), janky, and fundamentally unfixable because GTK's top-down allocation propagation means `grid.width()` is stale when the resize signal fires from a parent widget.
+
+Two clean alternatives exist:
+
+**Option A — One GridView per group:** Each group gets its own small GridView with only album items. Group captions are real GtkLabel widgets between grids. GTK's built-in GridView column flow handles resize natively. Deletes `pad_groups()`, fillers, and all resize signal handlers.
+
+**Option B — Coordinate math (GtkLayout):** One flat GtkLayout container. All widgets placed at computed (x, y) coordinates. On resize, iterate items once, recompute positions, call `layout.move_(widget, x, y)`. No GridView, no ListModel, no factories, no bind/unbind. Pure Rust math → GTK display.
+
+### Decision
+
+**Option B: Coordinate math (GtkLayout).**
+
+### Widget tree (proposed)
+
+```
+Window → Box → Paned (left | right)
+                  ├── left: GtkStack
+                  │    ├── Label "Connecting to MPD..."
+                  │    ├── Label "No albums found"
+                  │    └── GtkScrolledWindow
+                  │         └── GtkLayout (one flat container)
+                  │              ├── GtkLabel "Artist A"          ← move(label, 0, y)
+                  │              ├── AlbumCoverCell                ← move(cell, x*216, y)
+                  │              ├── AlbumCoverCell
+                  │              ├── GtkLabel "Artist B"
+                  │              └── AlbumCoverCell
+                  │              ...
+                  └── right: GtkStack (queue / now-playing)
+```
+
+### Resize algorithm
+
+```rust
+fn reposition(layout: &gtk4::Layout, width: f64, items: &[AlbumCell]) {
+    let cols = (width / CELL_SLOT).floor().max(1.0);
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut current_group = None;
+
+    for item in items {
+        if item.group_label != current_group {
+            // Caption row — full-width label
+            layout.move_(&item.caption, 0.0, y);
+            y += CAPTION_HEIGHT;
+            x = 0.0;
+            current_group = item.group_label.clone();
+        }
+        layout.move_(&item.cell, x * CELL_SLOT, y);
+        x += 1.0;
+        if x >= cols { x = 0.0; y += CELL_HEIGHT; }
+    }
+    layout.set_size(width, y + CELL_HEIGHT);
+}
+```
+
+**Performance:** 500 items → 500 `layout.move_()` calls → ~1ms. No widget creation, no texture reload. GTK queues redraw only for changed areas.
+
+### What is removed
+
+| Removed | Reason |
+|---------|--------|
+| `AlbumGridItem::Filler` variant | Layout artifacts no longer in data model |
+| `pad_groups()` (~60 lines) | No padding computation needed |
+| `AlbumGridData` / `album_grid_data` RefCell | Items stored as Vec<AlbumCell>, accessed by index |
+| `ListStore` / `NoSelection` / `SignalListItemFactory` | No ListModel hierarchy |
+| Bind callback (`connect_bind`) | Widgets created imperatively, not by factory |
+| Unbind callback (`connect_unbind`) | Widgets never recycled |
+| `StringObject` index hack | Direct index-based access |
+| `resize_last_cols` / `resize_generation` / `resize_last_time` | No debouncing needed |
+| `do_repad` / `trigger_repad` closures | Replaced by single `reposition()` call |
+| All resize signal handlers on Paned | `GtkLayout.move_()` is the only resize action |
+| `cover_widgets` HashMap<Picture> widget registry | Direct widget access via Vec index |
+| `batch_populate()` model manipulation | Direct widget property updates |
+| Group padding logic in bind callback | Captions are real widgets, not faux album items |
+
+### What GTK still handles
+
+- **`GtkScrolledWindow`**: Scroll bars, kinetic scrolling, viewport clipping. Only visible widgets are painted.
+- **`GtkLayout`**: Fixed-position container with configurable canvas size.
+- **`gdk4::MemoryTexture` + `gtk4::Picture`**: GPU texture upload and compositing.
+
+### Widget lifecycle
+
+All 500 widgets (covers + captions) are created upfront on library load. They remain alive for the session lifetime — no recycling, no destruction, no re-creation. Cover textures are set once on creation and updated in-place when events arrive (CoverRefreshed, CoverPaths).
+
+### Cover event update path (simplified)
+
+```
+Current:
+  CoverPaths(id, path) → cover_widgets.borrow() → HashMap::get(id) →
+    if Some(pic) { pic.set_paintable(...) }
+
+Proposed:
+  CoverPaths(id, path) → cells[id].picture.set_paintable(...)
+```
+
+O(1) Vec index → direct widget call. No HashMap, no RefCell, no borrow contention with the UI thread.
+
+### Memory budget
+
+| Component | Count | Per-item | Total |
+|-----------|-------|----------|-------|
+| AlbumCoverCell widgets | 500 | ~2KB | 1MB |
+| GtkPicture widgets | 500 | ~0.5KB | 0.25MB |
+| GtkLabel captions | 50 | ~1KB | 0.05MB |
+| Cover textures (cached separately) | 500 | ~160KB | 80MB |
+| **Widget overhead** | | | **~1.3MB** |
+
+Widget overhead is negligible against the 200MB budget. Cover textures dominate as before and are bounded by the existing texture cache.
+
+### Trade-offs
+
+- **Widget count vs. recycling**: GridView recycles ~30 widgets for scroll; this creates all 500 upfront. Memory impact: ~1.3MB — acceptable.
+- **Startup time**: Creating 550 widgets takes ~50–100ms. MPD connection + album listing already dominates startup (500ms–2s).
+- **Scroll performance**: GTK paints only visible children. GPU load is viewport-bounded regardless of total widget count.
+- **Coordinate precision**: `f64` coordinates passed to GTK may cause sub-pixel rendering. Cell widths are integer-aligned (216px slot) so this is not a practical concern.
+
+### Implementation phases
+
+1. **Build `AlbumCell` struct**: holds `AlbumCoverCell` widget + caption label + group metadata. Created once per album. Stored in a `Vec<AlbumCell>` ordered by group.
+2. **Create `GtkLayout` + `GtkScrolledWindow`**: replace the current GridView inside the Stack.
+3. **Implement `reposition()`**: called on window resize (connect to the grid's own `notify::width` or the layout's size-allocate signal). Single-pass loop over `Vec<AlbumCell>`.
+4. **Wire cover events**: `CoverRefreshed` → find cell by index → `cell.set_cover_texture(&texture)`.
+5. **Wire click/hover/context menu**: connect signals on `AlbumCoverCell` widgets as before — they're GTK widgets with full event support.
+6. **Delete old machinery**: `pad_groups`, `batch_populate`, filler system, ListModel boilerplate, resize signal handlers, widget registry.
 
 ## Architecture Decision Record: Search Architecture
 
@@ -471,7 +672,7 @@ last_profile = "local"
 - `--profile <name>` CLI flag for headless switching
 - Auto-detect on first connect saves into "default" profile
 - Profile selector in connection dialog
-- No profile editing UI in v1 — profiles are hand-edited in TOML
+- No profile editing UI in the release — profiles are hand-edited in TOML
 
 ## Architecture Decision Record: libadwaita Integration
 
@@ -668,7 +869,7 @@ last_profile = "local"
 
 ## Architecture Decision Record: Theming & UI Architecture
 
-**Decision:** GTK4 CSS theming with a single stylesheet (`style.css`), dark theme default, no runtime theme switching in v1.
+**Decision:** GTK4 CSS theming with a single stylesheet (`style.css`), dark theme default, no runtime theme switching in the release.
 
 ### Key Details
 
@@ -676,7 +877,7 @@ last_profile = "local"
 - GTK4 CSS variables for colors, spacing, font sizes — enables easy theme tweaking without recompile
 - Dark theme as default with sufficient contrast for long listening sessions
 - Light theme CSS exists but is compile-time gated (`feature = "light-theme"`)
-- No user-facing theme switcher in v1 — simplifies testing and eliminates a class of regressions
+- No user-facing theme switcher in the release — simplifies testing and eliminates a class of regressions
 - Custom widget styling via CSS name bindings, not inline style properties
 
 ### Explicit Trade-offs Accepted
@@ -771,18 +972,18 @@ last_profile = "local"
 - `.deb`/`.rpm` packages are distribution-specific and may lag behind Flatpak releases
 - Feature flags increase CI matrix complexity (4 build configurations × 2 architectures minimum)
 
-**Status: OUT OF SCOPE for v1.** No Flatpak manifest, no CI pipeline, no `.deb`/`.rpm` packaging. The project is built via `cargo build` and installed manually. Desktop file with proper `Categories` is tracked as a separate story (NFR-O2). Packaging and CI may be addressed post-v1 when a release process is established.
+**Status: OUT OF SCOPE for the release.** No Flatpak manifest, no CI pipeline, no `.deb`/`.rpm` packaging. The project is built via `cargo build` and installed manually. Desktop file with proper `Categories` is tracked as a separate story (NFR-O2). Packaging and CI may be addressed out of scope when a release process is established.
 
 ## Architecture Decision Record: Notification & System Integration
 
-**Decision:** Layered notification system — in-app toast notifications for transient events, optional MPRIS for desktop environment integration, no system tray in v1.
+**Decision:** Layered notification system — in-app toast notifications for transient events, optional MPRIS for desktop environment integration, no system tray in the release.
 
 ### Key Details
 
 - **Toast notifications:** In-app overlay, bottom-right corner, 3s default display, stacked (max 3 visible). Types: queue sync, cover art errors, library changes, connection status
 - **Toast types are non-modal** — no user action required; click-to-dismiss optional
 - **MPRIS integration** provides: lock screen playback info, media key support, desktop environment "now playing" display
-- **No system tray icon in v1** — desktop environment tray support is inconsistent across Linux DEs (GNOME removed it); MPRIS provides equivalent functionality for background control
+- **No system tray icon in the release** — desktop environment tray support is inconsistent across Linux DEs (GNOME removed it); MPRIS provides equivalent functionality for background control
 - **Notification area:** Optional libnotify integration for persistent notifications (e.g., "MPD disconnected — retrying") — disabled by default, opt-in via config. Uses the same `zbus::blocking::Connection` as MPRIS (see ADR: IPC & CLI Architecture §687), calling `org.freedesktop.Notifications` interface directly — no additional D-Bus dependency
 - **Desktop file** registers for common audio MIME types — file manager "Open with" works for audio files
 
@@ -790,7 +991,7 @@ last_profile = "local"
 
 - No system tray means window must remain open (or minimized) to access the client
 - MPRIS requires D-Bus — no control from `playerctl` without a session bus
-- Toast notifications are purely visual — no screen reader announcement for toasts in v1
+- Toast notifications are purely visual — no screen reader announcement for toasts in the release
 - libnotify integration (opt-in) may duplicate in-app toasts when both are enabled
 
 ## Architecture Decision Record: Concurrency & Threading Model
@@ -818,7 +1019,7 @@ last_profile = "local"
 - Thread pool for cover art complicates cancellation (in-flight HTTP request can't be aborted cheaply)
 - Arc<Mutex<>> on QueueStore is a contention point during rapid MPD updates (mitigated by event batching)
 - Channel backpressure must be explicitly managed — an overwhelmed main thread can't "drop" GTK events
-- **Future migration path:** If state-to-widget binding complexity grows (multiple widgets observing the same state), migrate `SharedState` to a `glib::Object` subclass with `ParamSpec` properties. This enables GTK4's native `bind_property()` cross-thread binding, eliminating manual `idle_add` wiring. Deferred to post-v1 — the channel approach is simpler and sufficient for the current widget count.
+- **Future migration path:** If state-to-widget binding complexity grows (multiple widgets observing the same state), migrate `SharedState` to a `glib::Object` subclass with `ParamSpec` properties. This enables GTK4's native `bind_property()` cross-thread binding, eliminating manual `idle_add` wiring. Out of scope — the channel approach is simpler and sufficient for the current widget count.
 
 ## Architecture Decision Record: Async Runtime Decision
 
@@ -843,18 +1044,18 @@ last_profile = "local"
 
 ## Architecture Decision Record: Session Persistence & State Restoration
 
-**Decision:** V1 scope — persist last active mode only. Three-tier persistence (full session restore, window geometry, etc.) deferred to post-v1.
+**Decision:** Scoped — persist last active mode only. Three-tier persistence (full session restore, window geometry, etc.) out of scope.
 
-### V1 Approach
+### Current Approach
 
 - Only the last active mode (Album/Folder) is persisted — a single key in the config file (`~/.config/mpd-client/config.toml`).
 - Written immediately on mode switch (no debounce).
 - Read on startup — no corruption risk (single key, atomic write).
 - Everything else (scroll positions, expanded folders, search query, window geometry) is ephemeral — lost on close.
 
-### Full Design (Deferred Post-V1)
+### Full Design (Out of Scope)
 
-The following three-tier design is documented for future implementation but is **out of scope for v1**:
+The following three-tier design is documented for future implementation but is **out of scope for the release**:
 
 - **Ephemeral (lost on close):** Scroll positions, expanded folder state, drag position, search query text, undo history
 - **Session-restorable (persist on shutdown, restore on startup):** Last active mode, window geometry (size, position, maximized state), last-selected album/track ID, MPD host/port (overrides config)
@@ -878,20 +1079,20 @@ The following three-tier design is documented for future implementation but is *
 
 ## Architecture Decision Record: No Plugin Architecture (Explicit Non-Decision)
 
-**Decision:** No plugin/extension system in v1. All functionality is compiled into the binary. This is an explicit non-decision documented to prevent scope creep.
+**Decision:** No plugin/extension system in the release. All functionality is compiled into the binary. This is an explicit non-decision documented to prevent scope creep.
 
 ### Rationale
 
-- Plugins would require a stable ABI or a scripting runtime — both add significant complexity with no clear benefit for the v1 use case
+- Plugins would require a stable ABI or a scripting runtime — both add significant complexity with no clear benefit for the current use case
 - MPD already provides the extensibility boundary: anything MPD can do, the client can expose. Plugins between the client and MPD add a layer without clear value
 - The two-mode architecture (Album + Folder) covers the identified user workflows; an extension system would invite scope creep by making it easy to add "one more mode"
 - Rust's trait system provides compile-time extension points (presenter traits, provider traits, normalizer strategies) without runtime overhead — if a new mode is needed later, it can be compiled in
 
-### Future Considerations (Post-v1)
+### Future Considerations (Out of Scope)
 
 - If plugin demand emerges, the trait boundaries already exist: `QueuePresenter`, `BrowsingPresenter`, `CoverArtProvider`, `FolderNormalizer` are all trait-defined and could be loaded from dynamic libraries
 - A plugin system would need: stable ABI for traits, dynamic loading crate (`libloading`), sandboxing considerations, and a plugin discovery protocol
-- Documented here so the architecture isn't inadvertently made "plugin-hostile" — the trait boundaries should remain clean even though plugins aren't loaded dynamically in v1
+- Documented here so the architecture isn't inadvertently made "plugin-hostile" — the trait boundaries should remain clean even though plugins aren't loaded dynamically in the release
 
 ### Explicit Trade-offs Accepted
 
@@ -918,7 +1119,7 @@ The following three-tier design is documented for future implementation but is *
 
 - `GtkFlowBox` for album grid limits animation possibilities (no per-item animated insertion/removal without workarounds)
 - `GtkTreeView` for folder tree is legacy GTK widget — `GtkColumnView` would be more modern but less battle-tested
-- CSS hover overlays don't work on touchscreens (out of scope for v1)
+- CSS hover overlays don't work on touchscreens (out of scope for the release)
 - Custom layout manager for FlowBox is non-trivial to implement with GTK4's layout model
 
 ## Architecture Decision Record: Keybinding Architecture
@@ -933,7 +1134,7 @@ The following three-tier design is documented for future implementation but is *
 - **Action enum:** typed enum of all invocable actions — `PlayPause`, `NextTrack`, `ToggleMode`, `FocusSearch`, `QueueSelected`, etc. — same enum used by IPC, hover buttons, and menu items
 - **Conflict detection:** compile-time assertion that no two mappings share the same `(key, mods, context)` — tested in `#[cfg(test)]`
 - **Defaults:** `Ctrl+F` → FocusSearch (Global, selects all text in omnibox if already focused), `Ctrl+,` → OpenSettings (Global), `Ctrl+Z` → Undo (Global), `Space` → PlayPause (Global), `Escape` → ClearSelection/Dismiss (Global), `Enter` → ActivateSelection (context-dependent), arrow keys → navigation (context-dependent), `Tab`/`Shift+Tab` → focus traversal (Global, GTK-managed)
-- No user-configurable keybindings in v1 — the mapping table is compile-time; customization deferred to post-v1
+- No user-configurable keybindings in the release — the mapping table is compile-time; customization out of scope
 
 ### Explicit Trade-offs Accepted
 
@@ -942,13 +1143,13 @@ The following three-tier design is documented for future implementation but is *
 - Global shortcuts (like Space for play/pause) must not conflict with GTK's built-in widget shortcuts (e.g., Space toggles buttons)
 - `GdkKey` values are hardware-dependent — keyboard layout differences handled by GTK's key event normalization
 
-**Status: PARTIALLY IMPLEMENTED — in-scope for V1.** All shortcuts work (Ctrl+F search, Ctrl+1/2 modes, Space play/pause, Ctrl+, settings, arrow keys, Enter, Delete, Shift+Up/Down queue reorder) but are wired as ad-hoc GTK accelerators and `EventControllerKey` handlers. Centralized `KeybindingService` with compile-time conflict detection still needs to be built for V1.
+**Status: PARTIALLY IMPLEMENTED — scoped.** All shortcuts work (Ctrl+F search, Ctrl+1/2 modes, Space play/pause, Ctrl+, settings, arrow keys, Enter, Delete, Shift+Up/Down queue reorder) but are wired as ad-hoc GTK accelerators and `EventControllerKey` handlers. Centralized `KeybindingService` with compile-time conflict detection still needs to be built for the release.
 
 ## Architecture Decision Record: Undo/Redo for Queue Operations
 
 **Decision:** Stack-based undo for queue mutations only (add, remove, reorder, clear), limited to 50 entries, cleared on mode switch.
 
-**V1 scope:** Not implemented. Deferred post-v1 — no undo in the first release.
+**Scoped:** Not implemented. Out of scope — no undo in the first release.
 
 ### Key Details
 
@@ -972,7 +1173,7 @@ The following three-tier design is documented for future implementation but is *
 
 ## Architecture Decision Record: Animation & Transition Architecture
 
-**Decision:** CSS transitions for UI state changes, GTK4's built-in revealer/stack animations for structural transitions, no custom animation engine in v1.
+**Decision:** CSS transitions for UI state changes, GTK4's built-in revealer/stack animations for structural transitions, no custom animation engine in the release.
 
 ### Key Details
 
@@ -1013,24 +1214,24 @@ The following three-tier design is documented for future implementation but is *
 
 ## Architecture Decision Record: Internationalization
 
-**Decision:** No i18n framework in v1 — English-only UI with all user-facing strings centralized in a single module for future extraction.
+**Decision:** No i18n framework in the release — English-only UI with all user-facing strings centralized in a single module for future extraction.
 
 ### Key Details
 
 - **String centralization:** All user-facing text in a `strings.rs` module as constants or simple functions — no inline string literals in widgets, no string formatting scattered across the codebase
 - **Format:** `pub fn queue_synced(count: usize) -> String { format!("Queue synchronized with {count} library change(s)") }` — centralized, consistent, extractable
-- **No gettext/fluent/fluent-bit integration in v1** — zero additional dependencies, zero build complexity
+- **No gettext/fluent/fluent-bit integration in the release** — zero additional dependencies, zero build complexity
 - **Future path:** `strings.rs` → gettext `.po` files or Fluent `.ftl` files — because strings are centralized, extraction is mechanical
 - **Unicode handling:** all text processing uses Rust's standard Unicode-aware string handling; search uses Unicode normalization (NFD decomposition for accent-insensitive matching) via `unicode-normalization` crate
 - **Locale-specific formatting:** numbers, dates, and durations formatted with `rust-icu` or manual implementation (ISO 8601 dates, standardized duration format) — avoids locale-dependent rendering that would change with system locale
-- **Text direction:** LTR only in v1 — GTK4 supports RTL natively via text direction setting, but no RTL testing planned
+- **Text direction:** LTR only in the release — GTK4 supports RTL natively via text direction setting, but no RTL testing planned
 
 ### Explicit Trade-offs Accepted
 
 - English-only UI excludes non-English-speaking users (mitigated by centralization for future translation)
-- No gettext/fluent in v1 means first translation requires more setup than if the framework was present from day one
+- No gettext/fluent in the release means first translation requires more setup than if the framework was present from day one
 - Locale-independent number/date formatting means the UI doesn't adapt to the user's regional conventions
-- RTL language support (Arabic, Hebrew) would require layout testing beyond v1 scope
+- RTL language support (Arabic, Hebrew) would require layout testing beyond current scope
 
 ## Architecture Decision Record: MPD Protocol Version Negotiation
 
@@ -1187,11 +1388,11 @@ The following contracts define the guarantees, invariants, and fault behavior fo
 
 ## Architecture Decision Record: Crate & Module Organization
 
-**Decision:** Single-crate project with a flat module hierarchy, no workspace partitioning in v1. Module boundaries aligned with architectural layers.
+**Decision:** Single-crate project with a flat module hierarchy, no workspace partitioning in the release. Module boundaries aligned with architectural layers.
 
 ### Key Details
 
-- **Single crate** (`mpd-client`) — no workspace sub-crates for v1. Rationale: faster iteration, simpler build, no inter-crate versioning overhead. Re-evaluate if compile times exceed 30s incremental.
+- **Single crate** (`mpd-client`) — no workspace sub-crates for the release. Rationale: faster iteration, simpler build, no inter-crate versioning overhead. Re-evaluate if compile times exceed 30s incremental.
 - **Module hierarchy:**
   - `main.rs` — entry point, GTK app construction, CLI parsing, startup phase orchestration
   - `app/` — GTK application wiring, action registration, CSS, resource loading, main loop
@@ -1214,7 +1415,7 @@ The following contracts define the guarantees, invariants, and fault behavior fo
 ### Explicit Trade-offs Accepted
 
 - Single crate means full recompile on any change — no incremental workspace caching
-- Flat hierarchy may grow too large; can split into workspace crates post-v1 when module boundaries are proven
+- Flat hierarchy may grow too large; can split into workspace crates out of scope when module boundaries are proven
 - Inward-pointing dependency rule may produce occasional trait or type duplication to avoid cycles
 
 ## Architecture Decision Record: GTK4 Application Wiring
@@ -1604,7 +1805,7 @@ Fetch album list from MPD, populate `GtkFlowBox` with text labels. No covers, no
 - No versioning scheme, no release process, no tags, no distribution packaging
 - No CI/CD, no `release.sh` script, no `rust-toolchain.toml` pinning
 - No mock MPD server — test against the real MPD instance on the same machine
-- All distribution, packaging, versioning, and automation infrastructure is deferred until the product has a consumer
+- All distribution, packaging, versioning, and automation infrastructure is out of scope until the product has a consumer
 
 ### Testing Approach
 
@@ -1752,14 +1953,14 @@ src/
     ├── mod.rs
     ├── album_queue.rs        # AlbumQueuePresenter: QueueStore → AlbumGridViewModel
     ├── track_queue.rs        # TrackQueuePresenter: QueueStore → TrackListViewModel
-    ├── grid_coord.rs         # GridCoordinateMapper — inline in album_grid.rs for v1
+    ├── grid_coord.rs         # GridCoordinateMapper — inline in album_grid.rs for the release
     └── folder_norm.rs        # FolderNormalizer trait + strategies (CueSheet, DsdFolder, etc.)
 ```
 
 - All projection logic in one place — no GTK imports in `presenters/`
 - `mod.rs` re-exports only the presenter functions (not internal helpers)
 - Each module is a set of stateless pure functions — no structs, no state
-- `GridCoordinateMapper` lives in `presenters/browse/album_grid.rs` (small module, doesn't warrant a separate file in v1). Shared between album and folder modes via `pub(crate)` re-export from `presenters::browse`.
+- `GridCoordinateMapper` lives in `presenters/browse/album_grid.rs` (small module, doesn't warrant a separate file in the release). Shared between album and folder modes via `pub(crate)` re-export from `presenters::browse`.
 
 ### Format Patterns
 
@@ -2302,7 +2503,7 @@ Folder Normalizer strategies that collapse multi-file structures (cue sheets, DS
 
 - A "Normalized" badge or distinct indent/icon on collapsed entries.
 - The badge must be discoverable but subtle — a small dimmed label (e.g., "Normalized — cue sheet") shown on hover or selection.
-- SVG icon prefix consideration: consider a small "stack" or "folder-merge" icon for v2; plain text badge for v1.
+- SVG icon prefix consideration: consider a small "stack" or "folder-merge" icon for a future release; plain text badge for the release.
 
 ## Project Structure & Boundaries
 
@@ -2319,7 +2520,6 @@ mpd-client/
 ├── src/
 │   ├── main.rs
 │   ├── errors.rs
-│   ├── constants.rs
 │   ├── state/
 │   │   └── mod.rs
 │   ├── mpd/
@@ -2359,7 +2559,7 @@ mpd-client/
 | Playback (4 FRs) | `src/mpd/` | `mod.rs`, `state_machine.rs` |
 | Queue (8 FRs) | `src/state/` | `mod.rs` (QueueStore inline) |
 | Browsing (10+ FRs) | `src/ui/` | `mod.rs`, `widgets/album_cover.rs`, `widgets/folder_tree.rs` |
-| Layout (6 FRs) | `src/constants.rs` | (constants only; LayoutService is `[future]`) |
+| Layout (6 FRs) | `src/ui/` | `mod.rs`, `widgets/album_cover.rs` |
 | Cover Art (7 FRs) | `src/coverart/` | `mod.rs` |
 | Search (8+ FRs) | `src/search/` | `mod.rs` |
 | Drag & Drop (7 FRs) | `src/ui/` | `mod.rs` |
@@ -2404,7 +2604,9 @@ mpd-client/
 **Thread annotation**: each of the five critical modules (`mpd/`, `state/`, `presenters/`, `ui/`, `queue/`) documents its thread affinity in its `mod.rs` docstring.
 **Tests**: unit tests as `#[cfg(test)] mod tests` at bottom of each module; integration in `tests/`; shared test helpers in `tests/common/mod.rs`.
 **Resources**: embedded via `gio` resource system (`build.rs` + `.gresource.xml`)
-**Layout constants**: shell split ratio, rail width, section proportions live in `src/constants.rs` — not scattered across `app.rs`, `presenters/`, and `ui/`.
+**Layout constants**: shell split ratio, rail width, and section proportions are defined in `src/ui/mod.rs` and `src/ui/widgets/`.
+
+**Right rail width**: pinned to exactly 320 px (`min_sidebar_width=320`, `max_sidebar_width=320` on `OverlaySplitView`). The `sidebar_width_fraction` (previously 0.30) was removed — it caused the rail to drift per-track as label natural widths changed, even with `ellipsize`. Without a fraction, the split view falls back to content natural size clamped between min/max; pinning min==max forces a static width regardless of content. All variable-width labels in the rail (`track_artist`, `track_album`, `fmt_label`) also carry `max_width_chars` as a secondary constraint.
 
 ### Integration Points
 

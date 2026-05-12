@@ -4,8 +4,7 @@
 //! In debug builds, they log elapsed time for critical operations.
 //! Operations exceeding the WARN_THRESHOLD are logged at warn level.
 
-use std::time::Instant;
-
+#[allow(dead_code)]
 const WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Time an operation and log the duration at debug level.

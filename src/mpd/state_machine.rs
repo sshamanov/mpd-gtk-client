@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used)]
 
-use crate::mpd::{ConnectionTarget, MpdAdapter};
+use crate::mpd::{ConnectionTarget, DirEntry, MpdAdapter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -31,8 +31,23 @@ pub enum MpdCommand {
     DeleteId(i32),
     MoveId(i32, i32),
     Add(String),
+    /// Add album at a specific queue position.
+    AddAt(String, i32),
     InsertNext(String),
     PlayAlbum(String),
+    /// Play a list of URIs directly (clear + add each + play 0).
+    /// Used by folder tree for CUE/DSD normalized albums.
+    PlayUris(Vec<String>),
+    /// Add a list of URIs directly to the queue (no clear, no play).
+    AddUris(Vec<String>),
+    /// Insert a list of URIs after the current track (for file-based "play next").
+    InsertNextUris(Vec<String>),
+    /// List directory contents, clear queue, add all files, and play.
+    PlayDirectory(String),
+    /// List directory contents and add all files to queue.
+    AddDirectory(String),
+    /// List directory contents and insert all files after current track.
+    InsertNextDirectory(String),
     Clear,
     Reconnect,
     FetchCovers(Vec<(String, String)>),
@@ -51,7 +66,7 @@ pub enum MpdEvent {
     Connecting,
     Disconnected,
     StateChanged(PlaybackUpdate),
-    Albums(Vec<(String, String)>),
+    Albums(Vec<crate::mpd::AlbumMeta>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
     SearchResults(Vec<(String, String)>),
     FileSearchResults(Vec<(String, String)>),
@@ -74,11 +89,14 @@ pub struct PlaybackUpdate {
     pub artist: Option<String>,
     pub title: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     pub volume: i16,
     pub elapsed: Option<f64>,
     pub duration: Option<f64>,
     pub playlist_version: Option<String>,
     pub format: Option<String>,
+    pub file: Option<String>,
+    pub bitrate: Option<String>,
 }
 
 /// Internal state machine for the MPD connection lifecycle.
@@ -274,7 +292,7 @@ fn connected_loop(
         .join("covers");
     let cover_provider = std::sync::Arc::new(std::sync::RwLock::new(crate::coverart::CoverProvider::new()));
     let mut actual_read = crate::coverart::ActualRead::new(cache_dir);
-    let mut cached_flat_albums: Vec<(String, String)> = Vec::new();
+    let mut cached_flat_albums: Vec<crate::mpd::AlbumMeta> = Vec::new();
 
     // Initial status fetch
     if let Some(update) = fetch_full_update(&mut adapter) {
@@ -358,29 +376,32 @@ fn connected_loop(
                         }
                     }
                     MpdCommand::ListAlbumsGrouped(group) => {
-                        // Use cache for Albums/Artist views — no MPD round-trip needed
-                        if !cached_flat_albums.is_empty() && (group == "Albums" || group == "Artist") {
-                            log::info!("[MPD] ListAlbumsGrouped({group}): using cache ({})", cached_flat_albums.len());
-                            let groups = if group == "Albums" {
-                                vec![("All Albums".into(), cached_flat_albums.clone())]
-                            } else {
-                                group_albums_by_artist(&cached_flat_albums)
-                            };
-                            let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
-                        } else if let Ok(groups) = adapter.list_albums_grouped(&group) {
-                            log::info!("[MPD] ListAlbumsGrouped({group}): fetched from MPD");
-                            // Cache the flat list for future local regrouping
-                            if group == "Albums" {
-                                cached_flat_albums = groups.iter()
-                                    .flat_map(|(_, a)| a.clone()).collect();
+                        // Populate cache on first call — one MPD query for all metadata
+                        if cached_flat_albums.is_empty() {
+                            match adapter.list_albums_full() {
+                                Ok(albums) => {
+                                    log::info!("[MPD] ListAlbumsGrouped: fetched {} albums with full metadata", albums.len());
+                                    cached_flat_albums = albums;
+                                }
+                                Err(e) => {
+                                    log::error!("[MPD] ListAlbumsGrouped: failed to fetch albums: {e}");
+                                    let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(Vec::new()));
+                                    continue;
+                                }
                             }
-                            let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+                        } else {
+                            log::info!("[MPD] ListAlbumsGrouped({group}): using cache ({})", cached_flat_albums.len());
                         }
+                        let groups = adapter.list_albums_grouped(&group, &cached_flat_albums);
+                        let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
                     }
                     MpdCommand::FetchCovers(albums) => {
-                        // Enqueue covers for background fetch; processed one per idle cycle below
                         log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
                         actual_read.enqueue(albums);
+                        // Fetch up to 16 covers immediately in bulk — avoids
+                        // the 1-per-idle-cycle bottleneck for initial load.
+                        let caps = adapter.capabilities.clone();
+                        actual_read.process_batch(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx, 16);
                     }
                     MpdCommand::Search(query) => {
                         if let Ok(results) = adapter.search_albums(&query) {
@@ -446,7 +467,7 @@ fn connected_loop(
                     MpdCommand::Add(album) => {
                         match adapter.find_album_uris(&album) {
                             Ok(uris) => {
-                                if uris.is_empty() { break; }
+                                if uris.is_empty() { continue; }
                                 let cmds: Vec<String> = uris.iter()
                                     .map(|uri| format!("addid \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
                                     .collect();
@@ -461,16 +482,45 @@ fn connected_loop(
                             Err(e) => log::error!("Add album failed: {e}"),
                         }
                     }
+                    MpdCommand::AddAt(album, pos) => {
+                        match adapter.find_album_uris(&album) {
+                            Ok(uris) => {
+                                if uris.is_empty() { continue; }
+                                let mut position = pos;
+                                let cmds: Vec<String> = uris.iter()
+                                    .map(|uri| {
+                                        let cmd = format!("addid \"{}\" {}", uri.replace('\\', "\\\\").replace('"', "\\\""), position);
+                                        position += 1;
+                                        cmd
+                                    })
+                                    .collect();
+                                if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddAt album failed: {e}"); }
+                                if let Some(update) = fetch_full_update(&mut adapter) {
+                                    let pv = update.playlist_version.clone();
+                                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                                    sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                                }
+                                last_status = Instant::now();
+                            }
+                            Err(e) => log::error!("AddAt album failed: {e}"),
+                        }
+                    }
                     MpdCommand::InsertNext(album) => {
                         match adapter.find_album_uris(&album) {
                             Ok(uris) => {
-                                if uris.is_empty() { break; }
+                                if uris.is_empty() { continue; }
                                 let current_pos = adapter.status()
                                     .ok()
                                     .and_then(|s| s.get("song").cloned())
                                     .and_then(|s| s.parse::<i32>().ok())
                                     .unwrap_or(-1);
-                                if current_pos < 0 { break; }
+                                if current_pos < 0 {
+                                    log::warn!("InsertNext: no current track, skipping insert");
+                                    let _ = event_tx.try_send(MpdEvent::Error(
+                                        "Cannot insert after current track: nothing is playing".into()
+                                    ));
+                                    continue;
+                                }
                                 // Batch all addid calls with position parameter to avoid per-item
                                 // round-trips and eliminate the race between addid and moveid.
                                 let mut cmds = Vec::with_capacity(uris.len());
@@ -512,6 +562,154 @@ fn connected_loop(
                             Err(e) => log::error!("PlayAlbum failed: {e}"),
                         }
                     }
+                    MpdCommand::PlayUris(uris) => {
+                        if uris.is_empty() { continue; }
+                        let mut cmds: Vec<String> = vec!["clear".to_string()];
+                        for uri in uris {
+                            let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+                            cmds.push(format!("add \"{escaped}\""));
+                        }
+                        cmds.push("play 0".to_string());
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayUris failed: {e}"); }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
+                    MpdCommand::AddUris(uris) => {
+                        if uris.is_empty() { continue; }
+                        let cmds: Vec<String> = uris.iter()
+                            .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
+                            .collect();
+                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddUris failed: {e}"); }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
+                    MpdCommand::InsertNextUris(uris) => {
+                        if uris.is_empty() { continue; }
+                        let current_pos = adapter.status()
+                            .ok()
+                            .and_then(|s| s.get("song").cloned())
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .unwrap_or(-1);
+                        if current_pos < 0 {
+                            log::warn!("InsertNextUris: no current track, falling back to AddUris");
+                            let cmds: Vec<String> = uris.iter()
+                                .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
+                                .collect();
+                            if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris fallback failed: {e}"); }
+                        } else {
+                            let mut cmds = Vec::with_capacity(uris.len());
+                            for (i, uri) in uris.iter().enumerate() {
+                                let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+                                let target = current_pos + 1 + i as i32;
+                                cmds.push(format!("addid \"{escaped}\" {target}"));
+                            }
+                            if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris failed: {e}"); }
+                        }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
+                    MpdCommand::PlayDirectory(dir) => {
+                        match adapter.lsinfo(&dir) {
+                            Ok(entries) => {
+                                let uris: Vec<String> = entries.iter()
+                                    .filter_map(|e| match e {
+                                        DirEntry::File { path, .. } => Some(path.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if !uris.is_empty() {
+                                    let mut cmds: Vec<String> = vec!["clear".to_string()];
+                                    for uri in &uris {
+                                        cmds.push(format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")));
+                                    }
+                                    cmds.push("play 0".to_string());
+                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayDirectory failed: {e}"); }
+                                }
+                            }
+                            Err(e) => log::error!("PlayDirectory lsinfo failed: {e}"),
+                        }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
+                    MpdCommand::AddDirectory(dir) => {
+                        match adapter.lsinfo(&dir) {
+                            Ok(entries) => {
+                                let uris: Vec<String> = entries.iter()
+                                    .filter_map(|e| match e {
+                                        DirEntry::File { path, .. } => Some(path.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if !uris.is_empty() {
+                                    let cmds: Vec<String> = uris.iter()
+                                        .map(|uri| format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")))
+                                        .collect();
+                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddDirectory failed: {e}"); }
+                                }
+                            }
+                            Err(e) => log::error!("AddDirectory lsinfo failed: {e}"),
+                        }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
+                    MpdCommand::InsertNextDirectory(dir) => {
+                        match adapter.lsinfo(&dir) {
+                            Ok(entries) => {
+                                let uris: Vec<String> = entries.iter()
+                                    .filter_map(|e| match e {
+                                        DirEntry::File { path, .. } => Some(path.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if !uris.is_empty() {
+                                    let current_pos = adapter.status()
+                                        .ok()
+                                        .and_then(|s| s.get("song").cloned())
+                                        .and_then(|s| s.parse::<i32>().ok())
+                                        .unwrap_or(-1);
+                                    let mut cmds = Vec::with_capacity(uris.len());
+                                    if current_pos < 0 {
+                                        for uri in &uris {
+                                            cmds.push(format!("add \"{}\"", uri.replace('\\', "\\\\").replace('"', "\\\"")));
+                                        }
+                                    } else {
+                                        for (i, uri) in uris.iter().enumerate() {
+                                            let escaped = uri.replace('\\', "\\\\").replace('"', "\\\"");
+                                            cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
+                                        }
+                                    }
+                                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextDirectory failed: {e}"); }
+                                }
+                            }
+                            Err(e) => log::error!("InsertNextDirectory lsinfo failed: {e}"),
+                        }
+                        if let Some(update) = fetch_full_update(&mut adapter) {
+                            let pv = update.playlist_version.clone();
+                            let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                            sync_queue(&mut adapter, event_tx, &mut local_queue, &mut last_playlist_version, pv.as_deref());
+                        }
+                        last_status = Instant::now();
+                    }
                     MpdCommand::Clear => {
                         if let Err(e) = adapter.send_command("clear") { log::error!("Clear failed: {e}"); }
                         if let Some(update) = fetch_full_update(&mut adapter) {
@@ -548,7 +746,6 @@ fn connected_loop(
                     let caps = adapter.capabilities.clone();
                     actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
                 }
-                // Fall through to status poll check below
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return;
@@ -632,15 +829,6 @@ fn sync_queue(
 }
 
 /// Group a flat (artist, album) list by artist name, sorted alphabetically.
-fn group_albums_by_artist(albums: &[(String, String)]) -> crate::mpd::AlbumGroup {
-    let mut map: std::collections::BTreeMap<String, Vec<(String, String)>> = std::collections::BTreeMap::new();
-    for (artist, album) in albums {
-        let key = if artist.is_empty() { "Unknown Artist" } else { artist.as_str() };
-        map.entry(key.to_string()).or_default().push((artist.clone(), album.clone()));
-    }
-    map.into_iter().collect()
-}
-
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
     // Extract format badge from status "audio" field (e.g., "dsd64:2" → "DSD64")
     let format = status.get("audio").and_then(|audio| {
@@ -678,6 +866,7 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
         artist: None,
         title: None,
         album: None,
+        year: None,
         volume: status.get("volume")
             .and_then(|v| v.parse::<i16>().ok())
             .map(|v| if v == -1 { 0 } else { v })
@@ -686,16 +875,23 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
         duration: status.get("duration").and_then(|v| v.parse().ok()),
         playlist_version: status.get("playlist").cloned(),
         format,
+        file: None,
+        bitrate: status.get("bitrate").cloned(),
     }
 }
 
 fn parse_song_update(song: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
     let format = format_badge_text(song);
+    let year = song.get("Date").map(|d| {
+        d.split('-').next().unwrap_or(d).to_string()
+    });
     PlaybackUpdate {
         artist: song.get("Artist").cloned(),
         title: song.get("Title").cloned(),
         album: song.get("Album").cloned(),
+        year,
         format,
+        file: song.get("file").cloned(),
         ..Default::default()
     }
 }
@@ -745,7 +941,9 @@ fn fetch_full_update(adapter: &mut MpdAdapter) -> Option<PlaybackUpdate> {
             if update.artist.is_none() { update.artist = song_update.artist; }
             if update.title.is_none() { update.title = song_update.title; }
             if update.album.is_none() { update.album = song_update.album; }
+            if update.year.is_none() { update.year = song_update.year; }
             if update.format.is_none() { update.format = song_update.format; }
+            if update.file.is_none() { update.file = song_update.file; }
         }
     }
     Some(update)

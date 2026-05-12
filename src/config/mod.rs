@@ -50,8 +50,6 @@ pub struct Config {
     pub mpd_host: String,
     #[serde(default = "default_port")]
     pub mpd_port: u16,
-    #[serde(default = "default_split_ratio")]
-    pub split_ratio: f64,
     #[serde(default)]
     pub mpris: MprisConfig,
     #[serde(default)]
@@ -75,9 +73,13 @@ pub struct Config {
     /// Auto-start on desktop login via XDG autostart.
     #[serde(default = "default_false")]
     pub auto_start: bool,
+    /// Group by AlbumArtist (true) or Artist (false) in Artists view.
+    #[serde(default = "default_true")]
+    pub use_album_artist: bool,
 }
 
 fn default_false() -> bool { false }
+fn default_true() -> bool { true }
 
 /// A named MPD connection profile — either a Unix socket path or TCP host:port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,14 +109,12 @@ fn default_notif_enabled() -> bool { false }
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
-fn default_split_ratio() -> f64 { 0.7 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             mpd_host: default_host(),
             mpd_port: default_port(),
-            split_ratio: default_split_ratio(),
             mpris: MprisConfig { enabled: false },
             notifications: NotificationsConfig { libnotify: false },
             profiles: None,
@@ -124,6 +124,7 @@ impl Default for Config {
             window_geometry: None,
             high_contrast: false,
             auto_start: false,
+            use_album_artist: true,
         }
     }
 }

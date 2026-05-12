@@ -16,26 +16,26 @@ editHistory:
   - date: '2026-04-22'
     changes: 'Fix validation report issues: FR format violations, NFR measurability gaps, implementation leakage, project-type gaps; incorporate user tech stack (GTK4/Rust/Linux-only)'
 ---
-## Implementation Notes (v2 — 2026-04-28)
+## Scoped Features (2026-04-28)
 
-The v1 implementation is complete. This section documents the v2 architecture refinements based on cross-project analysis (Ario C/GTK3, Plattenalbum Python/GTK4, CoverGrid Python/GTK4) and advanced elicitation. All v1 decisions remain valid unless explicitly overridden below.
+The initial release implementation is complete. This section documents scoped architecture refinements based on cross-project analysis (Ario C/GTK3, Plattenalbum Python/GTK4, CoverGrid Python/GTK4) and advanced elicitation. All prior decisions remain valid unless explicitly overridden below.
 
-### Technology Stack (v2)
+### Technology Stack
 - **Rust** edition 2024, MSRV 1.85, single crate
 - **GTK4** 0.11 with v4_14 feature + **libadwaita** 0.8 (adw crate)
 - **std::thread** with `mpsc::sync_channel` / `mpsc::channel`
 - **zbus** crate for MPRIS D-Bus (disabled by default, opt-in via config)
 - **env_logger**, **TOML** (dirs crate), **Linux-only**
 
-### MPD Idle Protocol (v2 — replaces 500ms poll)
+### MPD Idle Protocol (replaces 500ms poll)
 
-**Before (v1):** 500ms polling loop calling `fetch_full_update()` (status + currentsong) every tick. External changes detected by `last_song_pos` comparison.
+**Before:** 500ms polling loop calling `fetch_full_update()` (status + currentsong) every tick. External changes detected by `last_song_pos` comparison.
 
-**After (v2):** True MPD `idle`/`noidle` protocol (CoverGrid pattern). Worker thread blocks on `idle` when command queue is empty. Main thread writes `noidle\n` to socket clone (via `TcpStream::try_clone()`) to break idle when sending commands. Thread safety: half-duplex MPD protocol means read clone and write clone never contend. If `idle` returns a transient error, fall back to 100ms poll for 10 cycles then retry idle. If `idle` returns "unknown command", fall back to 500ms poll permanently.
+**After:** True MPD `idle`/`noidle` protocol (CoverGrid pattern). Worker thread blocks on `idle` when command queue is empty. Main thread writes `noidle\n` to socket clone (via `TcpStream::try_clone()`) to break idle when sending commands. Thread safety: half-duplex MPD protocol means read clone and write clone never contend. If `idle` returns a transient error, fall back to 100ms poll for 10 cycles then retry idle. If `idle` returns "unknown command", fall back to 500ms poll permanently.
 
 **Rationale:** Eliminates poll overhead entirely. State changes (from other MPD clients) are reflected immediately, not within 500ms. The `try_clone` pattern is safe because MPD's protocol is serialized — you never read and write simultaneously.
 
-### Cover Art Pipeline (v2 — replaces stub)
+### Cover Art Pipeline (replaces stub)
 
 **Two-layer split architecture:**
 
@@ -53,15 +53,15 @@ The v1 implementation is complete. This section documents the v2 architecture re
 - On reconnect/library change: enqueue visible albums into ActualRead, emit only on actual difference
 - Cache: `~/.cache/mpd-client/covers/{md5_hash}.jpg` with metadata sidecar
 
-### Queue Updates (v2 — replaces full playlistinfo)
+### Queue Updates (replaces full playlistinfo)
 
-**Before (v1):** Full `list_queue` → playlistinfo re-fetch on every Queue event.
+**Before:** Full `list_queue` → playlistinfo re-fetch on every Queue event.
 
-**After (v2):** Incremental via `plchanges <version>`. Store `playlist_version` from status response. On playlist change signal, call `plchanges(last_version)` to get only changed items. Handle deletions by cross-referencing positions with reported playlist length. Every 50th update: full `playlistinfo` sync to reconcile. On version wrap-around (32-bit counter): full sync.
+**After:** Incremental via `plchanges <version>`. Store `playlist_version` from status response. On playlist change signal, call `plchanges(last_version)` to get only changed items. Handle deletions by cross-referencing positions with reported playlist length. Every 50th update: full `playlistinfo` sync to reconcile. On version wrap-around (32-bit counter): full sync.
 
 **Rationale:** Preserves UI state (scroll position, selection, animation) during surgical updates. Full re-fetch replaces the entire model, losing view state.
 
-### Command List Batching (v2 — new)
+### Command List Batching (new)
 
 Add `MpdCommand::Batch(Vec<MpdCommand>)` variant. MPD's `command_list_begin`/`command_list_end` wraps multiple commands atomically. If any command fails, the entire list is aborted — this is a feature, not a bug.
 
@@ -71,19 +71,19 @@ Add `MpdCommand::Batch(Vec<MpdCommand>)` variant. MPD's `command_list_begin`/`co
 Before: adding a 20-track album = 20 `addid` + 1 `play` = 21 individual channel messages + 21 MPD round-trips.
 After: adding a 20-track album = 1 Batch message + 1 MPD command_list with 21 commands.
 
-### Unix Socket Auto-Detection (v2 — new)
+### Unix Socket Auto-Detection (new)
 
 Priority: `$XDG_RUNTIME_DIR/mpd/socket` → `/run/mpd/socket` → TCP localhost:6600 → connection settings dialog. Skipped entirely if user has configured a host. Each failed connect is harmless (ECONNREFUSED/ENOENT, just try next).
 
-### Multi-Profile Connections (v2 — new, previously deferred)
+### Multi-Profile Connections (new, previously out of scope)
 
-Config supports `[profiles.<name>]` sections. `--profile <name>` CLI flag. Auto-detect on first connect saves into "default" profile. Profile selector in connection dialog. No profile editing UI in v1 — profiles are hand-edited.
+Config supports `[profiles.<name>]` sections. `--profile <name>` CLI flag. Auto-detect on first connect saves into "default" profile. Profile selector in connection dialog. No profile editing UI in the release — profiles are hand-edited.
 
-### MPRIS D-Bus Integration (v2 — new, previously deferred)
+### MPRIS D-Bus Integration (new, previously out of scope)
 
 MPRIS v2.1 Player interface via `zbus` crate. D-Bus bus name `org.mpris.MediaPlayer2.mpdclient`. Player interface only (Play/Pause/Stop/Next/Previous/Seek/SetPosition + standard properties). **Disabled by default** — `[mpris] enabled = false` in config. Connect MPRIS method calls to existing MpdCommand channel — no new code paths.
 
-### libadwaita Integration (v2 — new)
+### libadwaita Integration (new)
 
 Added `adw` crate dependency. Replaces:
 - Custom toast → `Adw.ToastOverlay`
@@ -93,18 +93,18 @@ Added `adw` crate dependency. Replaces:
 
 Requires libadwaita >= 1.6 at runtime (included in GNOME runtime, available in all major distros).
 
-### Queue Model (unchanged from v1)
+### Queue Model (unchanged)
 Single track-oriented queue `ListBox` in the right rail. Album mode mini cover grid derived from same linear source. Track queue in folder mode remains flat. Dual-presenter architecture verified as correct.
 
-### Known Limitations & Deferred Work
-See `_bmad-output/implementation-artifacts/deferred-work.md` for the full list. New v2 additions:
+### Known Limitations & Out of Scope
+See `_bmad-output/implementation-artifacts/deferred-work.md` for the full historical list. Additions:
 - Cover art cache revalidation on reconnect/library change
 - MPRIS disabled by default — no D-Bus until user opts in
-- Profile management UI deferred to post-v1
+- Profile management UI out of scope for the release
 - ReadPictureProvider timestamp comparison edge cases on some MPD versions
 
 ### Tests
-11 integration tests with mock MPD server. New v2 tests needed:
+11 integration tests with mock MPD server. Scoped test additions:
 - MPD idle protocol (idle/noidle handshake, socket clone behavior)
 - Cover art binary protocol (albumart/readpicture parsing, partial reads)
 - CoverProvider cache hit/miss/refresh
@@ -112,6 +112,19 @@ See `_bmad-output/implementation-artifacts/deferred-work.md` for the full list. 
 - Command list batch atomicity
 - Unix socket auto-detection order
 - Multi-profile config loading/fallback
+
+---
+
+## Versioning Policy
+
+All work is classified as one of:
+
+| Status | Meaning |
+|--------|---------|
+| **Scoped** | Planned for the release — may be done, in-progress, or pending |
+| **Out of scope** | Explicitly excluded from the release — kept for historical reference only |
+
+There is no "V1", "V2", "deferred", or other version-numbered status. The project has one release. Features are either scoped or out of scope for that release.
 
 ---
 
@@ -162,7 +175,7 @@ The product stays narrow by design—no social features, no cloud sync, no playl
 
 **MVP Scope:** The client focuses exclusively on two core workflows—album‑first listening and folder‑first discovery—with minimal feature creep. No social features, cloud sync, or playlist management beyond MPD’s native capabilities.
 
-**Growth Vision:** Future versions could consider advanced metadata editing, multi‑room playback, or mobile companion apps, but these are explicitly out of scope for the initial release.
+**Growth Vision:** Future releases could consider advanced metadata editing, multi‑room playback, or mobile companion apps, but these are explicitly out of scope for the current release.
 
 **Design Principles:**
 - Album-first by default
@@ -641,7 +654,7 @@ Cover art is fetched exclusively via the MPD protocol. No local filesystem scann
 - **Memory:** Query processing allocates ≤10MB temporary working set
 - **Cancelation:** Rapid typing cancels pending queries; only latest executes
 
-### Advanced Features (Post‑v1)
+### Advanced Features (Out of Scope)
 
 #### Filter Operators
 - **Field prefixes:** `artist:`, `year:`, `genre:`, `bitdepth:`, `samplerate:`
@@ -702,17 +715,17 @@ Keep the main interaction model consistent.
 
 - Single click on album cover selects the album
 - Double click on album cover clears the queue, enqueues the album, and starts playback from track 1
-- `Add to queue` appends albums to the end of the queue in v1
+- `Add to queue` appends albums to the end of the queue
 - Dragging an album from the main grid into the album queue inserts it at an exact position
 - Dragging queued albums reorders them by exact before/after placement
 - Dragging a queued album off the album queue grid removes it from the queue
 - Manual album ordering in the main grid is allowed only in plain `Albums` view
-- Manual album ordering in plain `Albums` view is session-only in v1
+- Manual album ordering in plain `Albums` view is session-only
 - Albums can also be added through context menu actions
 - Hover controls map to `+` add to queue, `<-` insert after current album, and `>` clear queue and play
 - Duplicate albums in queue are allowed
-- Album context menu in v1 contains `Play now`, `Play next`, and `Add to queue`
-- Queued album item menu in v1 contains `Remove` and `Play now`
+- Album context menu contains `Play now`, `Play next`, and `Add to queue`
+- Queued album item menu contains `Remove` and `Play now`
 
 ### Folder Mode
 
@@ -720,12 +733,12 @@ Keep the main interaction model consistent.
 - Double click folder: clear queue, enqueue folder or album, start playback from the beginning
 - Click track: select
 - Double click track: replace the current queue with the opened folder content and start playback from the selected track
-- Drag and drop belongs in v1 for folder-mode queue interactions
-- `Add to queue` appends folders, folder track batches, or tracks to the end of the queue in v1
+- Drag and drop is supported for folder-mode queue interactions
+- `Add to queue` appends folders, folder track batches, or tracks to the end of the queue
 - Play next in folder mode inserts after the current track
 - `Play next` on a folder inserts that folder's tracks as one ordered batch after the current track
-- Folder and track context menus in v1 contain `Play now`, `Play next`, and `Add to queue`
-- Queued folder-mode item menu in v1 contains `Remove` and `Play now`
+- Folder and track context menus contain `Play now`, `Play next`, and `Add to queue`
+- Queued folder-mode item menu contains `Remove` and `Play now`
 
 ## Requirements Specification
 
@@ -872,7 +885,7 @@ The client relies on MPD for actual playback; these specifications define what t
 | **Crossfade** | Yes (MPD) | UI toggle for MPD crossfade setting | Configurable via MPD |
 | **Replay Gain** | Yes (MPD) | Display Replay Gain status if available | Read‑only display |
 | **Audio output selection** | Yes (MPD) | Output selector if MPD supports it | Conditional |
-| **Streaming URLs** | Yes (MPD) | URL entry field (v2+) | Future |
+| **Streaming URLs** | Yes (MPD) | URL entry field (out of scope) | Future |
 | **Equalizer** | Yes (MPD) | EQ UI if MPD supports DSP | Future |
 
 ### Performance Thresholds
@@ -1076,21 +1089,21 @@ Real-MPD validation confirmed the following patterns (see `architecture.md` "Pro
 3. The currently playing album has a distinct state
 4. User can reorder by drag and drop
 5. Initial queue layout is `3x2` at 50% cover scale
-6. Manual album reordering lasts only for the current session in v1
+6. Manual album reordering lasts only for the current session
 
 #### Folder Mode
 
 1. Queue is presented as tracks
 2. Queued tracks appear as a plain visible text list
 3. Queue scroll follows the current track only when it would leave the viewport
-4. Reordering is allowed in queue context in v1
+4. Reordering is allowed in queue context
 5. `Play now` on a queued item jumps to it without rebuilding the queue
 
 ### Search Flow
 
 1. Search is hidden by default
 2. User explicitly opens search as an inline field in the header when browsing is insufficient
-3. Search scope in v1 is limited to the current mode and active view
+3. Search scope is limited to the current mode and active view
 4. In album mode, search matches all available metadata
 5. In folder mode, search matches full path text, normalized folder names, track titles, raw filenames, and file-related text
 6. Search results are shown as a live in-place filter of the current view

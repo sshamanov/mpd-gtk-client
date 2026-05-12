@@ -56,13 +56,6 @@ pub struct FolderBrowsingState {
     pub scroll_position: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayoutState {
-    pub shell_split: (f64, f64),
-    pub right_rail_width: f64,
-    pub album_mode_proportions: (f64, f64, f64),
-    pub folder_mode_proportions: (f64, f64),
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
@@ -72,7 +65,6 @@ pub struct AppState {
     pub connection: ConnectionState,
     pub album_browsing: AlbumBrowsingState,
     pub folder_browsing: FolderBrowsingState,
-    pub layout: LayoutState,
     pub mode: Mode,
 }
 
@@ -111,12 +103,6 @@ pub fn create_initial_state() -> SharedState {
             expanded_paths: Vec::new(),
             selected_track_id: None,
             scroll_position: 0.0,
-        },
-        layout: LayoutState {
-            shell_split: (crate::constants::SHELL_SPLIT_RATIO, 1.0 - crate::constants::SHELL_SPLIT_RATIO),
-            right_rail_width: crate::constants::RAIL_WIDTH_MIN,
-            album_mode_proportions: (0.4, 0.2, 0.4),
-            folder_mode_proportions: (0.55, 0.45),
         },
         mode: Mode::Album,
     }))
@@ -182,15 +168,6 @@ impl Store {
     {
         if let Err(e) = self.state.write().map(|mut s| updater(&mut s.folder_browsing)) {
             log::error!("RwLock poisoned in update_folder_browsing: {e}");
-        }
-    }
-
-    pub fn update_layout<F>(&self, updater: F)
-    where
-        F: FnOnce(&mut LayoutState),
-    {
-        if let Err(e) = self.state.write().map(|mut s| updater(&mut s.layout)) {
-            log::error!("RwLock poisoned in update_layout: {e}");
         }
     }
 

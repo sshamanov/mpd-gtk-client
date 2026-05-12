@@ -29,16 +29,25 @@ No async runtime — `std::thread` over tokio (4.2MB vs 15MB binary).
 | `src/ui/widgets/` | Reusable widgets: album_cover, folder_tree, toast |
 | `src/config/mod.rs` | TOML config persistence (`~/.config/mpd-client/config.toml`) |
 | `src/search/mod.rs` | Local keyword→album search index (hash-based, no MPD round-trip) |
-| `src/coverart/mod.rs` | Cover art: MPD albumart/readpicture pipeline with disk cache (designed, not yet implemented) |
-| `src/constants.rs` | Layout constants |
+| `src/coverart/mod.rs` | Cover art: MPD albumart/readpicture pipeline with disk cache |
 | `src/errors.rs` | Error types |
 
 ## Development Status
 
-- **Phase**: v1 implementation complete — all 7 epics done
-- **Tests**: 11 integration tests with mock MPD server (`cargo test`)
-- **Pending**: integration tests for real MPD, keyboard shortcut docs in-app
+- **Phase**: Initial release implementation complete — all epics done
+- **Tests**: 17 integration tests with mock MPD server (`cargo test`)
 - **BMad**: installed for project management (`_bmad/` directory)
+
+### Versioning Policy
+
+All work is classified as one of:
+
+| Status | Meaning |
+|--------|---------|
+| **Scoped** | Planned for the release — may be done, in-progress, or pending |
+| **Out of scope** | Explicitly excluded from the release — kept for historical reference only |
+
+There is no "V1", "V2", "deferred", or other version-numbered status. The project has one release. Features are either scoped or out of scope for that release.
 
 ## Build & Run
 
@@ -54,7 +63,7 @@ RUST_LOG=debug cargo run      # verbose MPD protocol logging
 - **Design/PRD**: `_bmad-output/planning-artifacts/prd.md`
 - **Architecture decisions**: `_bmad-output/planning-artifacts/architecture.md`
 - **Sprint status**: `_bmad-output/implementation-artifacts/sprint-status.yaml`
-- **Deferred work**: `_bmad-output/implementation-artifacts/deferred-work.md`
+- **Out of scope (historical)**: `_bmad-output/implementation-artifacts/deferred-work.md`
 - **Config**: `~/.config/mpd-client/config.toml` (host/port, auto-created on first save)
 
 ## Authoritative Documents
@@ -69,7 +78,7 @@ These are the single sources of truth. Every other .md file is historical or sup
 | Implementation breakdown | Planning | `_bmad-output/planning-artifacts/epics.md` |
 | UX specification | Design | `_bmad-output/planning-artifacts/ux-design-specification.md` |
 | Sprint plan/status | Execution | `_bmad-output/implementation-artifacts/sprint-status.yaml` |
-| Deferred work | Planning | `_bmad-output/implementation-artifacts/deferred-work.md` |
+| Out of scope (historical) | Planning | `_bmad-output/implementation-artifacts/deferred-work.md` |
 
 ## Non-Authoritative Files
 
@@ -88,7 +97,7 @@ These files exist for reference and are NOT authoritative for current decisions:
 | `_bmad-output/planning-artifacts/architecture.md` | Engineering | ADRs, threading, protocol, modules, all implementation specs |
 | `_bmad-output/planning-artifacts/epics.md` | Planning | Epics, stories, sprint plan |
 | `_bmad-output/planning-artifacts/ux-design-specification.md` | Design | UX layout, interaction design |
-| `_bmad-output/implementation-artifacts/*` | Execution | Sprint status, retrospectives, deferred work |
+| `_bmad-output/implementation-artifacts/*` | Execution | Sprint status, retrospectives, out-of-scope historical record |
 
 ### Single Source of Truth
 
@@ -99,7 +108,7 @@ Each concern has exactly one authoritative document. If content exists in two pl
 
 ### Temporary Documents Policy
 
-Exploration findings, enhancement plans, v2 addendums, and cross-project analyses are created as temporary scratch documents. After successful review or advanced elicitation, their content MUST be:
+Exploration findings, enhancement plans, scoped feature addendums, and cross-project analyses are created as temporary scratch documents. After successful review or advanced elicitation, their content MUST be:
 
 1. **Merged inline** into the appropriate authoritative document (prd.md or architecture.md)
 2. **The temp file deleted** — no competing sources of truth
@@ -113,6 +122,35 @@ This prevents the document drift pattern where old design and new design coexist
 - No unwrap/expect in library code; `if let Ok(...)` patterns for fallible operations
 - MPD adapter commands return `Result<_, Error>`; callers log errors and continue
 - GTK4 0.11 with v4_14 feature; glib 0.20, gdk4 0.11
+
+## Debug Session Rules
+
+A **debug session** is any work that diverges from an already-made plan or sprint story — exploratory investigation, root-cause analysis, trial-and-error fixes, or experiments whose outcome is unknown at the start.
+
+### Never Revert Without Approval
+
+Do not revert code to a previous state without explicit user approval. The user may have context or reasons not captured in the current conversation. If a change makes things worse, ask before reverting rather than assuming.
+
+### Code Comments During Debug Sessions
+
+Every change made during a debug session must be annotated with a comment in the code:
+
+```rust
+// DEBUG 2026-05-03: <what was done and why>
+// DEBUG RESULT: <visual evaluation or test outcome, filled after testing>
+```
+
+Keep comments tight — one line for the action, one for the result. Remove them when the debug session concludes and the fix is finalized.
+
+### Action Log
+
+During debug sessions, log every significant action:
+- Edits made (file, line range, purpose)
+- User requests and their exact wording
+- Visual evaluation results (what the user saw on screen)
+- Hypotheses tested and outcomes
+
+The debug session summary lives at `_bmad-output/implementation-artifacts/debug-session-YYYY-MM-DD.md`. Append to the existing file for the day; create a new one if none exists.
 
 ## Git Commit Policy
 
@@ -133,7 +171,7 @@ Each commit represents one **practical step forward** — a change that is self-
 
 ### What Does NOT Get Committed
 
-- Temporary scratch documents (enhancement plans, v2 addendums, cross-project analyses) — these must be **absorbed into authoritative docs and deleted** before commit
+- Temporary scratch documents (enhancement plans, scoped feature addendums, cross-project analyses) — these must be **absorbed into authoritative docs and deleted** before commit
 - Intermediate file writes during editing
 - Temporary files in gitignored paths (`.claude/`, `target/`, `node_modules/`)
 - Failed experiments or debugging attempts — squash or don't stage

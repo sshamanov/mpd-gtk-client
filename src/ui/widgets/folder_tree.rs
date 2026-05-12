@@ -1,10 +1,13 @@
-//! Folder tree — breadcrumb navigation, file playback, format badges, keyboard nav. Thread: UI (GTK main loop).
+//! Folder browser — expandable tree with inline directory expansion.
+//! Directories expand/collapse in-place. Albums are normalized (CUE/DSD).
+//! Thread: UI (GTK main loop).
 
 use crate::mpd::DirEntry;
 use crate::mpd::state_machine::MpdCommand;
 use gtk4::prelude::*;
-use gtk4::{Box, EventControllerKey, Label, ListBox, Orientation, ScrolledWindow};
+use gtk4::{Box, EventControllerKey, Image, Label, ListBox, Orientation, ScrolledWindow};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -16,15 +19,21 @@ pub struct FolderBrowser {
     pub shared_path: Rc<RefCell<String>>,
     #[allow(dead_code)]
     cmd_tx: mpsc::Sender<MpdCommand>,
-    /// Full MPD URIs of audio files hidden by CUE normalization (for CUE summary row playback).
-    cue_tracks: Rc<RefCell<Vec<String>>>,
-    /// Full MPD URIs of .dsf/.dff files hidden by DSD normalization (for DSD summary row playback).
-    dsd_tracks: Rc<RefCell<Vec<String>>>,
+    /// Loaded directory contents: full MPD path → entries
+    dir_cache: Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
+    /// Which directory paths are currently expanded
+    expanded: Rc<RefCell<HashSet<String>>>,
+    /// CUE-associated audio file URIs per directory
+    cue_tracks: Rc<RefCell<HashMap<String, Vec<String>>>>,
+    /// Whether the root has been loaded
+    root_loaded: Rc<RefCell<bool>>,
 }
 
 impl FolderBrowser {
     pub fn new(cmd_tx: mpsc::Sender<MpdCommand>) -> Self {
         let container = Box::new(Orientation::Vertical, 0);
+        container.set_vexpand(true);
+        container.set_hexpand(true);
 
         let breadcrumb = Box::new(Orientation::Horizontal, 0);
         breadcrumb.set_margin_start(8);
@@ -35,61 +44,75 @@ impl FolderBrowser {
         let list = ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Single);
         let scroll = ScrolledWindow::new();
+        scroll.set_vexpand(true);
+        scroll.set_has_frame(true);
         scroll.set_child(Some(&list));
         container.append(&scroll);
 
         let shared_path: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
-        let cue_tracks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let dsd_tracks: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let dir_cache: Rc<RefCell<HashMap<String, Vec<DirEntry>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let expanded: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+        let cue_tracks: Rc<RefCell<HashMap<String, Vec<String>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let root_loaded: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-        // Row activation: navigate directories / play files / play CUE/DSD summary rows
+        // Row activation: expand/collapse directories, play files/albums
         let tx = cmd_tx.clone();
         let sp = shared_path.clone();
         let ct = cue_tracks.clone();
-        let dt = dsd_tracks.clone();
+        let dc = dir_cache.clone();
+        let ex = expanded.clone();
+        let list_ref = list.clone();
         list.connect_row_activated(move |_list, row| {
             if let Some(w) = row.child() {
-                let css = w.css_classes();
                 let name = w.widget_name();
-                // File rows have widget_name starting with "file:"
                 if name.starts_with("file:") {
                     let filepath = name.strip_prefix("file:").unwrap_or("");
                     let _ = tx.send(MpdCommand::PlayFile(filepath.to_string()));
                 } else if name.starts_with("cue:") {
-                    // CUE summary row: clear queue, add all cue-associated tracks, play
-                    let _ = tx.send(MpdCommand::Clear);
-                    for uri in ct.borrow().iter() {
-                        let _ = tx.send(MpdCommand::Add(uri.clone()));
+                    let path = name.strip_prefix("cue:").unwrap_or("");
+                    if let Some(uris) = ct.borrow().get(path) {
+                        let _ = tx.send(MpdCommand::PlayUris(uris.clone()));
                     }
-                    let _ = tx.send(MpdCommand::PlayPosition(0));
-                } else if name.starts_with("dsd:") {
-                    // DSD summary row: clear queue, add all DSD tracks, play
-                    let _ = tx.send(MpdCommand::Clear);
-                    for uri in dt.borrow().iter() {
-                        let _ = tx.send(MpdCommand::Add(uri.clone()));
+                } else if name.starts_with("dir:") {
+                    let dir_path = name.strip_prefix("dir:").unwrap_or("");
+                    let dir_path = dir_path.to_string();
+                    // Toggle expand/collapse
+                    if ex.borrow().contains(&dir_path) {
+                        // Collapse
+                        ex.borrow_mut().remove(&dir_path);
+                        rebuild_list(&list_ref, &dc, &ex, &ct, &sp);
+                    } else if dc.borrow().contains_key(&dir_path) {
+                        // Expand from cache
+                        ex.borrow_mut().insert(dir_path.clone());
+                        rebuild_list(&list_ref, &dc, &ex, &ct, &sp);
+                    } else {
+                        // Fetch from MPD
+                        let _ = tx.send(MpdCommand::ListDirectory(dir_path.clone()));
                     }
-                    let _ = tx.send(MpdCommand::PlayPosition(0));
                 } else if name == ".." {
                     let cur = sp.borrow().clone();
-                    let parent = Path::new(&cur).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let parent = Path::new(&cur)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    *sp.borrow_mut() = parent.clone();
                     let _ = tx.send(MpdCommand::ListDirectory(parent));
-                } else if css.contains(&"dir-entry".into()) {
-                    let cur = sp.borrow().clone();
-                    let n = name.to_string();
-                    let new_path = if n.is_empty() { cur } else if cur.is_empty() { n } else { format!("{}/{}", cur, n) };
-                    let _ = tx.send(MpdCommand::ListDirectory(new_path));
                 }
             }
         });
 
-        // Keyboard: Left=parent
+        // Keyboard: Left = parent
         let tx_kb = cmd_tx.clone();
         let sp_kb = shared_path.clone();
         let key_ctrl = EventControllerKey::new();
         key_ctrl.connect_key_pressed(move |_ctrl, key, _code, _mods| {
             if key == gtk4::gdk::Key::Left || key == gtk4::gdk::Key::BackSpace {
                 let cur = sp_kb.borrow().clone();
-                let parent = Path::new(&cur).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                let parent = Path::new(&cur)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                *sp_kb.borrow_mut() = parent.clone();
                 let _ = tx_kb.send(MpdCommand::ListDirectory(parent));
                 gtk4::glib::Propagation::Stop
             } else {
@@ -98,203 +121,472 @@ impl FolderBrowser {
         });
         list.add_controller(key_ctrl);
 
-        Self { container, list, breadcrumb, shared_path, cmd_tx, cue_tracks, dsd_tracks }
+        // Right-click context menu on folder tree rows.
+        // set_button(3) + Capture phase avoids gesture arbitration conflicts.
+        let folder_popover: Rc<RefCell<Option<gtk4::Popover>>> = Rc::new(RefCell::new(None));
+        let rctx_tx = cmd_tx.clone();
+        let rctx_list = list.clone();
+        let rctx_ct = cue_tracks.clone();
+        let rclick_gesture = gtk4::GestureClick::new();
+        rclick_gesture.set_button(3);
+        rclick_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let rctx_fp = folder_popover.clone();
+        rclick_gesture.connect_pressed(move |_gest, _n, x, y| {
+            log::debug!("FolderTree context menu fired, y={y}");
+            let list = &rctx_list;
+            let row = list.row_at_y(y as i32);
+            let Some(row) = row else { return; };
+            let Some(w) = row.child() else { return; };
+            let name = w.widget_name();
+            let tx = rctx_tx.clone();
+
+            if let Some(ref old) = *rctx_fp.borrow() {
+                old.popdown();
+            }
+
+            let pop = gtk4::Popover::new();
+            let popbox = Box::new(Orientation::Vertical, 0);
+            let pop_close = rctx_fp.clone();
+
+            if name.starts_with("file:") {
+                let filepath = name.strip_prefix("file:").unwrap_or("").to_string();
+                let btn_play = gtk4::Button::with_label("Play Now");
+                let tp = tx.clone();
+                let fp = filepath.clone();
+                let pc = pop_close.clone();
+                btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayFile(fp.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                let btn_next = gtk4::Button::with_label("Play Next");
+                let tn = tx.clone();
+                let fnp = filepath.clone();
+                let pc = pop_close.clone();
+                btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(vec![fnp.clone()])); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                let btn_add = gtk4::Button::with_label("Add to Queue");
+                let ta = tx.clone();
+                let fap = filepath.clone();
+                let pc = pop_close.clone();
+                btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddUris(vec![fap.clone()])); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                popbox.append(&btn_play);
+                popbox.append(&btn_next);
+                popbox.append(&btn_add);
+            } else if name.starts_with("cue:") {
+                let path = name.strip_prefix("cue:").unwrap_or("").to_string();
+                if let Some(uris) = rctx_ct.borrow().get(&path) {
+                    let uris_play = uris.clone();
+                    let uris_insert = uris.clone();
+                    let uris_add = uris.clone();
+                    let btn_play = gtk4::Button::with_label("Play Now");
+                    let tp = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayUris(uris_play.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    let btn_next = gtk4::Button::with_label("Play Next");
+                    let tn = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(uris_insert.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    let btn_add = gtk4::Button::with_label("Add to Queue");
+                    let ta = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddUris(uris_add.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    popbox.append(&btn_play);
+                    popbox.append(&btn_next);
+                    popbox.append(&btn_add);
+                } else {
+                    return;
+                }
+            } else if name.starts_with("dir:") {
+                let dirpath = name.strip_prefix("dir:").unwrap_or("").to_string();
+                let btn_play = gtk4::Button::with_label("Play Now");
+                let tp = tx.clone();
+                let dp = dirpath.clone();
+                let pc = pop_close.clone();
+                btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayDirectory(dp.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                let btn_next = gtk4::Button::with_label("Play Next");
+                let tn = tx.clone();
+                let dn = dirpath.clone();
+                let pc = pop_close.clone();
+                btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextDirectory(dn.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                let btn_add = gtk4::Button::with_label("Add to Queue");
+                let ta = tx.clone();
+                let da = dirpath.clone();
+                let pc = pop_close.clone();
+                btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddDirectory(da.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                popbox.append(&btn_play);
+                popbox.append(&btn_next);
+                popbox.append(&btn_add);
+            } else {
+                return;
+            }
+
+            pop.set_child(Some(&popbox));
+            pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            pop.set_parent(rctx_list.upcast_ref::<gtk4::Widget>());
+            pop.popup();
+            *rctx_fp.borrow_mut() = Some(pop);
+        });
+        list.add_controller(rclick_gesture);
+
+        Self {
+            container,
+            list,
+            breadcrumb,
+            shared_path,
+            cmd_tx,
+            dir_cache,
+            expanded,
+            cue_tracks,
+            root_loaded,
+        }
     }
 
+    /// Called when a directory listing arrives from MPD.
+    /// If path matches the current root, rebuilds breadcrumb (navigation).
+    /// Otherwise just caches and expands in-place (tree expansion).
     pub fn set_entries(&mut self, path: &str, entries: Vec<DirEntry>) {
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
+        let is_root = path == self.shared_path.borrow().as_str()
+            || (path.is_empty() && self.shared_path.borrow().is_empty());
 
-        *self.shared_path.borrow_mut() = path.to_string();
-
-        // Rebuild breadcrumb
-        while let Some(c) = self.breadcrumb.first_child() {
-            self.breadcrumb.remove(&c);
-        }
-        let tx = self.cmd_tx.clone();
-        if path.is_empty() {
-            let lbl = Label::new(Some("~"));
-            lbl.set_css_classes(&["breadcrumb-root"]);
-            let tx_r = tx.clone();
-            let gesture_r = gtk4::GestureClick::new();
-            gesture_r.connect_pressed(move |_g, _n, _x, _y| {
-                let _ = tx_r.send(MpdCommand::ListDirectory(String::new()));
-            });
-            lbl.add_controller(gesture_r);
-            self.breadcrumb.append(&lbl);
-        } else {
-            let parts: Vec<&str> = path.split('/').collect();
-            for (i, part) in parts.iter().enumerate() {
-                if i > 0 {
-                    let sep = Label::new(Some("/"));
-                    sep.set_css_classes(&["breadcrumb-sep"]);
-                    self.breadcrumb.append(&sep);
-                }
-                let seg_path = parts[..=i].join("/");
-                let lbl = Label::new(Some(part));
-                if i == parts.len() - 1 {
-                    lbl.set_css_classes(&["breadcrumb-current"]);
-                } else {
-                    lbl.set_css_classes(&["breadcrumb-segment"]);
-                    let seg_tx = tx.clone();
-                    let gesture = gtk4::GestureClick::new();
-                    gesture.connect_pressed(move |_gest, _n, _x, _y| {
-                        let _ = seg_tx.send(MpdCommand::ListDirectory(seg_path.clone()));
-                    });
-                    lbl.add_controller(gesture);
-                }
+        if is_root {
+            // Rebuild breadcrumb — this is a root navigation.
+            // Remove children one by one — while-let avoids re-entrancy
+            // issues (remove() can trigger GTK signals that modify the child
+            // list, causing "Tried to remove non-child").
+            while let Some(child) = self.breadcrumb.first_child() {
+                self.breadcrumb.remove(&child);
+            }
+            let tx = self.cmd_tx.clone();
+            let sp = self.shared_path.clone();
+            if path.is_empty() {
+                let lbl = Label::new(Some("~"));
+                lbl.set_css_classes(&["breadcrumb-root"]);
+                let tx_r = tx.clone();
+                let sp_r = sp.clone();
+                let gesture_r = gtk4::GestureClick::new();
+                gesture_r.connect_pressed(move |_g, _n, _x, _y| {
+                    *sp_r.borrow_mut() = String::new();
+                    let _ = tx_r.send(MpdCommand::ListDirectory(String::new()));
+                });
+                lbl.add_controller(gesture_r);
                 self.breadcrumb.append(&lbl);
+            } else {
+                let parts: Vec<&str> = path.split('/').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        let sep = Label::new(Some("/"));
+                        sep.set_css_classes(&["breadcrumb-sep"]);
+                        self.breadcrumb.append(&sep);
+                    }
+                    let seg_path = parts[..=i].join("/");
+                    let lbl = Label::new(Some(part));
+                    if i == parts.len() - 1 {
+                        lbl.set_css_classes(&["breadcrumb-current"]);
+                    } else {
+                        lbl.set_css_classes(&["breadcrumb-segment"]);
+                        let seg_tx = tx.clone();
+                        let sp_seg = sp.clone();
+                        let gesture = gtk4::GestureClick::new();
+                        gesture.connect_pressed(move |_gest, _n, _x, _y| {
+                            *sp_seg.borrow_mut() = seg_path.clone();
+                            let _ = seg_tx.send(MpdCommand::ListDirectory(seg_path.clone()));
+                        });
+                        lbl.add_controller(gesture);
+                    }
+                    self.breadcrumb.append(&lbl);
+                }
             }
         }
 
-        // Up-navigation
-        if !path.is_empty() {
-            self.list.append(&dir_row(".."));
-        }
+        self.add_children(path, entries);
+    }
 
-        // Normalization: detect cue/DSD folders (case-insensitive extension matching)
+    /// Called when a directory listing arrives from MPD.
+    /// Caches the entries, normalizes CUE, and expands the path in the tree.
+    fn add_children(&mut self, path: &str, entries: Vec<DirEntry>) {
+        // Detect CUE and build normalized view
         let ends_with_ci = |s: &str, ext: &str| -> bool {
-            s.len() >= ext.len() && s[s.len()-ext.len()..].to_lowercase() == ext
+            s.len() >= ext.len() && s[s.len() - ext.len()..].to_lowercase() == ext
         };
-        let has_cue = entries.iter().any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".cue")));
-        let dsd_count = entries.iter().filter(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff"))).count();
-        let is_dsd_folder = dsd_count >= 1;
-        let dsd_format = entries.iter().find_map(|e| {
-            if let DirEntry::File { name, format, audio, .. } = e {
-                if ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff") {
-                    Some(format_badge(format, audio))
-                } else { None }
-            } else { None }
-        }).unwrap_or_default();
 
-        // Collect URIs for CUE-associated audio files and DSD files
-        let mut cue_file_uris: Vec<String> = Vec::new();
-        let mut dsd_file_uris: Vec<String> = Vec::new();
-        for entry in &entries {
-            if let DirEntry::File { path, name, .. } = entry {
-                if has_cue && (ends_with_ci(name, ".flac") || ends_with_ci(name, ".wav")
-                    || ends_with_ci(name, ".ape") || ends_with_ci(name, ".ogg")
-                    || ends_with_ci(name, ".mp3") || ends_with_ci(name, ".m4a")
-                    || ends_with_ci(name, ".aiff") || ends_with_ci(name, ".aif")
-                    || ends_with_ci(name, ".wv") || ends_with_ci(name, ".wma")
-                    || ends_with_ci(name, ".opus") || ends_with_ci(name, ".aac"))
-                {
-                    cue_file_uris.push(path.clone());
-                }
-                if is_dsd_folder && (ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff")) {
-                    dsd_file_uris.push(path.clone());
-                }
-            }
-        }
-        *self.cue_tracks.borrow_mut() = cue_file_uris;
-        *self.dsd_tracks.borrow_mut() = dsd_file_uris;
+        let has_cue = entries
+            .iter()
+            .any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".cue")));
 
-        let mut has_visible = false;
-
-        for entry in entries {
-            match entry {
-                DirEntry::Directory { name, .. } => {
-                    has_visible = true;
-                    self.list.append(&dir_row(&name));
-                }
-                DirEntry::File { path, name, duration, format, audio, .. } => {
-                    // Hide .cue files when cue normalization is active
-                    if has_cue && ends_with_ci(&name, ".cue") { continue; }
-                    // Skip individual audio files grouped under a cue sheet
-                    if has_cue && (ends_with_ci(&name, ".flac") || ends_with_ci(&name, ".wav")
-                        || ends_with_ci(&name, ".ape") || ends_with_ci(&name, ".ogg")
-                        || ends_with_ci(&name, ".mp3") || ends_with_ci(&name, ".m4a")
-                        || ends_with_ci(&name, ".aiff") || ends_with_ci(&name, ".aif")
-                        || ends_with_ci(&name, ".wv") || ends_with_ci(&name, ".wma")
-                        || ends_with_ci(&name, ".opus") || ends_with_ci(&name, ".aac"))
-                    {
-                        continue;
-                    }
-                    // Collapse DSD folder into single entry
-                    if is_dsd_folder && (ends_with_ci(&name, ".dsf") || ends_with_ci(&name, ".dff")) {
-                        continue;
-                    }
-                    has_visible = true;
-                    let badge = format_badge(&format, &audio);
-                    let dur = duration.map(format_duration).unwrap_or_default();
-                    self.list.append(&file_row(&path, &name, &dur, &badge));
-                }
-                DirEntry::Playlist { name, .. } => {
-                    has_visible = true;
-                    self.list.append(&dir_row(&name));
-                }
-            }
-        }
-
-        // Show normalized entries
+        // Collect CUE-associated track URIs
         if has_cue {
-            let cue_row = gtk4::ListBoxRow::new();
-            let hbox = Box::new(Orientation::Horizontal, 4);
-            let lbl = Label::new(Some("[CUE] Cue Sheet Album"));
-            let info = Label::new(Some("click to play"));
-            info.set_css_classes(&["format-badge"]);
-            hbox.set_css_classes(&["dir-entry"]);
-            hbox.set_widget_name("cue:");
-            hbox.append(&lbl);
-            hbox.append(&info);
-            cue_row.set_child(Some(&hbox));
-            self.list.append(&cue_row);
-        }
-        if is_dsd_folder && !has_cue {
-            let dsd_row = gtk4::ListBoxRow::new();
-            let hbox = Box::new(Orientation::Horizontal, 4);
-            let lbl = Label::new(Some(&format!("[DSD] DSD Album ({} tracks)", dsd_count)));
-            let badge = Label::new(Some(&dsd_format));
-            badge.set_css_classes(&["format-badge"]);
-            hbox.set_css_classes(&["dir-entry"]);
-            hbox.set_widget_name("dsd:");
-            hbox.append(&lbl);
-            hbox.append(&badge);
-            dsd_row.set_child(Some(&hbox));
-            self.list.append(&dsd_row);
+            let mut uris: Vec<String> = Vec::new();
+            for entry in &entries {
+                if let DirEntry::File { path: fp, name, .. } = entry {
+                    if ends_with_ci(name, ".flac")
+                        || ends_with_ci(name, ".wav") || ends_with_ci(name, ".ape")
+                        || ends_with_ci(name, ".ogg") || ends_with_ci(name, ".mp3")
+                        || ends_with_ci(name, ".m4a") || ends_with_ci(name, ".aiff")
+                        || ends_with_ci(name, ".aif") || ends_with_ci(name, ".wv")
+                        || ends_with_ci(name, ".wma") || ends_with_ci(name, ".opus")
+                        || ends_with_ci(name, ".aac")
+                    {
+                        uris.push(fp.clone());
+                    }
+                }
+            }
+            self.cue_tracks.borrow_mut().insert(path.to_string(), uris);
         }
 
-        // Empty state
-        if !has_visible && !has_cue && !is_dsd_folder {
-            let empty_row = gtk4::ListBoxRow::new();
-            let lbl = Label::new(Some("(empty directory)"));
-            lbl.set_css_classes(&["album-grid-status"]);
-            empty_row.set_child(Some(&lbl));
-            self.list.append(&empty_row);
-        }
+        self.dir_cache.borrow_mut().insert(path.to_string(), entries);
+        self.expanded.borrow_mut().insert(path.to_string());
+        self.root_loaded.replace(true);
+
+        rebuild_list(
+            &self.list,
+            &self.dir_cache,
+            &self.expanded,
+            &self.cue_tracks,
+            &self.shared_path,
+        );
+    }
+
+    /// Rebuild the list from cache (used after collapse).
+    pub fn rebuild(&mut self) {
+        rebuild_list(
+            &self.list,
+            &self.dir_cache,
+            &self.expanded,
+            &self.cue_tracks,
+            &self.shared_path,
+        );
     }
 }
 
-fn dir_row(name: &str) -> gtk4::ListBoxRow {
+/// Recursively rebuild the ListBox from cached directory data.
+fn rebuild_list(
+    list: &ListBox,
+    dir_cache: &Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
+    expanded: &Rc<RefCell<HashSet<String>>>,
+    cue_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
+    shared_path: &Rc<RefCell<String>>,
+) {
+    // Clear all rows. Use remove_all() which handles ListBox internal
+    // bookkeeping correctly. The per-row remove() loop can infinite-loop
+    // if a child's parent isn't the ListBox ("Tried to remove non-child").
+    // remove_all() is safe because it only removes actual rows.
+    list.remove_all();
+
+    let root_path = shared_path.borrow().clone();
+
+    // Breadcrumb is managed by set_entries / the caller rebuilding it separately.
+    // Here we just rebuild the tree starting from root_path.
+
+    let has_children = dir_cache.borrow().contains_key(&root_path);
+    if !has_children {
+        // Not loaded yet — show empty
+        return;
+    }
+
+    // Build tree from root_path at depth 0
+    render_dir(
+        list,
+        &root_path,
+        0,
+        dir_cache,
+        expanded,
+        cue_tracks,
+    );
+
+    // Show ".." parent entry if not at root
+    if !root_path.is_empty() {
+        let parent_row = dir_row("..", "..", 0);
+        list.prepend(&parent_row);
+    }
+}
+
+fn render_dir(
+    list: &ListBox,
+    path: &str,
+    depth: u32,
+    dir_cache: &Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
+    expanded: &Rc<RefCell<HashSet<String>>>,
+    cue_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
+) {
+    let entries = match dir_cache.borrow().get(path) {
+        Some(e) => e.clone(),
+        None => return,
+    };
+
+    let ends_with_ci = |s: &str, ext: &str| -> bool {
+        s.len() >= ext.len() && s[s.len() - ext.len()..].to_lowercase() == ext
+    };
+
+    let has_cue = entries
+        .iter()
+        .any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".cue")));
+
+    let mut has_visible = false;
+
+    for entry in &entries {
+        match entry {
+            DirEntry::Directory { name, .. } => {
+                has_visible = true;
+                let full_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", path, name)
+                };
+                let is_expanded = expanded.borrow().contains(&full_path);
+                let row = tree_dir_row(name, &full_path, depth, is_expanded);
+                list.append(&row);
+
+                // If expanded, render children recursively
+                if is_expanded {
+                    render_dir(
+                        list,
+                        &full_path,
+                        depth + 1,
+                        dir_cache,
+                        expanded,
+                        cue_tracks,
+                    );
+                }
+            }
+            DirEntry::File {
+                path: fp,
+                name,
+                duration,
+                format,
+                audio,
+                ..
+            } => {
+                // Skip CUE files and audio files in CUE folders
+                if has_cue && ends_with_ci(name, ".cue") {
+                    continue;
+                }
+                if has_cue
+                    && (ends_with_ci(name, ".flac")
+                        || ends_with_ci(name, ".wav")
+                        || ends_with_ci(name, ".ape")
+                        || ends_with_ci(name, ".ogg")
+                        || ends_with_ci(name, ".mp3")
+                        || ends_with_ci(name, ".m4a")
+                        || ends_with_ci(name, ".aiff")
+                        || ends_with_ci(name, ".aif")
+                        || ends_with_ci(name, ".wv")
+                        || ends_with_ci(name, ".wma")
+                        || ends_with_ci(name, ".opus")
+                        || ends_with_ci(name, ".aac"))
+                {
+                    continue;
+                }
+                // DSD files are shown as individual tracks
+                has_visible = true;
+                let badge = format_badge(format, audio);
+                let dur = duration.map(format_duration).unwrap_or_default();
+                let row = file_row(fp, name, &dur, &badge, depth);
+                list.append(&row);
+            }
+            DirEntry::Playlist { name, .. } => {
+                has_visible = true;
+                let full_path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", path, name)
+                };
+                let row = tree_dir_row(name, &full_path, depth, false);
+                list.append(&row);
+            }
+        }
+    }
+
+    // Normalized CUE summary row
+    if has_cue {
+        let row = cue_summary_row(path, depth);
+        list.append(&row);
+        has_visible = true;
+    }
+
+    // Empty state
+    if !has_visible && !has_cue {
+        let empty_row = gtk4::ListBoxRow::new();
+        let lbl = Label::new(Some("(empty directory)"));
+        lbl.set_css_classes(&["album-grid-status"]);
+        lbl.set_margin_start((depth * 20 + 8) as i32);
+        empty_row.set_child(Some(&lbl));
+        list.append(&empty_row);
+    }
+}
+
+// --- Row builders ---
+
+fn tree_dir_row(name: &str, full_path: &str, depth: u32, expanded: bool) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::new();
     let hbox = Box::new(Orientation::Horizontal, 4);
-    hbox.set_margin_start(8);
-    hbox.set_margin_top(4);
-    hbox.set_margin_bottom(4);
-    hbox.set_widget_name(name);
+    let indent = (depth * 20 + 8) as i32;
+    hbox.set_margin_start(indent);
+    hbox.set_margin_top(3);
+    hbox.set_margin_bottom(3);
+    hbox.set_widget_name(&format!("dir:{}", full_path));
     hbox.set_css_classes(&["dir-entry"]);
-    let icon = Label::new(Some("▶"));
+
+    // Expander triangle — changes direction based on expand state
+    let expander = Label::new(Some(if expanded { "▼" } else { "▶" }));
+    expander.set_css_classes(&["tree-expander"]);
+    hbox.append(&expander);
+
+    let icon = Image::from_icon_name("folder-symbolic");
+    icon.set_pixel_size(16);
+    icon.set_css_classes(&["dir-icon"]);
+    hbox.append(&icon);
+
     let text = Label::new(Some(name));
     text.set_halign(gtk4::Align::Start);
-    hbox.append(&icon);
+    text.set_hexpand(true);
     hbox.append(&text);
+
     row.set_child(Some(&hbox));
     row
 }
 
-fn file_row(full_path: &str, _name: &str, duration: &str, format_badge: &str) -> gtk4::ListBoxRow {
+fn dir_row(name: &str, full_path: &str, depth: u32) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::new();
-    let hbox = Box::new(Orientation::Horizontal, 8);
-    hbox.set_margin_start(12);
-    hbox.set_margin_top(4);
-    hbox.set_margin_bottom(4);
-    hbox.set_widget_name(&format!("file:{}", full_path));
+    let indent = (depth * 20 + 8) as i32;
+    let hbox = Box::new(Orientation::Horizontal, 4);
+    hbox.set_margin_start(indent);
+    hbox.set_margin_top(3);
+    hbox.set_margin_bottom(3);
+    hbox.set_widget_name(full_path); // ".." or simple name
+    hbox.set_css_classes(&["dir-entry"]);
 
-    let icon = Label::new(Some("♪"));
+    let icon = Image::from_icon_name("go-up-symbolic");
+    icon.set_pixel_size(16);
+    icon.set_css_classes(&["dir-icon"]);
     hbox.append(&icon);
 
-    let name_label = Label::new(Some(_name));
+    let text = Label::new(Some(name));
+    text.set_halign(gtk4::Align::Start);
+    text.set_hexpand(true);
+    hbox.append(&text);
+
+    row.set_child(Some(&hbox));
+    row
+}
+
+fn file_row(
+    full_path: &str,
+    name: &str,
+    duration: &str,
+    format_badge: &str,
+    depth: u32,
+) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    let indent = (depth * 20 + 12) as i32;
+    let hbox = Box::new(Orientation::Horizontal, 8);
+    hbox.set_margin_start(indent);
+    hbox.set_margin_top(3);
+    hbox.set_margin_bottom(3);
+    hbox.set_widget_name(&format!("file:{}", full_path));
+    hbox.set_css_classes(&["folder-file-row"]);
+
+    let icon = Image::from_icon_name("audio-x-generic-symbolic");
+    icon.set_pixel_size(16);
+    icon.set_css_classes(&["file-icon"]);
+    hbox.append(&icon);
+
+    let name_label = Label::new(Some(name));
     name_label.set_halign(gtk4::Align::Start);
     name_label.set_hexpand(true);
     name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -313,8 +605,35 @@ fn file_row(full_path: &str, _name: &str, duration: &str, format_badge: &str) ->
     row
 }
 
+fn cue_summary_row(path: &str, depth: u32) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    let indent = (depth * 20 + 8) as i32;
+    let hbox = Box::new(Orientation::Horizontal, 4);
+    hbox.set_margin_start(indent);
+    hbox.set_margin_top(3);
+    hbox.set_margin_bottom(3);
+
+    let icon = Image::from_icon_name("media-optical-cd-audio-symbolic");
+    icon.set_pixel_size(16);
+    hbox.append(&icon);
+
+    let lbl = Label::new(Some("[CUE] Cue Sheet Album"));
+    let info = Label::new(Some("click to play"));
+    info.set_css_classes(&["format-badge"]);
+    hbox.set_css_classes(&["dir-entry"]);
+    hbox.set_widget_name(&format!("cue:{}", path));
+    hbox.append(&lbl);
+    hbox.append(&info);
+    row.set_child(Some(&hbox));
+    row
+}
+
+// --- Format helpers ---
+
 fn format_duration(secs: f64) -> String {
-    if secs < 0.0 { return "0:00".into(); }
+    if secs < 0.0 {
+        return "0:00".into();
+    }
     let total = secs as u64;
     format!("{}:{:02}", total / 60, total % 60)
 }
@@ -322,18 +641,31 @@ fn format_duration(secs: f64) -> String {
 fn format_badge(format: &Option<String>, audio: &Option<String>) -> String {
     match (audio, format) {
         (Some(a), f) if a.to_lowercase() == "dsd" => {
-            let rate = f.as_ref().and_then(|s| s.split(':').next())
-                .and_then(|r| r.parse::<u32>().ok()).unwrap_or(0);
+            let rate = f
+                .as_ref()
+                .and_then(|s| s.split(':').next())
+                .and_then(|r| r.parse::<u32>().ok())
+                .unwrap_or(0);
             let mult = rate / 44100;
-            if mult >= 2 { format!("DSD{}", mult) } else { "DSD".into() }
+            if mult >= 2 {
+                format!("DSD{}", mult)
+            } else {
+                "DSD".into()
+            }
         }
         (_, Some(f)) => {
             let p: Vec<&str> = f.split(':').collect();
             if p.len() >= 2 {
                 let sr = p[0].parse::<f64>().unwrap_or(0.0) / 1000.0;
-                let sr_s = if sr.fract() == 0.0 { format!("{}", sr as u32) } else { format!("{:.1}", sr) };
+                let sr_s = if sr.fract() == 0.0 {
+                    format!("{}", sr as u32)
+                } else {
+                    format!("{:.1}", sr)
+                };
                 format!("{}/{}", p[1], sr_s)
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         }
         _ => String::new(),
     }

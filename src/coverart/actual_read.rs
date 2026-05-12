@@ -68,10 +68,28 @@ impl ActualRead {
         self.queue.len()
     }
 
+    /// Process up to `max` albums from the queue. Called immediately after
+    /// enqueue to fetch covers in bulk rather than one-per-idle-cycle.
+    pub fn process_batch(
+        &mut self,
+        adapter: &mut MpdAdapter,
+        caps: &crate::mpd::MpdCapabilities,
+        provider: &CoverProvider,
+        event_tx: &EventSender,
+        max: usize,
+    ) {
+        for _ in 0..max {
+            if self.queue.is_empty() {
+                break;
+            }
+            self.process_one(adapter, caps, provider, event_tx);
+        }
+    }
+
     /// Process one album from the queue.
     ///
     /// 1. Pops the front album from the queue.
-    /// 2. Primary: `adapter.albumart(uri)` — MD5 hash, compare against CoverProvider cache.
+    /// 2. Primary: `adapter.albumart_by_uri(uri)` — MD5 hash, compare against CoverProvider cache.
     /// 3. Fallback: `adapter.readpicture(uri)` — compare timestamp against cache.
     /// 4. (optional) Online lookup (feature-gated, disabled by default).
     /// 5. If new data: write cache file, update index.json, emit `CoverPaths`, invalidate CoverProvider.
@@ -111,10 +129,15 @@ impl ActualRead {
             }
         };
 
-        // Step 2: Primary — albumart
+        // Step 2: Primary — albumart (use maybe_uri from step 1 to avoid double find_album_uris)
         log::info!("[cover] '{key}': albumart={}, readpicture={}", caps.albumart, caps.readpicture);
         if caps.albumart {
-            match adapter.albumart(&album_name) {
+            let result = if let Some(ref uri) = maybe_uri {
+                adapter.albumart_by_uri(uri, &album_name)
+            } else {
+                adapter.albumart(&album_name)
+            };
+            match result {
                 Ok(Some(data)) => {
                     log::info!("[cover] '{key}': albumart returned {} bytes", data.len());
                     if self.handle_albumart_data(&key, &data, provider, event_tx) {
@@ -217,19 +240,22 @@ impl ActualRead {
         provider.update_entry(album_name, &md5, Some(mtime));
     }
 
-    /// Write cover data to disk cache.
+    /// Write cover data to disk cache, stripping ICC color profiles.
     fn write_cache(&self, album_name: &str, data: &[u8], md5: &str, timestamp: Option<u64>) {
         let jpeg_path = self.cache_dir.join(format!("{md5}.jpg"));
-        if let Err(e) = fs::write(&jpeg_path, data) {
+        // Strip ICC profile (APP2 marker) to avoid expensive glycin/gdk-pixbuf
+        // color space conversion on every load. Album covers don't need color management.
+        let cleaned = strip_jpeg_icc(data);
+        if let Err(e) = fs::write(&jpeg_path, &cleaned) {
             log::warn!(
                 "[actual_read] Failed to write cache for '{album_name}': {e}"
             );
-            // Non-fatal — UI can still display from event payload in future stories.
-            // For now, we still emit the CoverPaths event below.
         } else {
             log::info!(
-                "[actual_read] Cached cover for '{album_name}' at {:?}",
-                jpeg_path
+                "[actual_read] Cached cover for '{album_name}' at {:?} ({} bytes, ICC stripped: {})",
+                jpeg_path,
+                cleaned.len(),
+                cleaned.len() != data.len()
             );
         }
 
@@ -253,15 +279,13 @@ impl ActualRead {
         let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
     }
 
-    /// Emit a CoverRefreshed event for the given album, carrying raw JPEG bytes.
-    ///
-    /// The UI thread decodes the raw bytes into a GdkTexture via gdk-pixbuf for
-    /// direct widget updates — no path-based handoff needed. This complements
-    /// `emit_cover_path` which carries the file path for backward compat.
+    /// Emit a CoverRefreshed event for the given album with ICC-stripped JPEG bytes.
+    /// Raw bytes bypass write_cache's stripping — must strip here too.
     fn emit_cover_refreshed(&self, album_name: &str, data: &[u8], event_tx: &EventSender) {
+        let cleaned = strip_jpeg_icc(data);
         let _ = event_tx.try_send(MpdEvent::CoverRefreshed {
             album_id: album_name.to_string(),
-            data: data.to_vec(),
+            data: cleaned,
         });
     }
 
@@ -345,6 +369,29 @@ impl ActualRead {
     }
 }
 
+/// Strip APP2 (ICC profile) markers from JPEG data. Album covers don't need
+/// color management, and ICC profiles trigger unnecessary color conversions.
+fn strip_jpeg_icc(data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0xFF && i + 1 < data.len() && data[i + 1] == 0xE2 {
+            // APP2 marker found — skip marker + length-prefixed segment
+            if i + 3 < data.len() {
+                let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+                i += 2 + len; // skip 2-byte marker + segment length
+            } else {
+                result.push(data[i]);
+                i += 1;
+            }
+        } else {
+            result.push(data[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -401,15 +448,20 @@ mod tests {
     }
 
     #[test]
-    fn test_enqueue_replaces_previous() {
+    fn test_enqueue_dedup() {
         let cache_dir = PathBuf::from("/tmp/test_actual_read");
         let mut ar = ActualRead::new(cache_dir);
 
         ar.enqueue(vec![("A".into(), "Old".into())]);
         assert_eq!(ar.pending_count(), 1);
 
+        // Different items append (don't replace)
         ar.enqueue(vec![("B".into(), "New".into())]);
-        assert_eq!(ar.pending_count(), 1); // Old was replaced
+        assert_eq!(ar.pending_count(), 2);
+
+        // Same item is deduplicated
+        ar.enqueue(vec![("A".into(), "Old".into())]);
+        assert_eq!(ar.pending_count(), 2);
     }
 
     #[test]

@@ -180,7 +180,11 @@ fn get_response(command: &str) -> Vec<String> {
         c if c.starts_with("moveid ") => vec![],
         c if c.starts_with("addid ") => vec!["Id: 99".into()],
         c if c.starts_with("search ") => make_search_response(c),
-        c if c == "list album" || c.starts_with("list album group") => make_list_albums_response(),
+        c if c == "list album" => make_list_albums_response(),
+        c if c.starts_with("list album group AlbumArtist") => make_list_album_artist_response(),
+        c if c.starts_with("list album group Date") => make_list_date_response(),
+        c if c.starts_with("list album group Genre") => make_list_genre_response(),
+        c if c.starts_with("list artist group album") => make_list_artist_group_album_response(),
         c if c.starts_with("find album ") => make_find_album_response(),
         c if c.starts_with("lsinfo") => make_lsinfo_response(command),
         _ => vec![],
@@ -277,12 +281,54 @@ fn make_search_albumartist_response() -> Vec<String> {
 
 fn make_list_albums_response() -> Vec<String> {
     vec![
-        "Artist: Test Artist".into(),
-        "Album: Test Album".into(),
-        "Artist: Second Artist".into(),
         "Album: Second Album".into(),
-        "Artist: Third Artist".into(),
+        "Album: Test Album".into(),
         "Album: Third Album".into(),
+    ]
+}
+
+fn make_list_album_artist_response() -> Vec<String> {
+    vec![
+        "AlbumArtist: Second Artist".into(),
+        "Album: Second Album".into(),
+        "AlbumArtist: Test Artist".into(),
+        "Album: Test Album".into(),
+        "AlbumArtist: Third Artist".into(),
+        "Album: Third Album".into(),
+    ]
+}
+
+fn make_list_date_response() -> Vec<String> {
+    vec![
+        "Date: 2020".into(),
+        "Album: Second Album".into(),
+        "Date: 2022".into(),
+        "Album: Test Album".into(),
+        "Date: 2024".into(),
+        "Album: Third Album".into(),
+    ]
+}
+
+fn make_list_genre_response() -> Vec<String> {
+    vec![
+        "Genre: Rock".into(),
+        "Album: Second Album".into(),
+        "Genre: Jazz".into(),
+        "Album: Test Album".into(),
+        "Genre: Electronic".into(),
+        "Album: Third Album".into(),
+    ]
+}
+
+fn make_list_artist_group_album_response() -> Vec<String> {
+    vec![
+        "Album: Second Album".into(),
+        "Artist: Second Artist".into(),
+        "Album: Test Album".into(),
+        "Artist: Test Artist".into(),
+        "Artist: Featured Artist".into(),
+        "Album: Third Album".into(),
+        "Artist: Third Artist".into(),
     ]
 }
 

@@ -105,26 +105,32 @@ fn test_search_albums_albumartist() {
 }
 
 #[test]
-fn test_list_albums() {
+fn test_list_albums_full() {
     let (server, mut client) = common::with_mpd_server();
-    let albums = client.list_albums().unwrap();
+    let albums = client.list_albums_full().unwrap();
     assert_eq!(albums.len(), 3);
-    assert_eq!(albums[0].1, "Second Album"); // sorted alphabetically by album name
-    assert_eq!(albums[1].1, "Test Album");
-    assert_eq!(albums[2].1, "Third Album");
+    // Sorted alphabetically by album name
+    assert_eq!(albums[0].album, "Second Album");
+    assert_eq!(albums[0].album_artist, "Second Artist");
+    assert_eq!(albums[0].year.as_deref(), Some("2020"));
+    assert_eq!(albums[0].genre.as_deref(), Some("Rock"));
+    assert_eq!(albums[1].album, "Test Album");
+    assert_eq!(albums[2].album, "Third Album");
     server.assert_received("list");
 }
 
 #[test]
 fn test_list_albums_grouped() {
     let (server, mut client) = common::with_mpd_server();
-    let groups = client.list_albums_grouped("Artist").unwrap();
+    // First fetch the full metadata
+    let albums = client.list_albums_full().unwrap();
+    // Then group locally by Artist
+    let groups = client.list_albums_grouped("Artist", &albums);
     assert!(!groups.is_empty());
     // First group should have header and albums
     let (header, albums) = &groups[0];
     assert!(!header.is_empty());
     assert!(!albums.is_empty());
-    server.assert_received("list");
 }
 
 #[test]
