@@ -6,7 +6,7 @@ use crate::ui::widgets::AlbumCoverCell;
 use crate::config::Config;
 use crate::mpd::state_machine::{CommandSender, MpdCommand, MpdEvent, PlaybackUpdate};
 use crate::mpd::AlbumMeta;
-use crate::search::SearchIndex;
+use crate::search::{SearchCommand, SearchCommandSender};
 use crate::state::SharedState;
 use gtk4::prelude::*;
 use adw::prelude::*;
@@ -15,7 +15,7 @@ use gtk4::{Application, Box, DragSource, DropTarget, EventControllerKey, Fixed, 
 use gtk4::gdk::{ContentProvider, DragAction};
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 /// Album grid item with optional group overlay badge on first item of each group.
 #[derive(Clone)]
@@ -434,6 +434,8 @@ pub struct App {
     /// Sender for MPRIS PropertiesChanged signal emissions (drops unused when !mpris feature).
     mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
     metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
+    /// Sender for search worker commands (story 28-3).
+    search_cmd_tx: SearchCommandSender,
 }
 
 impl App {
@@ -444,6 +446,7 @@ impl App {
         conn_params: Arc<Mutex<crate::mpd::ConnectionTarget>>,
         mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
         metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
+        search_cmd_tx: SearchCommandSender,
     ) -> Self {
         Self {
             state,
@@ -452,6 +455,7 @@ impl App {
             conn_params,
             mpris_update_tx,
             metadata_cache,
+            search_cmd_tx,
         }
     }
 
@@ -481,6 +485,7 @@ impl App {
 
         let mpris_update_tx = self.mpris_update_tx.clone();
         let metadata_cache = self.metadata_cache.clone();
+        let search_cmd_tx = self.search_cmd_tx.clone();
 
         application.connect_activate(move |window_app| {
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
@@ -971,9 +976,9 @@ impl App {
             // Track the previously active group for restore on search clear
             let prev_group: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
 
-            // Search generation counter & local index
+            // Search generation counter
             let search_gen: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(0));
-            let search_index: Arc<RwLock<SearchIndex>> = Arc::new(RwLock::new(SearchIndex::new()));
+            let scmd = search_cmd_tx.clone();
 
             // stop_search: Escape or clear button
             let stop_btn_map = group_btn_map.clone();
@@ -992,12 +997,12 @@ impl App {
             let se_group = prev_group.clone();
             let se_active_group = active_group.clone();
             let se_btn_map = group_btn_map.clone();
-            let se_index = search_index.clone();
-            let se_stack = left_stack.clone();
-            let se_scroll = left_scroll.clone();
-            let se_model = album_model.clone();
-            let se_data = album_grid_data.clone();
-            let se_cw = cover_widgets.clone();
+            let se_scmd = scmd.clone();
+            let _se_stack = left_stack.clone();
+            let _se_scroll = left_scroll.clone();
+            let _se_model = album_model.clone();
+            let _se_data = album_grid_data.clone();
+            let _se_cw = cover_widgets.clone();
             // DISABLED: resize repad machinery (see comment at main resize block)
             // let se_last_cols = resize_last_cols.clone();
             // let se_generation = resize_generation.clone();
@@ -1026,42 +1031,16 @@ impl App {
 
                 let qc = q.clone();
                 let gen_c = se_gen.clone();
-                let idx = se_index.clone();
-                let scr = se_scroll.clone();
-                let s = se_stack.clone();
+                let scmd = se_scmd.clone();
                 let tx = se_tx.clone();
-                let m = se_model.clone();
-                let d = se_data.clone();
-                let cw = se_cw.clone();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(150),
                     move || {
                         if gen_c.get() != this_gen { return; }
-                        // Try local index first
-                        let Ok(index) = idx.read() else { return; };
-                        let results = index.search(&qc);
-                        if !results.is_empty() {
-                            let items: Vec<AlbumGridItem> = results.iter()
-                                .enumerate()
-                                .map(|(i, (artist, name, _score))| {
-                                    AlbumGridItem::Album {
-                                        artist: artist.clone(),
-                                        name: name.clone(),
-                                        album_id: format!("search-{i}"),
-                                        year: None,
-                                        group_label: None,
-                                        caption: None,
-                                        year_badge: None,
-                                    }
-                                })
-                                .collect();
-                            batch_populate(&m, &d, items, &cw);
-                            s.set_visible_child(&scr);
-                            // DISABLED: resize repad after grid allocation (see main resize block)
-                        } else {
-                            // Fall back to MPD search
-                            let _ = tx.send(MpdCommand::Search(qc));
-                        }
+                        // Send to search worker (story 28-3): worker emits SearchResults via event_tx
+                        scmd.send(SearchCommand::Search(qc.clone()));
+                        // MPD search fallback (fires unconditionally; local results arrive first)
+                        let _ = tx.send(MpdCommand::Search(qc));
                     },
                 );
             });
@@ -2083,7 +2062,7 @@ impl App {
             let fc_ql = queue_list.clone();
             let fc_queue_popover = queue_popover.clone();
             let fc_ids = item_ids_w.clone();
-            let fc_si = search_index.clone();
+            let fc_scmd = scmd.clone();
             let fc_mc = metadata_cache.clone();
             let fc_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
@@ -2237,7 +2216,7 @@ impl App {
                     drop(guard);
                     match event {
                         MpdEvent::Connected => {
-                            if let Ok(mut idx) = fc_si.write() { *idx = SearchIndex::new(); }
+                            fc_scmd.send(SearchCommand::Reset);
                             let _ = fc_cmd.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
                             let _ = fc_cmd.send(MpdCommand::ListQueue);
                         }
@@ -2343,7 +2322,7 @@ impl App {
                             let flat_for_index: Vec<(String, String)> = albums.iter()
                                 .map(|m| (m.album_artist.clone(), m.album.clone()))
                                 .collect();
-                            if let Ok(mut idx) = fc_si.write() { idx.build(&flat_for_index); }
+                            fc_scmd.send(SearchCommand::BuildIndex(flat_for_index));
                             if albums.is_empty() {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
@@ -2424,13 +2403,8 @@ impl App {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                // Only rebuild search index if flat list changed
-                                let need_index = if let Ok(idx) = fc_si.read() {
-                                    idx.album_count() != flat.len()
-                                } else { true };
-                                if need_index {
-                                    if let Ok(mut idx) = fc_si.write() { idx.build(&flat); }
-                                }
+                                // Send index build to search worker (story 28-3)
+                                fc_scmd.send(SearchCommand::BuildIndex(flat.clone()));
                                 let single_group = groups.len() == 1;
                                 let view_mode = active_group.borrow().clone();
                                 let mut items: Vec<AlbumGridItem> = groups.iter()
@@ -2482,7 +2456,7 @@ impl App {
                                 batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
                                 fc_stack.set_visible_child(&fc_scroll);
                                 // trigger_repad(); // DISABLED
-                                if need_index {
+                                {
                                     let mut all_albums = Some(all_albums);
                                     glib::idle_add_local(move || {
                                         if let Some(albums) = all_albums.take() {
@@ -2829,7 +2803,7 @@ impl App {
                             }
                         }
                         MpdEvent::LibraryChanged => {
-                            if let Ok(mut idx) = fc_si.write() { *idx = SearchIndex::new(); }
+                            fc_scmd.send(SearchCommand::Reset);
                             let _ = fc_cmd.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
                         }
                         MpdEvent::Error(msg) => {

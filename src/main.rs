@@ -218,7 +218,7 @@ fn main() {
 
     // Create bounded MPD event channel (backpressure: drop events when UI is busy)
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(1024);
-    let (event_loop, cmd_tx, metadata_cache) = MpdEventLoop::spawn(
+    let (event_loop, cmd_tx, metadata_cache, search_cmd_tx) = MpdEventLoop::spawn(
         event_tx,
         conn_params.clone(),
     );
@@ -271,7 +271,7 @@ fn main() {
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();
-    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache);
+    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache, search_cmd_tx);
     app.run();
 
     info!("Shutting down MPD connection");

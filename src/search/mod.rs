@@ -1,4 +1,13 @@
-//! Local in-memory search index — fast full-text search without MPD round-trips. Thread: UI build (from event data), UI query.
+//! Local in-memory search index — fast full-text search without MPD round-trips.
+//! Thread: Search worker thread (index builds + queries), GTK thread (results display).
+//!
+//! After story 28-3, the `SearchIndex` is owned by the search worker thread.
+//! The GTK thread sends `SearchCommand` via channel and receives results as
+//! `MpdEvent::SearchResults`. The index is never locked or accessed from GTK.
+
+pub mod worker;
+
+pub use worker::{SearchCommand, SearchCommandSender};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;

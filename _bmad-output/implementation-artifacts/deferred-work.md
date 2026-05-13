@@ -29,6 +29,14 @@ Items planned for the release — may be in-progress or pending.
 - **SIGINT cleanup via `process::exit(0)`** — skips graceful MPD disconnect
 - **D-Bus session bus reconnection** — MPRIS silently stops if D-Bus restarts
 
+## Deferred from: code review of 28-3-search-worker-thread (2026-05-13)
+
+- Unconditional MPD fallback alongside local search worker — doubled MPD traffic per keystroke, result race between local and MPD SearchResults
+- Race window between Reset and BuildIndex on reconnect — user search between Connected/Albums events returns empty
+- 500ms recv_timeout command latency — follows Cover Proc pattern, debounce masks it
+- Event channel saturation from SearchResults — try_send drops when channel full (pre-existing pattern)
+- No generation counter on SearchResults — stale results from slow queries can overwrite fresh ones
+
 ## Deferred from: code review of 28-2-cover-proc-worker (2026-05-13)
 
 - Multiple Cover Proc workers during reconnection window — index.json read-modify-write not atomic across threads, can lose cache entries

@@ -4,6 +4,7 @@
 
 use crate::mpd::cover::{self, CoverFetchResult, CoverThreadSender};
 use crate::mpd::{ConnectionTarget, DirEntry, MpdAdapter, MpdStream};
+use crate::search::{SearchCommand, SearchCommandSender};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -196,14 +197,21 @@ impl MpdEventLoop {
     pub fn spawn(
         event_tx: mpsc::SyncSender<MpdEvent>,
         conn_params: Arc<std::sync::Mutex<ConnectionTarget>>,
-    ) -> (Self, CommandSender, std::sync::Arc<crate::metadata::MetadataCache>) {
+    ) -> (Self, CommandSender, std::sync::Arc<crate::metadata::MetadataCache>, SearchCommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel::<MpdCommand>();
         let cmd_sender = CommandSender::new(cmd_tx);
         let noidle_socket = cmd_sender.noidle_socket.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let stop_search = stop.clone();
         let metadata_cache = std::sync::Arc::new(crate::metadata::MetadataCache::new());
         let mc_thread = metadata_cache.clone();
+
+        // Search worker (story 28-3): owns SearchIndex, runs queries off GTK thread
+        let (search_cmd_tx, search_cmd_rx) = mpsc::sync_channel::<SearchCommand>(64);
+        let search_sender = SearchCommandSender::new(search_cmd_tx);
+        let search_event_tx = event_tx.clone();
+        crate::search::worker::spawn(search_cmd_rx, search_event_tx, stop_search);
 
         let handle = thread::Builder::new()
             .name("mpd-event-loop".into())
@@ -295,6 +303,7 @@ impl MpdEventLoop {
             },
             cmd_sender,
             metadata_cache,
+            search_sender,
         )
     }
 
