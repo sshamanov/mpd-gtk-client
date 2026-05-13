@@ -172,25 +172,29 @@ fn rebuild_mini_fixed(
 /// Given a Picture widget inside a cover_overlay (Overlay), find and hide
 /// the placeholder DrawingArea overlay that sits on top of it.
 /// Generate a solid-color placeholder texture from an artist name.
-/// Uses Pixbuf::fill() — one call fills the entire buffer with the color.
 fn placeholder_texture(artist: &str) -> gdk4::Texture {
     let (r, g, b) = placeholder_rgb(artist);
     let r8 = (r * 255.0) as u8;
     let g8 = (g * 255.0) as u8;
     let b8 = (b * 255.0) as u8;
-    let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 200, 200)
-        .expect("valid pixbuf params");
-    // Pack RGB into u32 (0xRRGGBB00 — alpha byte ignored for non-alpha pixbuf)
-    let pixel: u32 = ((r8 as u32) << 24) | ((g8 as u32) << 16) | ((b8 as u32) << 8);
-    pixbuf.fill(pixel);
-    gdk4::Texture::for_pixbuf(&pixbuf)
+    let img = image::RgbImage::from_pixel(200, 200, image::Rgb([r8, g8, b8]));
+    let raw = img.into_raw();
+    let rgba: Vec<u8> = raw.chunks(3)
+        .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255u8])
+        .collect();
+    let bytes = glib::Bytes::from_owned(rgba);
+    gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4).into()
 }
 
-/// Generate a neutral placeholder cover texture (200x200, dark gray).
 fn make_placeholder_cover() -> Option<gdk4::Texture> {
-    let pixbuf = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, false, 8, 200, 200)?;
-    pixbuf.fill(0x55555500_u32);
-    Some(gdk4::Texture::for_pixbuf(&pixbuf))
+    let img = image::RgbImage::from_pixel(200, 200, image::Rgb([0x55u8, 0x55, 0x55]));
+    let raw = img.into_raw();
+    let rgba: Vec<u8> = raw.chunks(3)
+        .flat_map(|chunk| [chunk[0], chunk[1], chunk[2], 255u8])
+        .collect();
+    let bytes = glib::Bytes::from_owned(rgba);
+    let tex: gdk4::Texture = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4).into();
+    Some(tex)
 }
 
 fn placeholder_rgb(artist: &str) -> (f64, f64, f64) {
@@ -664,11 +668,13 @@ impl App {
                             if let Some(p) = found {
                                 log::debug!("[bind] cache MISS key={key} path={p} t={}us", t0.elapsed().as_micros());
                                 let t_decode = std::time::Instant::now();
-                                if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
-                                    let tex = gdk4::Texture::for_pixbuf(&pixbuf);
+                                if let Ok(img) = image::open(p) {
+                                    let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
+                                    let bytes = glib::Bytes::from_owned(rgba.into_raw());
+                                    let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
                                     log::debug!("[bind] decoded {}x{} from disk in {}us  key={key}",
                                         tex.width(), tex.height(), t_decode.elapsed().as_micros());
-                                    bind_tc.borrow_mut().insert(key.clone(), tex.clone());
+                                    bind_tc.borrow_mut().insert(key.clone(), tex.clone().into());
                                     cell.set_cover_texture(&tex);
                                 }
                             } else {
@@ -2748,12 +2754,13 @@ impl App {
                                 // Update grid Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
                                     // Load at 200x200 to prevent GridView row expansion from native image dims
-                                    if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_file_at_size(p, 200, 200) {
-                                        let tex = gdk4::Texture::for_pixbuf(&pixbuf);
-                                        fc_ev_cover_tex_cache.borrow_mut().insert(album.clone(), tex.clone());
-                                        log::info!("[UI] cover push: '{album}' tex={}x{} w={} h={}",
-                                            tex.width(), tex.height(),
-                                            pixbuf.width(), pixbuf.height());
+                                    if let Ok(img) = image::open(p) {
+                                        let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
+                                        let bytes = glib::Bytes::from_owned(rgba.into_raw());
+                                        let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
+                                        fc_ev_cover_tex_cache.borrow_mut().insert(album.clone(), tex.clone().into());
+                                        log::info!("[UI] cover push: '{album}' tex={}x{}",
+                                            tex.width(), tex.height());
                                             if let Some(pic) = widgets.get(album) {
                                                 log::info!("[UI] cover push: updating grid widget for '{album}', alloc before={}x{}",
                                                     pic.width(), pic.height());

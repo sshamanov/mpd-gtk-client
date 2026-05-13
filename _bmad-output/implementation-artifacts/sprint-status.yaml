@@ -182,7 +182,7 @@ development_status:
   28-4-notification-router: done
 
   epic-29: backlog
-  29-1-image-crate-migration: backlog
+  29-1-image-crate-migration: done
   29-2-gtklayout-grid-migration: backlog
   29-3-now-playing-consolidation: backlog
   29-4-presenter-layer: backlog

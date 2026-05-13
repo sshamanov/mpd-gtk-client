@@ -10,7 +10,7 @@ license = "MIT"
 gtk4 = { version = "0.11", features = ["v4_14"] }
 glib = "0.22"
 gdk4 = "0.11"
-gdk-pixbuf = "0.22"
+
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls", "gzip"] }
 rustls = { version = "0.23", optional = true }
 serde = { version = "1", features = ["derive"] }

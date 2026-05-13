@@ -59,6 +59,11 @@ Items planned for the release — may be in-progress or pending.
 - **Config loaded twice during startup** — I/O waste on TOML file
 - **BackSpace at root sends `ListDirectory("")`** — harmless but wrong; should be no-op
 
+## Deferred from: code review of 29-1-image-crate-migration (2026-05-13)
+
+- `image::open` decodes full image before resize, unlike `Pixbuf::from_file_at_size` which decoded at target resolution — can cause OOM for very large cached cover files (pre-existing concern, already tracked as "No size guard on JPEG decode")
+- `image::open` decode failures silently swallowed by `if let Ok` — no diagnostic log; same as old Pixbuf code but missed opportunity to add `log::warn!`
+
 ---
 
 ## Out of Scope (Historical)
