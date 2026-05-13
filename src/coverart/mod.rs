@@ -2,6 +2,7 @@
 //! Thread: background MPD thread for writes, any thread for reads.
 
 pub mod actual_read;
+pub mod cover_proc;
 pub mod provider;
 #[cfg(feature = "online-cover-art")]
 pub mod online;

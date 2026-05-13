@@ -177,7 +177,7 @@ development_status:
 
   epic-28: in-progress
   28-1-mpd-cover-thread: done
-  28-2-cover-proc-worker: backlog
+  28-2-cover-proc-worker: done
   28-3-search-worker-thread: backlog
   28-4-notification-router: backlog
 

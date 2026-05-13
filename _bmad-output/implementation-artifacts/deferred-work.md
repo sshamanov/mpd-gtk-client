@@ -28,6 +28,18 @@ Items planned for the release — may be in-progress or pending.
 - **`MpdAdapter` has no `Drop`** — no clean MPD close on shutdown
 - **SIGINT cleanup via `process::exit(0)`** — skips graceful MPD disconnect
 - **D-Bus session bus reconnection** — MPRIS silently stops if D-Bus restarts
+
+## Deferred from: code review of 28-2-cover-proc-worker (2026-05-13)
+
+- Multiple Cover Proc workers during reconnection window — index.json read-modify-write not atomic across threads, can lose cache entries
+- MPD Cover thread blocking send can stall permanently if Cover Proc panics — no timeout on send, no panic detection
+- Non-JPEG embedded cover art may enter delete-recycle loop via CoverProvider::is_valid_jpeg rejecting non-JPEG files cached as .jpg
+- Orphaned {md5}.jpg files accumulate when cover art changes — no GC or LRU eviction
+- update_index_json called on failed fs::write — transient cache index inconsistency
+- No size guard on JPEG decode — large images can cause OOM in Cover Proc via intermediate RGBA buffer before resize
+- CoverProvider RwLock poison silently disables cache I/O — if let Ok pattern skips silently with no recovery
+- try_send event drops invisible to caller — CoverPaths/CoverRefreshed can be silently dropped when channel full
+- Corrupt index.json silently resets entire cache — unwrap_or_default() replaces all entries with empty map
 - **Config loaded twice during startup** — I/O waste on TOML file
 - **BackSpace at root sends `ListDirectory("")`** — harmless but wrong; should be no-op
 

@@ -343,7 +343,7 @@ fn connected_loop(
         .join("mpd-client")
         .join("covers");
     let cover_provider = std::sync::Arc::new(std::sync::RwLock::new(crate::coverart::CoverProvider::new()));
-    let mut actual_read = crate::coverart::ActualRead::new(cache_dir);
+    let mut actual_read = crate::coverart::ActualRead::new();
     let mut cached_flat_albums: Vec<crate::mpd::AlbumMeta> = Vec::new();
     let mut use_idle = true;
     let mut transient_failures: u32 = 0;
@@ -351,6 +351,15 @@ fn connected_loop(
     // Cover thread (story 28-1): separate MPD connection for binary cover data
     let (cover_result_tx, cover_result_rx) = mpsc::sync_channel::<CoverFetchResult>(64);
     let mut cover_tx: Option<CoverThreadSender> = None;
+
+    // Cover Proc worker (story 28-2): JPEG decode, MD5 hash, cache write, emit RGBA
+    crate::coverart::cover_proc::spawn(
+        cover_result_rx,
+        event_tx.clone(),
+        cover_provider.clone(),
+        cache_dir.clone(),
+        stop.clone(),
+    );
 
     // Set the stream clone for the main thread's CommandSender
     if let Ok(clone) = adapter.stream_clone() {
@@ -460,21 +469,7 @@ fn connected_loop(
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
-                    // Drain cover results from the MPD Cover thread (story 28-1)
-                    while let Ok(result) = cover_result_rx.try_recv() {
-                        match result {
-                            CoverFetchResult::Success { key, data, mtime } => {
-                                actual_read.process_cover_result(&key, &data, mtime,
-                                    &cover_provider.read().unwrap(), event_tx);
-                            }
-                            CoverFetchResult::Empty { key } => {
-                                log::debug!("[cover] '{key}': no cover data available");
-                            }
-                            CoverFetchResult::Error { key, error } => {
-                                log::warn!("[cover] '{key}': cover fetch error: {error}");
-                            }
-                        }
-                    }
+                    // Cover results are drained by Cover Proc worker (story 28-2)
                 }
                 Err(ref e) if e.to_string().contains("unknown command") => {
                     log::info!("[MPD] idle not supported, falling back to 500ms polling");
@@ -507,21 +502,7 @@ fn connected_loop(
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Drain cover results (story 28-1)
-                    while let Ok(result) = cover_result_rx.try_recv() {
-                        match result {
-                            CoverFetchResult::Success { key, data, mtime } => {
-                                actual_read.process_cover_result(&key, &data, mtime,
-                                    &cover_provider.read().unwrap(), event_tx);
-                            }
-                            CoverFetchResult::Empty { key } => {
-                                log::debug!("[cover] '{key}': no cover data available");
-                            }
-                            CoverFetchResult::Error { key, error } => {
-                                log::warn!("[cover] '{key}': cover fetch error: {error}");
-                            }
-                        }
-                    }
+                    // Cover results are drained by Cover Proc worker (story 28-2)
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }

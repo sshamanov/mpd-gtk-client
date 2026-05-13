@@ -2799,42 +2799,33 @@ impl App {
                                 }
                             }
                         MpdEvent::CoverRefreshed { album_id, data } => {
-                            log::info!("[UI] cover refreshed: '{album_id}' ({} bytes)", data.len());
-                            // Decode raw JPEG bytes into a GdkTexture via gdk-pixbuf.
-                            let owned = data.to_vec();
-                            let cursor = std::io::Cursor::new(owned);
-                            if let Ok(pixbuf) = gdk_pixbuf::Pixbuf::from_read(cursor) {
-                                log::info!("[UI] cover refresh: '{album_id}' native={}x{}, bytes={}",
-                                    pixbuf.width(), pixbuf.height(), data.len());
-                                if let Some(scaled) = pixbuf.scale_simple(200, 200, gdk_pixbuf::InterpType::Bilinear) {
-                                    let texture = gdk4::Texture::for_pixbuf(&scaled);
-                                    fc_ev_cover_tex_cache.borrow_mut().insert(album_id.clone(), texture.clone());
-                                    log::info!("[UI] cover refresh: '{album_id}' scaled={}x{} tex={}x{}",
-                                        scaled.width(), scaled.height(),
-                                        texture.width(), texture.height());
-                                    if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
-                                        log::info!("[UI] cover refresh: updating grid widget for '{album_id}', alloc before={}x{}",
-                                            pic.width(), pic.height());
-                                        pic.set_paintable(Some(&texture));
-                                        pic.queue_draw();
-                                    }
-                                    if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
-                                        pic.set_paintable(Some(&texture));
-                                        pic.set_visible(true);
-                                        pic.queue_draw();
-                                    }
-                                    let is_current = fc_current_album.borrow().as_deref()
-                                        .map(|a| album_id.ends_with(&format!("||{}", a)))
-                                        .unwrap_or(false);
-                                    if is_current {
-                                        fc_np_cover.set_paintable(Some(&texture));
-                                        fc_np_cover.set_visible(true);
-                                    }
-                                } else {
-                                    log::warn!("[UI] cover refresh: scale_simple failed for '{album_id}', skipping");
-                                }
-                            } else {
-                                log::warn!("[UI] cover refresh failed: couldn't decode image for '{album_id}'");
+                            let data_len = data.len();
+                            log::info!("[UI] cover refreshed: '{album_id}' ({} bytes RGBA)", data_len);
+                            // RGBA bytes pre-decoded by Cover Proc (story 28-2): zero-copy GPU upload
+                            let rgba = glib::Bytes::from_owned(data);
+                            let texture = gdk4::MemoryTexture::new(
+                                200, 200,
+                                gdk4::MemoryFormat::R8g8b8a8,
+                                &rgba,
+                                200 * 4,
+                            );
+                            fc_ev_cover_tex_cache.borrow_mut().insert(album_id.clone(), texture.clone().into());
+                            log::info!("[UI] cover refresh: '{album_id}' texture from {data_len} RGBA bytes");
+                            if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
+                                pic.set_paintable(Some(&texture));
+                                pic.queue_draw();
+                            }
+                            if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
+                                pic.set_paintable(Some(&texture));
+                                pic.set_visible(true);
+                                pic.queue_draw();
+                            }
+                            let is_current = fc_current_album.borrow().as_deref()
+                                .map(|a| album_id.ends_with(&format!("||{}", a)))
+                                .unwrap_or(false);
+                            if is_current {
+                                fc_np_cover.set_paintable(Some(&texture));
+                                fc_np_cover.set_visible(true);
                             }
                         }
                         MpdEvent::LibraryChanged => {
