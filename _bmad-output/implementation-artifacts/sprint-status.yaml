@@ -175,11 +175,11 @@ development_status:
   epic-26: done
   26-1-metadata-caching: done
 
-  epic-28: in-progress
+  epic-28: done
   28-1-mpd-cover-thread: done
   28-2-cover-proc-worker: done
   28-3-search-worker-thread: done
-  28-4-notification-router: backlog
+  28-4-notification-router: done
 
   epic-29: backlog
   29-1-image-crate-migration: backlog

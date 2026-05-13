@@ -81,7 +81,20 @@ pub enum MpdEvent {
     CoverRefreshed { album_id: String, data: Vec<u8> },
     /// Tracks of the currently playing album: Vec<(title, file, duration)>.
     AlbumTracks(Vec<(String, String, f64)>),
+    /// User-facing notification with severity level.
+    Toast { message: String, level: ToastLevel },
     Error(String),
+}
+
+/// Severity level for Toast events — determines display behaviour in-app and via desktop notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastLevel {
+    /// Informational — auto-dismiss after 3s in-app, default timeout on desktop.
+    Info,
+    /// Warning — auto-dismiss after 5s in-app, default timeout on desktop.
+    Warn,
+    /// Error — persists until user dismisses in-app, persistent on desktop.
+    Error,
 }
 
 /// Playback state update from the MPD status response.
@@ -230,6 +243,10 @@ impl MpdEventLoop {
                         MpdState::Disconnected { ref mut backoff, ref mut first_attempt } => {
                             if !*first_attempt {
                                 let _ = event_tx.try_send(MpdEvent::Disconnected);
+                                let _ = event_tx.try_send(MpdEvent::Toast {
+                                    message: "MPD connection lost — retrying...".into(),
+                                    level: ToastLevel::Warn,
+                                });
                             }
                             *first_attempt = false;
 
@@ -264,7 +281,10 @@ impl MpdEventLoop {
                                     MpdState::Disconnected { backoff, first_attempt: false }
                                 }
                                 Err(e) => {
-                                    let _ = event_tx.try_send(MpdEvent::Error(e.to_string()));
+                                    let _ = event_tx.try_send(MpdEvent::Toast {
+                                        message: format!("MPD connection failed: {e}\n\nCheck your MPD server and settings."),
+                                        level: ToastLevel::Error,
+                                    });
                                     let b = ExponentialBackoff::new();
                                     MpdState::Error {
                                         error: e.to_string(),

@@ -33,7 +33,8 @@ impl CliOverrides {
 
 /// Current schema version for config migration.
 /// Version 0 means "unversioned" (pre-migration). Version 1 is the first versioned schema.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Version 2: `notifications.libnotify` (bool) → `notifications.mode` (string enum).
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Window geometry persisted for session restoral.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -99,13 +100,30 @@ pub struct MprisConfig {
 
 fn default_mpris_enabled() -> bool { false }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct NotificationsConfig {
-    #[serde(default = "default_notif_enabled")]
-    pub libnotify: bool,
+/// Desktop notification routing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationMode {
+    /// In-app toast overlay only — no desktop notifications.
+    Toast,
+    /// Desktop notification via `org.freedesktop.Notifications` — no in-app overlay.
+    Desktop,
+    /// Both in-app toast overlay AND desktop notification.
+    Both,
 }
 
-fn default_notif_enabled() -> bool { false }
+impl Default for NotificationMode {
+    fn default() -> Self {
+        Self::Toast
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct NotificationsConfig {
+    /// Notification routing mode. `"toast"` (default), `"desktop"`, or `"both"`.
+    #[serde(default)]
+    pub mode: NotificationMode,
+}
 
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
@@ -116,7 +134,7 @@ impl Default for Config {
             mpd_host: default_host(),
             mpd_port: default_port(),
             mpris: MprisConfig { enabled: false },
-            notifications: NotificationsConfig { libnotify: false },
+            notifications: NotificationsConfig::default(),
             profiles: None,
             default_profile: None,
             last_profile: None,
@@ -134,6 +152,7 @@ impl Default for Config {
 fn migrations() -> Vec<fn(&mut Config)> {
     vec![
         migrate_0_to_1,
+        migrate_1_to_2,
     ]
 }
 
@@ -142,6 +161,27 @@ fn migrations() -> Vec<fn(&mut Config)> {
 fn migrate_0_to_1(_cfg: &mut Config) {
     // No structural changes needed — the Config struct already matches v1.
     // Future migrations will modify fields here.
+}
+
+/// Migration 1 → 2: `notifications.libnotify` (bool) → `notifications.mode` (NotificationMode).
+fn migrate_1_to_2(cfg: &mut Config) {
+    // The old `libnotify` key is deserialized into `NotificationsConfig` via serde.
+    // If the file has `libnotify = true`, serde would set `mode = Toast` (default) since
+    // `mode` is absent from the TOML. We need to detect this case.
+    // However, after deserialization, the bool field is gone. We detect the old format
+    // by checking if the serialized form contains the `libnotify` key directly.
+    // Simplest approach: read the raw TOML and check for `libnotify`.
+    if let Ok(content) = std::fs::read_to_string(Config::config_path()) {
+        if let Ok(raw) = content.parse::<toml::Value>() {
+            if raw.get("notifications")
+                .and_then(|n| n.get("libnotify"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                cfg.notifications.mode = NotificationMode::Desktop;
+            }
+        }
+    }
 }
 
 /// Run all pending migrations from the config's current version to CURRENT_SCHEMA_VERSION.

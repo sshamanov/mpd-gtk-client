@@ -29,6 +29,14 @@ Items planned for the release — may be in-progress or pending.
 - **SIGINT cleanup via `process::exit(0)`** — skips graceful MPD disconnect
 - **D-Bus session bus reconnection** — MPRIS silently stops if D-Bus restarts
 
+## Deferred from: code review of 28-4-notification-router (2026-05-13)
+
+- `event.clone()` on every MpdEvent wastes memory — clones large variants (CoverRefreshed JPEG, AlbumTracks) that the router ignores; only Toast/Connected/Disconnected needed
+- Router thread never joined on shutdown — `notif_stop` signaled but no `JoinHandle` available for `join()`
+- Toast channel (256) sizing undocumented vs event channel (1024) and search channel (64); rationale unclear
+- Toast timeout values (3s/5s) hardcoded in match arm in ui/mod.rs, not shared as constants with ToastLevel docs
+- `reduce()` referenced in notifications/mod.rs doc comment but doesn't exist in codebase — architecture-speak leak
+
 ## Deferred from: code review of 28-3-search-worker-thread (2026-05-13)
 
 - Unconditional MPD fallback alongside local search worker — doubled MPD traffic per keystroke, result race between local and MPD SearchResults

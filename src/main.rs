@@ -11,7 +11,6 @@ pub mod profiling;
 pub mod mpd;
 #[cfg(feature = "mpris")]
 pub mod mpris;
-#[cfg(feature = "mpris")]
 pub mod notifications;
 pub mod metadata;
 pub mod search;
@@ -248,11 +247,22 @@ fn main() {
     #[cfg(feature = "mpris")]
     {
         mpris::init(cmd_tx.clone(), state.clone(), config.mpris.enabled, mpris_update_rx);
-        let _notif_handle = notifications::spawn(state.clone(), config.notifications.libnotify);
     }
     #[cfg(not(feature = "mpris"))]
     if config.mpris.enabled {
         log::warn!("MPRIS: enabled in config but not compiled (rebuild with --features mpris)");
+    }
+
+    // NotificationRouter — receives cloned MPD events from the GTK thread for
+    // desktop notification dispatch via D-Bus (org.freedesktop.Notifications).
+    // Skip spawning when mode is Toast (no desktop notifications needed).
+    let (toast_tx, toast_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(256);
+    let notif_mode = config.notifications.mode;
+    let notif_stop = Arc::new(AtomicBool::new(false));
+    if notif_mode != config::NotificationMode::Toast {
+        notifications::router::spawn(toast_rx, notif_mode, notif_stop.clone());
+    } else {
+        drop(toast_rx); // Channel dropped, toast_tx sends become no-ops
     }
 
     // Signal handlers (SIGINT/SIGTERM) were removed — glib::source::unix_signal_add
@@ -271,7 +281,7 @@ fn main() {
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();
-    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache, search_cmd_tx);
+    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache, search_cmd_tx, toast_tx);
     app.run();
 
     info!("Shutting down MPD connection");
@@ -301,6 +311,7 @@ fn main() {
     }
     // Clean up IPC artifacts
     ipc_stop.store(true, Ordering::Relaxed);
+    notif_stop.store(true, Ordering::Relaxed);
     ipc::remove_socket();
     ipc::remove_lock();
     info!("Exiting");

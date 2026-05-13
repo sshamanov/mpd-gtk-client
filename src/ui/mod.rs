@@ -436,6 +436,8 @@ pub struct App {
     metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
     /// Sender for search worker commands (story 28-3).
     search_cmd_tx: SearchCommandSender,
+    /// Sender for NotificationRouter — forwards MpdEvent clones for desktop notification dispatch.
+    toast_tx: mpsc::SyncSender<MpdEvent>,
 }
 
 impl App {
@@ -447,6 +449,7 @@ impl App {
         mpris_update_tx: mpsc::Sender<crate::mpd::state_machine::PlaybackUpdate>,
         metadata_cache: std::sync::Arc<crate::metadata::MetadataCache>,
         search_cmd_tx: SearchCommandSender,
+        toast_tx: mpsc::SyncSender<MpdEvent>,
     ) -> Self {
         Self {
             state,
@@ -456,6 +459,7 @@ impl App {
             mpris_update_tx,
             metadata_cache,
             search_cmd_tx,
+            toast_tx,
         }
     }
 
@@ -486,6 +490,7 @@ impl App {
         let mpris_update_tx = self.mpris_update_tx.clone();
         let metadata_cache = self.metadata_cache.clone();
         let search_cmd_tx = self.search_cmd_tx.clone();
+        let toast_tx = self.toast_tx.clone();
 
         application.connect_activate(move |window_app| {
             // Clone early for the shutdown timer closure; window_app is consumed by the builder below.
@@ -979,6 +984,7 @@ impl App {
             // Search generation counter
             let search_gen: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(0));
             let scmd = search_cmd_tx.clone();
+            let ftx = toast_tx.clone();
 
             // stop_search: Escape or clear button
             let stop_btn_map = group_btn_map.clone();
@@ -2214,6 +2220,7 @@ impl App {
                     };
                     batch += 1;
                     drop(guard);
+                    let fwd = event.clone();
                     match event {
                         MpdEvent::Connected => {
                             fc_scmd.send(SearchCommand::Reset);
@@ -2809,7 +2816,18 @@ impl App {
                         MpdEvent::Error(msg) => {
                             fc_toast.add_toast(adw::Toast::new(&format!("MPD Error: {msg}")));
                         }
+                        MpdEvent::Toast { message, level } => {
+                            let timeout = match level {
+                                crate::mpd::state_machine::ToastLevel::Error => 0u32,
+                                crate::mpd::state_machine::ToastLevel::Warn => 5,
+                                crate::mpd::state_machine::ToastLevel::Info => 3,
+                            };
+                            let toast = adw::Toast::new(&message);
+                            toast.set_timeout(timeout);
+                            fc_toast.add_toast(toast);
+                        }
                     }
+                    let _ = ftx.try_send(fwd);
                     guard = match fc_rx.lock() {
                         Ok(g) => g,
                         Err(poisoned) => {
