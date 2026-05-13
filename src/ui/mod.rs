@@ -10,8 +10,7 @@ use crate::search::{SearchCommand, SearchCommandSender};
 use crate::state::SharedState;
 use gtk4::prelude::*;
 use adw::prelude::*;
-use gtk4::gio::ListStore;
-use gtk4::{Application, Box, DragSource, DropTarget, EventControllerKey, Fixed, GridView, Label, ListBox, NoSelection, Orientation, Picture, ScrolledWindow, SignalListItemFactory, StringObject};
+use gtk4::{Application, Box, DragSource, DropTarget, EventControllerKey, Fixed, Label, ListBox, Orientation, Picture, ScrolledWindow};
 use gtk4::gdk::{ContentProvider, DragAction};
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -19,29 +18,21 @@ use std::sync::{Arc, Mutex};
 
 /// Album grid item with optional group overlay badge on first item of each group.
 #[derive(Clone)]
-enum AlbumGridItem {
-    Album {
-        artist: String,
-        name: String,
-        album_id: String,
-        /// Year extracted from MPD Date grouping (e.g. "2024"). None when unavailable.
-        year: Option<String>,
-        /// Group boundary marker for pad_groups. None = continuation of current group.
-        group_label: Option<String>,
-        /// Visual caption overlay on the cover (may differ from group_label).
-        /// Max 6 strings, rendered as stacked labels top-to-bottom.
-        caption: Option<Vec<String>>,
-        /// Year badge (last 2 digits e.g. "84") in top-right corner. None for Years view.
-        year_badge: Option<String>,
-    },
-    /// Invisible placeholder that forces GridView row break.
-    /// Inserted after each group to pad the last row to full width,
-    /// ensuring the next group starts at column 0 of a fresh row.
-    Filler,
+/// Album cell in the GtkLayout coordinate-based grid.
+/// Each cell holds its AlbumCoverCell widget, an optional group caption label,
+/// and metadata for repositioning and filtering.
+struct AlbumCell {
+    cell: AlbumCoverCell,
+    caption: Option<gtk4::Label>,
+    artist: String,
+    album: String,
+    album_id: String,
+    /// Group label value for detecting group boundaries in reposition().
+    group_value: Option<String>,
 }
 
-/// Backing data store for the album grid.
-type AlbumGridData = std::rc::Rc<std::cell::RefCell<Vec<AlbumGridItem>>>;
+/// Backing store for the album grid — ordered Vec of AlbumCell.
+type AlbumCells = std::rc::Rc<std::cell::RefCell<Vec<AlbumCell>>>;
 
 /// Item in the mini queue grid (album-level grouping).
 #[derive(Clone)]
@@ -216,92 +207,52 @@ fn placeholder_rgb(artist: &str) -> (f64, f64, f64) {
     (r1 + m, g1 + m, b1 + m)
 }
 
-/// Populate the ListStore atomically via splice().
-/// cover_widgets is cleared before population to prevent stale Picture widget
-/// mappings from surviving across re-populations.
-fn batch_populate(model: &ListStore, backing: &AlbumGridData, items: Vec<AlbumGridItem>,
-                  cover_widgets: &std::rc::Rc<std::cell::RefCell<HashMap<String, gtk4::Picture>>>
-                  ) {
-    let t0 = std::time::Instant::now();
-    let n_items = items.len();
-    let n_widgets = cover_widgets.borrow().len();
-    cover_widgets.borrow_mut().clear();
-    *backing.borrow_mut() = items;
-    let total = backing.borrow().len();
+// ── GtkLayout coordinate-based grid ──
 
-    let new_items: Vec<StringObject> = (0..total)
-        .map(|i| StringObject::new(&i.to_string()))
-        .collect();
+/// Slot constants for grid layout.
+const CELL_SLOT_W: f64 = 216.0; // 200 cover + 16 padding/margin
+const CELL_SLOT_H: f64 = 250.0; // 200 cover + 50 metadata
+const CAPTION_H: f64 = 32.0;
 
-    let t_prep = t0.elapsed();
-    let old_count = model.n_items();
-    model.splice(0, old_count, &new_items);
-    let t_splice = t0.elapsed();
-    log::debug!(
-        "[batch_populate] cleared {n_widgets} widgets, {old_count}->{n_items} items, \
-         prep={}us splice={}us total={}us",
-        t_prep.as_micros(), (t_splice - t_prep).as_micros(), t_splice.as_micros()
-    );
-}
+/// Reposition all album cells and group captions within the GtkLayout.
+/// Called on library load, group switch, window resize, and search filter change.
+fn reposition(layout: &gtk4::Fixed, cells: &[AlbumCell], width: f64) {
+    let cols = ((width / CELL_SLOT_W).floor() as usize).max(1);
+    let mut x: usize = 0;
+    let mut y: f64 = 0.0;
+    let mut current_group: Option<&str> = None;
 
-/// Pad each group with Filler items so the next group starts at column 0
-/// of a fresh row. Computes columns from the grid's current allocation width;
-/// falls back to max_columns if the grid hasn't been allocated yet.
-fn pad_groups(items: Vec<AlbumGridItem>, grid: &GridView) -> Vec<AlbumGridItem> {
-    // 200 (content) + 8 (.album-cover-cell padding 4px×2) + 4 (margin 2px×2) + 4 (gridview > child padding 2px×2) = 216
-    let cell_slot: i32 = 216;
-    let grid_width = grid.width();
-    let columns: i32 = if grid_width > 0 {
-        std::cmp::max(1, grid_width / cell_slot)
-    } else {
-        std::cmp::max(1, grid.max_columns() as i32)
-    };
-    if columns <= 1 {
-        return items;
-    }
-    let columns = columns as usize;
+    for item in cells {
+        // Hide cells not matching search filter
+        if !item.cell.is_visible() {
+            continue;
+        }
 
-    let mut result: Vec<AlbumGridItem> = Vec::with_capacity(items.len());
-    let mut group_start_i: usize = 0; // position in original items index space
-    let mut group_start_res: usize = 0; // position in result (after padding)
-    let mut current_label: Option<String> = None;
-
-    for (i, item) in items.iter().enumerate() {
-        let this_label = match item {
-            AlbumGridItem::Album { group_label, .. } => group_label.clone(),
-            AlbumGridItem::Filler => continue,
-        };
-
-        // Only items that explicitly carry a group_label can start a new group.
-        // None items are always continuations of the current group.
-        if this_label.is_some() && this_label != current_label {
-            if current_label.is_some() {
-                // Group boundary — pad previous group's last row
-                let group_len = i - group_start_i;
-                let rem = group_len % columns;
-                if rem != 0 {
-                    for _ in 0..(columns - rem) {
-                        result.push(AlbumGridItem::Filler);
-                    }
-                }
+        let group_start = item.group_value.as_deref() != current_group;
+        if group_start {
+            current_group = item.group_value.as_deref();
+            if let Some(ref caption) = item.caption {
+                caption.set_visible(true);
+                layout.move_(caption, 0.0, y);
+                y += CAPTION_H;
             }
-            current_label = this_label;
-            group_start_i = i;
-            group_start_res = result.len();
+            x = 0;
+        } else if let Some(ref caption) = item.caption {
+            caption.set_visible(false);
         }
-        result.push(item.clone());
-    }
 
-    // Pad the final group's last row
-    let final_len = result.len() - group_start_res;
-    let rem = final_len % columns;
-    if rem != 0 {
-        for _ in 0..(columns - rem) {
-            result.push(AlbumGridItem::Filler);
+        layout.move_(&item.cell, x as f64 * CELL_SLOT_W, y);
+        x += 1;
+        if x >= cols {
+            x = 0;
+            y += CELL_SLOT_H;
         }
     }
 
-    result
+    if x > 0 {
+        y += CELL_SLOT_H;
+    }
+    layout.set_size_request(width as i32, y as i32);
 }
 
 /// Compute the group caption for an album based on the active view mode.
@@ -338,65 +289,6 @@ fn format_year_badge(year: Option<&str>) -> Option<String> {
             Some(y.to_string())
         }
     })
-}
-
-/// Calculate which albums are in the visible viewport (plus a buffer of ±1 row)
-/// of the album grid, based on scroll position and estimated cell size.
-///
-/// Falls back to all albums when the layout hasn't settled yet (page_size == 0),
-/// which happens during initial population before the first allocation pass.
-fn calculate_visible_albums(
-    backing: &AlbumGridData,
-    vadj: &gtk4::Adjustment,
-    grid: &GridView,
-) -> Vec<(String, String)> {
-    let scroll_top = vadj.value();
-    let page_size = vadj.page_size();
-    let Ok(binding) = backing.try_borrow() else { return vec![]; };
-    let total_items = binding.len();
-    if total_items == 0 {
-        return vec![];
-    }
-    drop(binding);
-
-    // Layout not yet settled — return all albums (safe fallback)
-    if page_size <= 0.0 {
-        let Ok(binding) = backing.try_borrow() else { return vec![]; };
-        return binding.iter().filter_map(|item| {
-            if let AlbumGridItem::Album { artist, name, .. } = item {
-                Some((artist.clone(), name.clone()))
-            } else {
-                None
-            }
-        }).collect();
-    }
-
-    // Estimate items per row from the grid's allocated width.
-    // Cell minimum width is 200px per size_request in factory setup.
-    let grid_width = grid.width() as f64;
-    let items_per_row = if grid_width > 0.0 {
-        std::cmp::max(1, (grid_width / 200.0_f64).floor() as usize)
-    } else {
-        // Unknown grid width — use a reasonable default for a typical window
-        4usize
-    };
-
-    // Cell minimum height is 250px per size_request.
-    let row_height = 250.0_f64;
-    let first_row = (scroll_top / row_height).floor() as usize;
-    let visible_rows = (page_size / row_height).ceil() as usize + 2; // +2 for buffer rows (±1)
-
-    let start_idx = first_row.saturating_mul(items_per_row);
-    let end_idx = (first_row + visible_rows).saturating_mul(items_per_row);
-
-    let Ok(binding) = backing.try_borrow() else { return vec![]; };
-    let mut visible = Vec::new();
-    for i in start_idx..end_idx.min(binding.len()) {
-        if let AlbumGridItem::Album { artist, name, .. } = &binding[i] {
-            visible.push((artist.clone(), name.clone()));
-        }
-    }
-    visible
 }
 
 type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;
@@ -578,162 +470,21 @@ impl App {
             left_scroll.set_vexpand(true);
             left_scroll.set_hexpand(true);
 
-            // --- GtkGridView + factory for virtualized album grid ---
-            let album_model: ListStore = ListStore::builder()
-                .item_type(StringObject::static_type())
-                .build();
-            let album_factory = SignalListItemFactory::new();
-            let album_grid_data: AlbumGridData = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            // --- GtkLayout coordinate-based grid ---
+            let album_cells: AlbumCells = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let left_stack = gtk4::Stack::new();
 
             // Shared cover tracking
             let cover_paths: std::rc::Rc<std::cell::RefCell<HashMap<String, Option<String>>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
-            let cover_widgets: std::rc::Rc<std::cell::RefCell<HashMap<String, gtk4::Picture>>> =
-                std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
             // Texture cache — avoids repeated disk read+decode during scroll
             let cover_texture_cache: std::rc::Rc<std::cell::RefCell<HashMap<String, gdk4::Texture>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
 
-            // AlbumCoverCell: single GtkBox subclass per cell with deferred pattern
-            // — constructed() builds child widgets, new() wires handlers after cmd_tx set.
-            // Pattern from plattenalbum.
-            let setup_tx = cmd_tx.clone();
-            let grid_data_setup = album_grid_data.clone();
-            album_factory.connect_setup(move |_factory, item| {
-                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-                let cell = AlbumCoverCell::new(setup_tx.clone());
-
-                // Drag source — allow dragging album names from the grid to queue
-                let drag_src = DragSource::new();
-                drag_src.set_actions(DragAction::COPY);
-                let cell_key = cell.clone();
-                let bind_data_setup = grid_data_setup.clone();
-                drag_src.connect_prepare(move |_source, _x, _y| {
-                    let key = cell_key.album_key();
-                    if key.is_empty() {
-                        return None;
-                    }
-                    let data = bind_data_setup.borrow();
-                    // Find the album name for this key in the backing data
-                    let name = data.iter().find_map(|item| {
-                        if let AlbumGridItem::Album { name, artist, .. } = item {
-                            let candidate = crate::coverart::cover_key(artist, name);
-                            if candidate == key { Some(name.clone()) } else { None }
-                        } else {
-                            None
-                        }
-                    });
-                    let label = name.unwrap_or_else(|| key.clone());
-                    Some(ContentProvider::for_value(&glib::Value::from(&label)))
-                });
-                cell.add_controller(drag_src);
-
-                list_item.set_child(Some(&cell));
-            });
-
-            // Factory bind: populate AlbumCoverCell from model data.
-            let bind_cp = cover_paths.clone();
-            let bind_cw = cover_widgets.clone();
-            let bind_tc = cover_texture_cache.clone();
-            let bind_data = album_grid_data.clone();
-            album_factory.connect_bind(move |_factory, item| {
-                let list_item = item.downcast_ref::<gtk4::ListItem>().unwrap();
-                let Some(obj) = list_item.item() else { return; };
-                let Some(so) = obj.downcast_ref::<StringObject>() else { return; };
-                let idx: usize = match so.string().parse() { Ok(i) => i, Err(_) => return };
-                let binding = bind_data.borrow();
-                let Some(item_data) = binding.get(idx) else { return };
-                let cell = list_item.child()
-                    .and_then(|c| c.downcast::<AlbumCoverCell>().ok());
-                let Some(cell) = cell else { return };
-
-                match item_data {
-                    AlbumGridItem::Album { artist, name, album_id: _id, year, caption, year_badge, .. } => {
-                        list_item.set_activatable(true);
-                        cell.set_can_focus(true);
-                        cell.set_can_target(true);
-                        let key = crate::coverart::cover_key(artist, name);
-                        cell.set_album(name, artist, year.as_deref(), name);
-                        cell.set_group_captions(caption.as_deref().unwrap_or(&[]));
-                        cell.set_year_badge(year_badge.as_deref());
-                        // Check texture cache first to avoid repeated disk read+decode during scroll
-                        let t0 = std::time::Instant::now();
-                        if let Some(tex) = bind_tc.borrow().get(&key) {
-                            log::debug!("[bind] cache HIT  key={key} t={}us", t0.elapsed().as_micros());
-                            cell.set_cover_texture(tex);
-                        } else {
-                            let cp = bind_cp.borrow();
-                            let found = cp.get(&key).and_then(|o| o.as_deref());
-                            if let Some(p) = found {
-                                log::debug!("[bind] cache MISS key={key} path={p} t={}us", t0.elapsed().as_micros());
-                                let t_decode = std::time::Instant::now();
-                                if let Ok(img) = image::open(p) {
-                                    let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
-                                    let bytes = glib::Bytes::from_owned(rgba.into_raw());
-                                    let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
-                                    log::debug!("[bind] decoded {}x{} from disk in {}us  key={key}",
-                                        tex.width(), tex.height(), t_decode.elapsed().as_micros());
-                                    bind_tc.borrow_mut().insert(key.clone(), tex.clone().into());
-                                    cell.set_cover_texture(&tex);
-                                }
-                            } else {
-                                log::debug!("[bind] NO COVER key={key} t={}us", t0.elapsed().as_micros());
-                                cell.set_cover_texture(&placeholder_texture(artist));
-                            }
-                            drop(cp);
-                        }
-                        if let Some(pic) = cell.cover_picture() {
-                            bind_cw.borrow_mut().insert(key.clone(), pic);
-                        }
-                    }
-                    AlbumGridItem::Filler => {
-                        cell.set_filler();
-                        cell.set_year_badge(None);
-                        list_item.set_activatable(false);
-                        cell.set_can_focus(false);
-                        cell.set_can_target(false);
-                    }
-                }
-            });
-
-            // Factory unbind: no-op — cover_widgets is cleared on each batch_populate.
-            album_factory.connect_unbind(|_, _| {});
-
-            let selection = NoSelection::new(Some(album_model.clone()));
-            let album_grid = GridView::new(Some(selection.clone()), Some(album_factory.clone()));
-            album_grid.set_min_columns(1);
-
-            // Double-click / Enter activates the item
-            let activate_data = album_grid_data.clone();
-            let activate_tx = cmd_tx.clone();
-            album_grid.connect_activate(move |grid, position| {
-                if let Some(model) = grid.model() {
-                    if let Some(item) = model.item(position) {
-                        if let Some(so) = item.downcast_ref::<StringObject>() {
-                            if let Ok(idx) = so.string().parse::<usize>() {
-                                let binding = activate_data.borrow();
-                                if let Some(AlbumGridItem::Album { name, .. }) = binding.get(idx) {
-                                    let _ = activate_tx.send(MpdCommand::PlayAlbum(name.clone()));
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Context menu is now handled per-cell via AlbumCoverCell::wire_context_menu()
-            // with Capture phase — avoids GridView gesture arbitration issues.
-
-            // ── Resize repad machinery (DISABLED — unstable) ──
-            // The filler-in-model approach requires column-aware padding that
-            // must be recomputed on every resize. GTK allocation propagation
-            // is top-down, so paned::width fires before grid::width is current,
-            // Grid repadding on window resize is intentionally disabled.
-            // The column calculations become stale mid-allocation, causing
-            // incorrect layouts. No debounce/cooldown strategy has fixed this.
-            // Tracked as architecture debt — see:
-            //   architecture.md § "Grid Layout v2 — coordinate-based album grid"
+            // GtkLayout: fixed-position container — all widgets positioned via coordinates
+            let album_layout = gtk4::Fixed::new();
+            album_layout.set_hexpand(false);
+            album_layout.set_vexpand(false);
 
             // Loading / empty-state labels
             let loading_label = Label::new(Some("Connecting to MPD..."));
@@ -746,13 +497,20 @@ impl App {
             empty_label.set_visible(false);
             empty_label.set_widget_name("album-grid-status");
 
-            // GridView goes inside ScrolledWindow directly — GtkStack forces uniform
-            // child sizing, which breaks GridView layout.
-            left_scroll.set_child(Some(&album_grid));
+            left_scroll.set_child(Some(&album_layout));
             left_stack.add_child(&loading_label);
             left_stack.add_child(&empty_label);
             left_stack.add_child(&left_scroll);
             left_stack.set_visible_child(&loading_label);
+
+            // Resize: reposition all cells when scrolled window width changes
+            let resize_sw = left_scroll.clone();
+            let resize_cells = album_cells.clone();
+            let resize_layout = album_layout.clone();
+            resize_sw.connect_notify_local(Some("width"), move |sw, _| {
+                let cells = resize_cells.borrow();
+                reposition(&resize_layout, &cells, sw.width() as f64);
+            });
             // Album mode content box (group bar + search + grid)
             let album_content = Box::new(Orientation::Vertical, 0);
             album_content.set_vexpand(true);
@@ -1012,13 +770,6 @@ impl App {
             let se_scmd = scmd.clone();
             let _se_stack = left_stack.clone();
             let _se_scroll = left_scroll.clone();
-            let _se_model = album_model.clone();
-            let _se_data = album_grid_data.clone();
-            let _se_cw = cover_widgets.clone();
-            // DISABLED: resize repad machinery (see comment at main resize block)
-            // let se_last_cols = resize_last_cols.clone();
-            // let se_generation = resize_generation.clone();
-            // let se_grid = album_grid.clone();
             search_entry.connect_search_changed(move |entry| {
                 let q = entry.text().to_string();
 
@@ -1088,64 +839,49 @@ impl App {
 
             // GtkDropTarget for album grid reorder (plain Albums view only)
             let grid_state = state.clone();
-            let grid_data = album_grid_data.clone();
-            let grid_model = album_model.clone();
-            let grid_cw = cover_widgets.clone();
+            let grid_cells = album_cells.clone();
             let grid_vadj = left_scroll.vadjustment();
+            let grid_layout = album_layout.clone();
             let grid_target = DropTarget::new(String::static_type(), DragAction::MOVE);
             grid_target.connect_drop(move |target, value, x, y| {
-                // Only allow reorder when ungrouped (Albums view — no group labels)
-                let has_groups = grid_data.borrow().iter().any(|item| {
-                    matches!(item, AlbumGridItem::Album { group_label: Some(_), .. })
-                });
+                // Only allow reorder when ungrouped (no group captions)
+                let has_groups = grid_cells.borrow().iter().any(|c| c.group_value.is_some());
                 if has_groups {
                     return false;
                 }
 
                 if let Ok(s) = value.get::<String>() {
                     if !s.contains(':') {
-                        // Plain album name — this is a grid reorder attempt
                         let scroll_top = grid_vadj.value();
-                        let adjusted_y = scroll_top + y; // Convert to data-space y
-
-                        // 200x250 cell size from factory setup
-                        let col = (x / 200.0_f64).floor() as usize;
-                        let row = (adjusted_y / 250.0_f64).floor() as usize;
+                        let adjusted_y = scroll_top + y;
+                        let col = (x / CELL_SLOT_W).floor() as usize;
+                        let row = (adjusted_y / CELL_SLOT_H).floor() as usize;
                         let grid_width = target.widget().and_then(|w| w.downcast::<gtk4::ScrolledWindow>().ok())
                             .map(|sw| sw.width()).unwrap_or(800);
-                        let cols_per_row = std::cmp::max(1, grid_width / 200);
-                        let target_idx = row.saturating_mul(cols_per_row as usize) + col;
+                        let cols_per_row = std::cmp::max(1, (grid_width as f64 / CELL_SLOT_W) as usize);
+                        let target_idx = row.saturating_mul(cols_per_row) + col;
 
-                        // Reorder the backing data
-                        let mut data = grid_data.borrow_mut();
-                        let source_pos = data.iter().position(|item| {
-                            matches!(item, AlbumGridItem::Album { name, .. } if name == &s)
-                        });
+                        let mut cells = grid_cells.borrow_mut();
+                        let source_pos = cells.iter().position(|c| c.album == s);
                         if let Some(src) = source_pos {
-                            if src == target_idx.min(data.len().saturating_sub(1)) {
-                                return true; // No move needed
+                            if src == target_idx.min(cells.len().saturating_sub(1)) {
+                                return true;
                             }
-                            let item = data.remove(src);
-                            // After removal at src, items shift left: adjust target when inserting below
+                            let item = cells.remove(src);
                             let insert_at = if target_idx > src {
-                                target_idx.saturating_sub(1).min(data.len())
+                                target_idx.saturating_sub(1).min(cells.len())
                             } else {
-                                target_idx.min(data.len())
+                                target_idx.min(cells.len())
                             };
-                            data.insert(insert_at, item);
+                            cells.insert(insert_at, item);
 
-                            // Save custom order and update model
-                            let order: Vec<String> = data.iter().filter_map(|item| {
-                                if let AlbumGridItem::Album { name, .. } = item {
-                                    Some(name.clone())
-                                } else { None }
-                            }).collect();
+                            let order: Vec<String> = cells.iter().map(|c| c.album.clone()).collect();
                             if let Ok(mut st) = grid_state.write() {
                                 st.album_browsing.custom_album_order = order;
                             }
-                            drop(data);
-                            let items: Vec<AlbumGridItem> = grid_data.borrow().clone();
-                            batch_populate(&grid_model, &grid_data, items, &grid_cw);
+                            drop(cells);
+                            let cells_ref = grid_cells.borrow();
+                            reposition(&grid_layout, &cells_ref, grid_width as f64);
                         }
                         return true;
                     }
@@ -1998,29 +1734,42 @@ impl App {
                 std::rc::Rc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let sv_adj = left_scroll.vadjustment();
-            let sv_backing = album_grid_data.clone();
-            let sv_grid = album_grid.clone();
+            let sv_cells = album_cells.clone();
             let sv_cmd = cmd_tx.clone();
             let sv_cp = cover_paths.clone();
+            let sv_sw = left_scroll.clone();
             sv_adj.connect_value_changed(move |adj| {
                 let gen_id = scroll_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let backing = sv_backing.clone();
-                let grid = sv_grid.clone();
+                let cells = sv_cells.clone();
                 let cmd = sv_cmd.clone();
                 let adj_clone = adj.clone();
                 let check_gen = scroll_gen.clone();
                 let cp = sv_cp.clone();
+                let sw = sv_sw.clone();
                 glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-                    // Stale timer — a newer scroll event has already replaced us
                     if check_gen.load(std::sync::atomic::Ordering::Relaxed) != gen_id {
                         return glib::ControlFlow::Break;
                     }
-                    let albums = calculate_visible_albums(&backing, &adj_clone, &grid);
-                    // Filter out albums that already have covers (prevents replacing
-                    // full initial fetch with partial scroll-based fetch)
-                    let new_albums: Vec<_> = albums.into_iter()
-                        .filter(|(a, n)| !cp.borrow().contains_key(&crate::coverart::cover_key(a, n)))
+                    // Estimate visible range from scroll position and known cell size
+                    let scroll_top = adj_clone.value();
+                    let page_size = adj_clone.page_size();
+                    if page_size <= 0.0 {
+                        return glib::ControlFlow::Break;
+                    }
+                    let cols = ((sw.width() as f64 / CELL_SLOT_W).floor() as usize).max(1);
+                    let first_row = (scroll_top / CELL_SLOT_H).floor() as usize;
+                    let visible_rows = (page_size / CELL_SLOT_H).ceil() as usize + 2;
+                    let cells_binding = cells.borrow();
+                    let start_idx = first_row.saturating_mul(cols);
+                    let end_idx = (first_row + visible_rows).saturating_mul(cols).min(cells_binding.len());
+                    let new_albums: Vec<_> = cells_binding[start_idx..end_idx].iter()
+                        .filter(|c| {
+                            let key = crate::coverart::cover_key(&c.artist, &c.album);
+                            !cp.borrow().contains_key(&key)
+                        })
+                        .map(|c| (c.artist.clone(), c.album.clone()))
                         .collect();
+                    drop(cells_binding);
                     if !new_albums.is_empty() {
                         log::debug!(
                             "[ui] scroll stop: enqueuing {} visible albums for cover fetch",
@@ -2078,15 +1827,11 @@ impl App {
             let fc_mc = metadata_cache.clone();
             let fc_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
-            let fc_ev_cover_widgets = cover_widgets.clone();
             let fc_ev_cover_tex_cache = cover_texture_cache.clone();
             let fc_mini_cw = mini_cover_widgets.clone();
             let fc_cp_np = fc_ev_cover_paths.clone();
-            let fc_ev_model = album_model.clone();
-            let fc_ev_data = album_grid_data.clone();
-            let fc_grid = album_grid.clone();
-            // DISABLED: deferred repad for initial data loads (see main resize block)
-            // let trigger_repad = { ... };
+            let fc_ev_cells = album_cells.clone();
+            let fc_layout = album_layout.clone();
             let fc_current_song_pos: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
             let fc_current_album: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::new(std::cell::RefCell::new(None));
             let fc_shutdown = shutdown_app.clone();
@@ -2331,7 +2076,6 @@ impl App {
                             let _ = fc_mpris_update.send(update);
                         }
                         MpdEvent::Albums(albums) => {
-                            // Build local search index (convert AlbumMeta to flat tuples)
                             let flat_for_index: Vec<(String, String)> = albums.iter()
                                 .map(|m| (m.album_artist.clone(), m.album.clone()))
                                 .collect();
@@ -2340,70 +2084,82 @@ impl App {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                // Apply sort mode to album list
                                 let mut sorted = albums.clone();
                                 let sort_idx = fc_sort_mode as usize;
                                 match sort_idx {
-                                    1 => sorted.sort_by(|a, b| a.album.cmp(&b.album)), // Album Name
-                                    2 => sorted.sort_by(|a, b| b.album_artist.cmp(&a.album_artist)), // Artist (Z-A)
-                                    3 => sorted.sort_by(|a, b| b.album.cmp(&a.album)), // Album Name (Z-A)
-                                    _ => sorted.sort_by(|a, b| a.album_artist.cmp(&b.album_artist)), // Artist (default)
+                                    1 => sorted.sort_by(|a, b| a.album.cmp(&b.album)),
+                                    2 => sorted.sort_by(|a, b| b.album_artist.cmp(&a.album_artist)),
+                                    3 => sorted.sort_by(|a, b| b.album.cmp(&a.album)),
+                                    _ => sorted.sort_by(|a, b| a.album_artist.cmp(&b.album_artist)),
                                 }
-                                let mut items: Vec<AlbumGridItem> = sorted.iter()
-                                    .enumerate()
-                                    .map(|(i, meta)| {
-                                        AlbumGridItem::Album {
-                                            artist: meta.album_artist.clone(),
-                                            name: meta.album.clone(),
-                                            album_id: format!("album-{i}"),
-                                            year: meta.year.clone(),
-                                            group_label: None,
-                                            caption: None,
-                                            year_badge: format_year_badge(meta.year.as_deref()),
-                                        }
-                                    })
-                                    .collect();
-                                // Apply custom session order in plain Albums view
+                                // Apply custom session order
                                 if let Ok(st) = fc_state.read() {
                                     let order = &st.album_browsing.custom_album_order;
                                     if !order.is_empty() {
-                                        items.sort_by_key(|item| {
-                                            if let AlbumGridItem::Album { name, .. } = item {
-                                                order.iter().position(|o| o == name).unwrap_or(usize::MAX)
-                                            } else {
-                                                usize::MAX
-                                            }
+                                        sorted.sort_by_key(|m| {
+                                            order.iter().position(|o| o == &m.album).unwrap_or(usize::MAX)
                                         });
                                     }
                                 }
-                                // Fetch covers for all albums on initial load (before items is moved into batch_populate)
+                                // Build AlbumCells
                                 let cmd = fc_cmd.clone();
-                                let all_albums: Vec<(String, String)> = items.iter()
-                                    .filter_map(|i| {
-                                        if let AlbumGridItem::Album { artist, name, .. } = i {
-                                            Some((artist.clone(), name.clone()))
-                                        } else {
-                                            None
-                                        }
-                                    })
+                                let cmd2 = fc_cmd.clone();
+                                let all_albums: Vec<(String, String)> = sorted.iter()
+                                    .map(|m| (m.album_artist.clone(), m.album.clone()))
                                     .collect();
-                                let items = pad_groups(items, &fc_grid);
-                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
-                                fc_stack.set_visible_child(&fc_scroll);
-                                // trigger_repad(); // DISABLED
-                                let mut all_albums = Some(all_albums);
-                                glib::idle_add_local(move || {
-                                    if let Some(albums) = all_albums.take() {
-                                        if !albums.is_empty() {
-                                            log::debug!(
-                                                "[ui] initial load: enqueuing {} albums for cover fetch",
-                                                albums.len()
-                                            );
-                                            let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                let layout = fc_layout.clone();
+                                let cells_rc = fc_ev_cells.clone();
+                                let cp = fc_ev_cover_paths.clone();
+                                let tc = fc_ev_cover_tex_cache.clone();
+                                // Clear old widgets from layout
+                                while let Some(child) = layout.first_child() {
+                                    layout.remove(&child);
+                                }
+                                let mut new_cells: Vec<AlbumCell> = Vec::with_capacity(sorted.len());
+                                for (_i, meta) in sorted.iter().enumerate() {
+                                    let cell = AlbumCoverCell::new(cmd2.clone());
+                                    let key = crate::coverart::cover_key(&meta.album_artist, &meta.album);
+                                    cell.set_album(&meta.album, &meta.album_artist, meta.year.as_deref(), &meta.album);
+                                    cell.set_year_badge(format_year_badge(meta.year.as_deref()).as_deref());
+                                    // Set cover texture from cache or placeholder
+                                    let cached = tc.borrow().get(&key).cloned();
+                                    if let Some(tex) = cached {
+                                        cell.set_cover_texture(&tex);
+                                    } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
+                                        if let Ok(img) = image::open(&p) {
+                                            let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
+                                            let bytes = glib::Bytes::from_owned(rgba.into_raw());
+                                            let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
+                                            tc.borrow_mut().insert(key.clone(), tex.clone().into());
+                                            cell.set_cover_texture(&tex);
+                                        } else {
+                                            cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
                                         }
+                                    } else {
+                                        cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
                                     }
-                                    glib::ControlFlow::Break
-                                });
+                                    layout.put(&cell, 0.0, 0.0);
+                                    new_cells.push(AlbumCell {
+                                        cell,
+                                        caption: None,
+                                        artist: meta.album_artist.clone(),
+                                        album: meta.album.clone(),
+                                        album_id: key.clone(),
+                                        group_value: None,
+                                    });
+                                }
+                                *cells_rc.borrow_mut() = new_cells;
+                                let sw = fc_scroll.clone();
+                                let w = sw.width() as f64;
+                                if w > 0.0 {
+                                    let cells = cells_rc.borrow();
+                                    reposition(&layout, &cells, w);
+                                }
+                                fc_stack.set_visible_child(&fc_scroll);
+                                if !all_albums.is_empty() {
+                                    log::debug!("[ui] initial load: enqueuing {} albums for cover fetch", all_albums.len());
+                                    let _ = cmd.send(MpdCommand::FetchCovers(all_albums));
+                                }
                             }
                         }
                         MpdEvent::AlbumsGrouped(groups) => {
@@ -2416,73 +2172,92 @@ impl App {
                                 fc_empty.set_text("No albums found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                // Send index build to search worker (story 28-3)
                                 fc_scmd.send(SearchCommand::BuildIndex(flat.clone()));
                                 let single_group = groups.len() == 1;
                                 let view_mode = active_group.borrow().clone();
-                                let mut items: Vec<AlbumGridItem> = groups.iter()
-                                    .flat_map(|(header, albums)| {
-                                        let mut group_items: Vec<AlbumGridItem> = Vec::new();
-                                        for meta in albums {
-                                            let caption = group_caption_for_view(&view_mode, header, meta);
-                                            let year_badge = format_year_badge(meta.year.as_deref());
-                                            group_items.push(AlbumGridItem::Album {
-                                                artist: meta.album_artist.clone(),
-                                                name: meta.album.clone(),
-                                                album_id: format!("{}-{}", header, meta.album),
-                                                year: meta.year.clone(),
-                                                group_label: if single_group { None } else { Some(header.clone()) },
-                                                caption,
-                                                year_badge,
-                                            });
-                                        }
-                                        group_items
-                                    })
-                                    .collect();
-                                // Apply custom session order in plain Albums view (single group)
-                                if single_group {
-                                    if let Ok(st) = fc_state.read() {
-                                        let order = &st.album_browsing.custom_album_order;
-                                        if !order.is_empty() {
-                                            items.sort_by_key(|item| {
-                                                if let AlbumGridItem::Album { name, .. } = item {
-                                                    order.iter().position(|o| o == name).unwrap_or(usize::MAX)
-                                                } else {
-                                                    usize::MAX
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
-                                // Fetch covers for all albums on group change (before items is moved)
+                                let layout = fc_layout.clone();
+                                let cells_rc = fc_ev_cells.clone();
                                 let cmd = fc_cmd.clone();
-                                let all_albums: Vec<(String, String)> = items.iter()
-                                    .filter_map(|i| {
-                                        if let AlbumGridItem::Album { artist, name, .. } = i {
-                                            Some((artist.clone(), name.clone()))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                let items = pad_groups(items, &fc_grid);
-                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
-                                fc_stack.set_visible_child(&fc_scroll);
-                                // trigger_repad(); // DISABLED
-                                {
-                                    let mut all_albums = Some(all_albums);
-                                    glib::idle_add_local(move || {
-                                        if let Some(albums) = all_albums.take() {
-                                            if !albums.is_empty() {
-                                                log::debug!(
-                                                    "[ui] grouped: enqueuing {} albums for cover fetch",
-                                                    albums.len()
-                                                );
-                                                let _ = cmd.send(MpdCommand::FetchCovers(albums));
+                                let cmd2 = fc_cmd.clone();
+                                let cp = fc_ev_cover_paths.clone();
+                                let tc = fc_ev_cover_tex_cache.clone();
+                                while let Some(child) = layout.first_child() {
+                                    layout.remove(&child);
+                                }
+                                let mut new_cells: Vec<AlbumCell> = Vec::new();
+                                let mut all_albums: Vec<(String, String)> = Vec::new();
+                                for (header, albums) in groups.iter() {
+                                    let group_value: Option<String> = if single_group { None } else { Some(header.clone()) };
+                                    let mut sorted_albums = albums.clone();
+                                    if single_group {
+                                        if let Ok(st) = fc_state.read() {
+                                            let order = &st.album_browsing.custom_album_order;
+                                            if !order.is_empty() {
+                                                sorted_albums.sort_by_key(|m| {
+                                                    order.iter().position(|o| o == &m.album).unwrap_or(usize::MAX)
+                                                });
                                             }
                                         }
-                                        glib::ControlFlow::Break
-                                    });
+                                    }
+                                    for meta in &sorted_albums {
+                                        let cell = AlbumCoverCell::new(cmd2.clone());
+                                        let key = crate::coverart::cover_key(&meta.album_artist, &meta.album);
+                                        let caption = group_caption_for_view(&view_mode, header, meta);
+                                        let year_badge = format_year_badge(meta.year.as_deref());
+                                        cell.set_album(&meta.album, &meta.album_artist, meta.year.as_deref(), &meta.album);
+                                        cell.set_group_captions(caption.as_deref().unwrap_or(&[]));
+                                        cell.set_year_badge(year_badge.as_deref());
+                                        let cached = tc.borrow().get(&key).cloned();
+                                        if let Some(tex) = cached {
+                                            cell.set_cover_texture(&tex);
+                                        } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
+                                            if let Ok(img) = image::open(&p) {
+                                                let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
+                                                let bytes = glib::Bytes::from_owned(rgba.into_raw());
+                                                let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
+                                                tc.borrow_mut().insert(key.clone(), tex.clone().into());
+                                                cell.set_cover_texture(&tex);
+                                            } else {
+                                                cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
+                                            }
+                                        } else {
+                                            cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
+                                        }
+                                        // Group caption label (created only for first item in group)
+                                        let caption_label = if group_value.is_some() && new_cells.last().map_or(true, |c: &AlbumCell| c.group_value.as_deref() != group_value.as_deref()) {
+                                            let lbl = Label::new(Some(header));
+                                            lbl.set_halign(gtk4::Align::Start);
+                                            lbl.set_valign(gtk4::Align::Center);
+                                            lbl.set_css_classes(&["group-caption"]);
+                                            lbl.set_height_request((CAPTION_H - 4.0) as i32);
+                                            layout.put(&lbl, 0.0, 0.0);
+                                            Some(lbl)
+                                        } else {
+                                            None
+                                        };
+                                        layout.put(&cell, 0.0, 0.0);
+                                        new_cells.push(AlbumCell {
+                                            cell,
+                                            caption: caption_label,
+                                            artist: meta.album_artist.clone(),
+                                            album: meta.album.clone(),
+                                            album_id: key.clone(),
+                                            group_value: group_value.clone(),
+                                        });
+                                        all_albums.push((meta.album_artist.clone(), meta.album.clone()));
+                                    }
+                                }
+                                *cells_rc.borrow_mut() = new_cells;
+                                let sw = fc_scroll.clone();
+                                let w = sw.width() as f64;
+                                if w > 0.0 {
+                                    let cells = cells_rc.borrow();
+                                    reposition(&layout, &cells, w);
+                                }
+                                fc_stack.set_visible_child(&fc_scroll);
+                                if !all_albums.is_empty() {
+                                    log::debug!("[ui] grouped: enqueuing {} albums for cover fetch", all_albums.len());
+                                    let _ = cmd.send(MpdCommand::FetchCovers(all_albums));
                                 }
                             }
                         }
@@ -2491,27 +2266,58 @@ impl App {
                                 fc_empty.set_text("No results found");
                                 fc_stack.set_visible_child(&fc_empty);
                             } else {
-                                let items: Vec<AlbumGridItem> = results.iter()
-                                    .enumerate()
-                                    .map(|(i, (artist, name))| {
-                                        let year = fc_mc.get(artist, name)
-                                            .and_then(|m| m.year.clone());
-                                        let year_badge = year.as_deref()
-                                            .and_then(|y_str| format_year_badge(Some(y_str)));
-                                        AlbumGridItem::Album {
-                                            artist: artist.clone(),
-                                            name: name.clone(),
-                                            album_id: format!("search-{i}"),
-                                            year,
-                                            group_label: None,
-                                            caption: None,
-                                            year_badge,
+                                let layout = fc_layout.clone();
+                                let cells_rc = fc_ev_cells.clone();
+                                let cp = fc_ev_cover_paths.clone();
+                                let tc = fc_ev_cover_tex_cache.clone();
+                                let cmd = fc_cmd.clone();
+                                while let Some(child) = layout.first_child() {
+                                    layout.remove(&child);
+                                }
+                                let mut new_cells: Vec<AlbumCell> = Vec::with_capacity(results.len());
+                                for (_i, (artist, name)) in results.iter().enumerate() {
+                                    let cell = AlbumCoverCell::new(cmd.clone());
+                                    let key = crate::coverart::cover_key(artist, name);
+                                    let year = fc_mc.get(artist, name).and_then(|m| m.year.clone());
+                                    let year_badge = year.as_deref().and_then(|y_str| format_year_badge(Some(y_str)));
+                                    cell.set_album(name, artist, year.as_deref(), name);
+                                    cell.set_year_badge(year_badge.as_deref());
+                                    let cached = tc.borrow().get(&key).cloned();
+                                    if let Some(tex) = cached {
+                                        cell.set_cover_texture(&tex);
+                                    } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
+                                        if let Ok(img) = image::open(&p) {
+                                            let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
+                                            let bytes = glib::Bytes::from_owned(rgba.into_raw());
+                                            let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
+                                            tc.borrow_mut().insert(key.clone(), tex.clone().into());
+                                            cell.set_cover_texture(&tex);
+                                        } else {
+                                            cell.set_cover_texture(&placeholder_texture(artist));
                                         }
-                                    })
-                                    .collect();
-                                batch_populate(&fc_ev_model, &fc_ev_data, items, &fc_ev_cover_widgets);
+                                    } else {
+                                        cell.set_cover_texture(&placeholder_texture(artist));
+                                    }
+                                    layout.put(&cell, 0.0, 0.0);
+                                    new_cells.push(AlbumCell {
+                                        cell,
+                                        caption: None,
+                                        artist: artist.clone(),
+                                        album: name.clone(),
+                                        album_id: key.clone(),
+                                        group_value: None,
+                                    });
+                                }
+                                *cells_rc.borrow_mut() = new_cells;
+                                let sw = fc_scroll.clone();
+                                let w = sw.width() as f64;
+                                if w > 0.0 {
+                                    let cells = cells_rc.borrow();
+                                    reposition(&layout, &cells, w);
+                                }
                                 fc_stack.set_visible_child(&fc_scroll);
-                                // trigger_repad(); // DISABLED
+                                // Enqueue cover art fetch for search results
+                                let _ = cmd.send(MpdCommand::FetchCovers(results.clone()));
                             }
                         }
                         MpdEvent::FileSearchResults(results) => {
@@ -2747,13 +2553,10 @@ impl App {
                         MpdEvent::CoverPaths(paths) => {
                             log::info!("[UI] CoverPaths: {} covers, keys: {:?}", paths.len(), paths.keys().collect::<Vec<_>>());
                             let mut cp = fc_ev_cover_paths.borrow_mut();
-                            let widgets = fc_ev_cover_widgets.borrow();
                             let mini_widgets = fc_mini_cw.borrow();
                             for (album, path) in &paths {
                                 cp.insert(album.clone(), path.clone());
-                                // Update grid Picture widget in-place if registered
                                 if let Some(p) = path.as_deref() {
-                                    // Load at 200x200 to prevent GridView row expansion from native image dims
                                     if let Ok(img) = image::open(p) {
                                         let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
                                         let bytes = glib::Bytes::from_owned(rgba.into_raw());
@@ -2761,35 +2564,32 @@ impl App {
                                         fc_ev_cover_tex_cache.borrow_mut().insert(album.clone(), tex.clone().into());
                                         log::info!("[UI] cover push: '{album}' tex={}x{}",
                                             tex.width(), tex.height());
-                                            if let Some(pic) = widgets.get(album) {
-                                                log::info!("[UI] cover push: updating grid widget for '{album}', alloc before={}x{}",
-                                                    pic.width(), pic.height());
-                                                pic.set_paintable(Some(&tex));
-                                                pic.queue_draw();
-                                            } else {
-                                                log::warn!("[UI] cover: no grid widget for '{album}', registry has {} entries: {:?}",
-                                                    widgets.len(), widgets.keys().take(3).collect::<Vec<_>>());
-                                            }
-                                            if let Some(pic) = mini_widgets.get(album) {
-                                                pic.set_paintable(Some(&tex));
-                                                pic.set_visible(true);
-                                                pic.queue_draw();
-                                            }
-                                            let is_current = fc_current_album.borrow().as_deref()
-                                                .map(|a| album.ends_with(&format!("||{}", a)))
-                                                .unwrap_or(false);
-                                            if is_current {
-                                                fc_np_cover.set_paintable(Some(&tex));
-                                                fc_np_cover.set_visible(true);
-                                            }
+                                        // Update grid cell in-place by album_id
+                                        let cells = fc_ev_cells.borrow();
+                                        if let Some(cell) = cells.iter().find(|c| &c.album_id == album) {
+                                            cell.cell.set_cover_texture(&tex);
+                                        }
+                                        drop(cells);
+                                        // Update mini queue grid
+                                        if let Some(pic) = mini_widgets.get(album) {
+                                            pic.set_paintable(Some(&tex));
+                                            pic.set_visible(true);
+                                            pic.queue_draw();
+                                        }
+                                        let is_current = fc_current_album.borrow().as_deref()
+                                            .map(|a| album.ends_with(&format!("||{}", a)))
+                                            .unwrap_or(false);
+                                        if is_current {
+                                            fc_np_cover.set_paintable(Some(&tex));
+                                            fc_np_cover.set_visible(true);
                                         }
                                     }
                                 }
                             }
+                        }
                         MpdEvent::CoverRefreshed { album_id, data } => {
                             let data_len = data.len();
                             log::info!("[UI] cover refreshed: '{album_id}' ({} bytes RGBA)", data_len);
-                            // RGBA bytes pre-decoded by Cover Proc (story 28-2): zero-copy GPU upload
                             let rgba = glib::Bytes::from_owned(data);
                             let texture = gdk4::MemoryTexture::new(
                                 200, 200,
@@ -2799,10 +2599,11 @@ impl App {
                             );
                             fc_ev_cover_tex_cache.borrow_mut().insert(album_id.clone(), texture.clone().into());
                             log::info!("[UI] cover refresh: '{album_id}' texture from {data_len} RGBA bytes");
-                            if let Some(pic) = fc_ev_cover_widgets.borrow().get(&album_id) {
-                                pic.set_paintable(Some(&texture));
-                                pic.queue_draw();
+                            let cells = fc_ev_cells.borrow();
+                            if let Some(cell) = cells.iter().find(|c| c.album_id == album_id) {
+                                cell.cell.set_cover_texture(&texture);
                             }
+                            drop(cells);
                             if let Some(pic) = fc_mini_cw.borrow().get(&album_id) {
                                 pic.set_paintable(Some(&texture));
                                 pic.set_visible(true);

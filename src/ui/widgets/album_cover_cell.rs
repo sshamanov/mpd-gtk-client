@@ -267,7 +267,39 @@ impl AlbumCoverCell {
         obj.imp().cmd_tx.replace(Some(cmd_tx));
         obj.wire_buttons();
         obj.wire_context_menu();
+        obj.wire_drag_source();
+        obj.wire_activation();
         obj
+    }
+
+    fn wire_activation(&self) {
+        let cmd = self.imp().cmd_tx.borrow().clone().expect("cmd_tx set before wire_activation");
+        let cell = self.clone();
+        let gesture = gtk4::GestureClick::new();
+        gesture.set_button(1);
+        gesture.connect_pressed(move |_gest, n_clicks, _x, _y| {
+            if n_clicks == 2 {
+                let key = cell.album_key();
+                if !key.is_empty() {
+                    let _ = cmd.send(MpdCommand::PlayAlbum(key));
+                }
+            }
+        });
+        self.add_controller(gesture);
+    }
+
+    fn wire_drag_source(&self) {
+        let drag = gtk4::DragSource::new();
+        drag.set_actions(gtk4::gdk::DragAction::COPY);
+        let cell = self.clone();
+        drag.connect_prepare(move |_source, _x, _y| {
+            let key = cell.album_key();
+            if key.is_empty() {
+                return None;
+            }
+            Some(gtk4::gdk::ContentProvider::for_value(&glib::Value::from(&key)))
+        });
+        self.add_controller(drag);
     }
 
     fn wire_buttons(&self) {
@@ -457,20 +489,6 @@ impl AlbumCoverCell {
             } else {
                 badge.set_visible(false);
             }
-        }
-    }
-
-    /// Hide all visible content — used for Filler grid items that pad group rows.
-    pub fn set_filler(&self) {
-        self.imp().album_key.replace(String::new());
-        if let Some(ref a) = *self.imp().album_section.borrow() {
-            a.set_visible(false);
-        }
-        if let Some(ref badge) = *self.imp().year_badge.borrow() {
-            badge.set_visible(false);
-        }
-        if let Some(ref cap) = *self.imp().group_caption.borrow() {
-            cap.set_visible(false);
         }
     }
 }
