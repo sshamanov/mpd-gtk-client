@@ -2,6 +2,7 @@
 
 #![allow(clippy::expect_used)]
 
+use crate::mpd::cover::{self, CoverFetchResult, CoverThreadSender};
 use crate::mpd::{ConnectionTarget, DirEntry, MpdAdapter, MpdStream};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -247,7 +248,8 @@ impl MpdEventLoop {
                                 Ok(adapter) => {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
                                     mc_thread.clear();
-                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread);
+                                    let cover_target = target.clone();
+                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread, cover_target);
                                     // When connected_loop exits, connection was lost.
                                     // Preserve backoff across the reconnect cycle.
                                     let backoff = ExponentialBackoff::new();
@@ -326,9 +328,10 @@ fn connected_loop(
     mut adapter: MpdAdapter,
     cmd_rx: &mpsc::Receiver<MpdCommand>,
     event_tx: &mpsc::SyncSender<MpdEvent>,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     noidle_socket: Arc<Mutex<Option<MpdStream>>>,
     metadata_cache: &crate::metadata::MetadataCache,
+    cover_target: ConnectionTarget,
 ) {
     let mut last_status = Instant::now();
     let mut last_song_pos: Option<u32>;
@@ -344,6 +347,10 @@ fn connected_loop(
     let mut cached_flat_albums: Vec<crate::mpd::AlbumMeta> = Vec::new();
     let mut use_idle = true;
     let mut transient_failures: u32 = 0;
+
+    // Cover thread (story 28-1): separate MPD connection for binary cover data
+    let (cover_result_tx, cover_result_rx) = mpsc::sync_channel::<CoverFetchResult>(64);
+    let mut cover_tx: Option<CoverThreadSender> = None;
 
     // Set the stream clone for the main thread's CommandSender
     if let Ok(clone) = adapter.stream_clone() {
@@ -444,6 +451,7 @@ fn connected_loop(
                                     &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                                     &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                                     stop, metadata_cache,
+                                    &mut cover_tx, &cover_target, &cover_result_tx,
                                 ) {
                                     return;
                                 }
@@ -452,10 +460,20 @@ fn connected_loop(
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
-                    // Process one cover fetch per idle cycle
-                    if actual_read.has_pending() {
-                        let caps = adapter.capabilities.clone();
-                        actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
+                    // Drain cover results from the MPD Cover thread (story 28-1)
+                    while let Ok(result) = cover_result_rx.try_recv() {
+                        match result {
+                            CoverFetchResult::Success { key, data, mtime } => {
+                                actual_read.process_cover_result(&key, &data, mtime,
+                                    &cover_provider.read().unwrap(), event_tx);
+                            }
+                            CoverFetchResult::Empty { key } => {
+                                log::debug!("[cover] '{key}': no cover data available");
+                            }
+                            CoverFetchResult::Error { key, error } => {
+                                log::warn!("[cover] '{key}': cover fetch error: {error}");
+                            }
+                        }
                     }
                 }
                 Err(ref e) if e.to_string().contains("unknown command") => {
@@ -483,14 +501,26 @@ fn connected_loop(
                         &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                         &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                         stop, metadata_cache,
+                        &mut cover_tx, &cover_target, &cover_result_tx,
                     ) {
                         return;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if actual_read.has_pending() {
-                        let caps = adapter.capabilities.clone();
-                        actual_read.process_one(&mut adapter, &caps, &cover_provider.read().unwrap(), event_tx);
+                    // Drain cover results (story 28-1)
+                    while let Ok(result) = cover_result_rx.try_recv() {
+                        match result {
+                            CoverFetchResult::Success { key, data, mtime } => {
+                                actual_read.process_cover_result(&key, &data, mtime,
+                                    &cover_provider.read().unwrap(), event_tx);
+                            }
+                            CoverFetchResult::Empty { key } => {
+                                log::debug!("[cover] '{key}': no cover data available");
+                            }
+                            CoverFetchResult::Error { key, error } => {
+                                log::warn!("[cover] '{key}': cover fetch error: {error}");
+                            }
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -548,15 +578,18 @@ fn process_command(
     adapter: &mut MpdAdapter,
     event_tx: &mpsc::SyncSender<MpdEvent>,
     actual_read: &mut crate::coverart::ActualRead,
-    cover_provider: &std::sync::Arc<std::sync::RwLock<crate::coverart::CoverProvider>>,
+    _cover_provider: &std::sync::Arc<std::sync::RwLock<crate::coverart::CoverProvider>>,
     last_status: &mut Instant,
     _last_song_pos: &mut Option<u32>,
     last_playlist_version: &mut Option<String>,
     local_queue: &mut Vec<crate::mpd::QueueEntry>,
     cached_flat_albums: &mut Vec<crate::mpd::AlbumMeta>,
     _consecutive_failures: &mut u32,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     metadata_cache: &crate::metadata::MetadataCache,
+    cover_tx: &mut Option<CoverThreadSender>,
+    cover_target: &ConnectionTarget,
+    cover_result_tx: &mpsc::SyncSender<CoverFetchResult>,
 ) -> bool {
     match cmd {
         MpdCommand::Play => {
@@ -649,9 +682,38 @@ fn process_command(
         }
         MpdCommand::FetchCovers(albums) => {
             log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
-            actual_read.enqueue(albums);
-            let caps = adapter.capabilities.clone();
-            actual_read.process_batch(adapter, &caps, &cover_provider.read().unwrap(), event_tx, 16);
+            actual_read.enqueue(albums.clone());
+
+            // Lazy-spawn cover thread on first use (story 28-1)
+            if cover_tx.is_none() {
+                let caps = adapter.capabilities.clone();
+                *cover_tx = Some(cover::spawn(
+                    cover_target.clone(),
+                    caps,
+                    cover_result_tx.clone(),
+                    stop.clone(),
+                ));
+            }
+
+            // Resolve URIs on the MPD IO connection, enqueue (artist, album, uri)
+            // jobs to the cover thread for binary fetch on its own connection
+            let mut jobs = Vec::with_capacity(albums.len());
+            for (artist, album) in &albums {
+                match adapter.find_album_uris(album) {
+                    Ok(uris) => {
+                        if let Some(uri) = uris.first() {
+                            jobs.push((artist.clone(), album.clone(), uri.clone()));
+                        }
+                    }
+                    Err(e) => {
+                        log::info!("[cover] find_album_uris for '{artist}/{album}' failed: {e}");
+                    }
+                }
+            }
+
+            if let Some(ref tx) = *cover_tx {
+                tx.enqueue(&jobs);
+            }
         }
         MpdCommand::Search(query) => {
             if let Ok(results) = adapter.search_albums(&query) {

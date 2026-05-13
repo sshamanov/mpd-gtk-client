@@ -86,6 +86,26 @@ impl ActualRead {
         }
     }
 
+    /// Process a cover result from the MPD Cover thread (story 28-1).
+    ///
+    /// Dispatches to `handle_albumart_data` when mtime is None (albumart source),
+    /// or `handle_readpicture_data` when mtime is Some (readpicture source).
+    /// The MPD IO thread calls this when draining results from the cover result channel.
+    pub fn process_cover_result(
+        &mut self,
+        key: &str,
+        data: &[u8],
+        mtime: Option<u64>,
+        provider: &CoverProvider,
+        event_tx: &EventSender,
+    ) {
+        if let Some(mtime) = mtime {
+            self.handle_readpicture_data(key, data, mtime, provider, event_tx);
+        } else {
+            self.handle_albumart_data(key, data, provider, event_tx);
+        }
+    }
+
     /// Process one album from the queue.
     ///
     /// 1. Pops the front album from the queue.

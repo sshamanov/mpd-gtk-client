@@ -3,6 +3,7 @@
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod mock;
 pub mod state_machine;
+pub mod cover;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
