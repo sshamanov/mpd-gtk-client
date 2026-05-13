@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-12"
+last_updated: "2026-05-13"
 
 
 project: mpd-client
@@ -197,5 +197,5 @@ development_status:
   30-6-dead-atomicbool-statics: backlog
   30-7-cli-action-overwrite-warning: backlog
 
-  epic-27: backlog
-  27-1-responsive-right-rail: backlog
+  epic-27: done
+  27-1-responsive-right-rail: done

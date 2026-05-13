@@ -516,11 +516,7 @@ impl App {
                 });
             }
 
-            let split_view = adw::OverlaySplitView::new();
-            split_view.set_sidebar_position(gtk4::PackType::End);
-            split_view.set_min_sidebar_width(320.0);
-            split_view.set_max_sidebar_width(320.0);
-            split_view.set_show_sidebar(true);
+            let multi_view = adw::MultiLayoutView::new();
 
             // --- Left pane: group bar + album grid ---
             let left_pane_box = Box::new(Orientation::Vertical, 0);
@@ -1215,7 +1211,7 @@ impl App {
             bottom_panel.append(&bp_queue_btn);
             left_pane_box.append(&bottom_panel);
 
-            split_view.set_content(Some(&left_pane_box));
+            multi_view.set_child("left", &left_pane_box);
 
             // --- Right rail ---
             let right_pane = Box::new(Orientation::Vertical, 0);
@@ -1940,18 +1936,53 @@ impl App {
             });
             queue_list.add_controller(reorder_target);
 
-            split_view.set_sidebar(Some(&right_pane));
+            multi_view.set_child("right", &right_pane);
+
+            // --- MultiLayoutView: wide and narrow layouts ---
+            let bottom_sheet = adw::BottomSheet::new();
+            // Narrow layout: BottomSheet shows right_pane (via slot "right") on demand
+            let narrow_content = Box::new(Orientation::Vertical, 0);
+            let narrow_left = adw::LayoutSlot::new("left");
+            narrow_left.set_vexpand(true);
+            narrow_content.append(&narrow_left);
+            bottom_sheet.set_content(Some(&narrow_content));
+            let narrow_right_slot = adw::LayoutSlot::new("right");
+            bottom_sheet.set_sheet(Some(&narrow_right_slot));
+            let narrow_layout = adw::Layout::new(&bottom_sheet);
+            narrow_layout.set_name(Some("narrow"));
+            multi_view.add_layout(narrow_layout);
+
+            // Wide layout: side-by-side split (left pane + right pane)
+            let wide_box = Box::new(Orientation::Horizontal, 0);
+            let wide_left = adw::LayoutSlot::new("left");
+            let wide_right = adw::LayoutSlot::new("right");
+            wide_left.set_hexpand(true);
+            wide_right.set_size_request(320, -1);
+            wide_box.append(&wide_left);
+            wide_box.append(&wide_right);
+            let wide_layout = adw::Layout::new(&wide_box);
+            wide_layout.set_name(Some("wide"));
+            multi_view.add_layout(wide_layout);
+
+            // Start in correct layout based on configured window geometry
+            let init_narrow = cfg.window_geometry.as_ref()
+                .map(|g| g.width < 800)
+                .unwrap_or(false);
+            multi_view.set_layout_name(if init_narrow { "narrow" } else { "wide" });
 
             // Toast overlay for notifications (libadwaita)
             let toast_overlay = adw::ToastOverlay::new();
-            toast_overlay.set_child(Some(&split_view));
+            toast_overlay.set_child(Some(&multi_view));
             window.set_content(Some(&toast_overlay));
 
-            // Ctrl+B toggle bottom sheet / sidebar visibility
-            let sv_toggle = split_view.clone();
+            // Ctrl+B toggles BottomSheet in narrow mode, no-op in wide
+            let bs_toggle = bottom_sheet.clone();
+            let mv_toggle_ref = multi_view.clone();
             let toggle_bs_act = gtk4::gio::SimpleAction::new("toggle-sidebar", None);
             toggle_bs_act.connect_activate(move |_, _| {
-                sv_toggle.set_show_sidebar(!sv_toggle.shows_sidebar());
+                if mv_toggle_ref.layout_name().as_deref() == Some("narrow") {
+                    bs_toggle.set_open(!bs_toggle.is_open());
+                }
             });
             app_clone.add_action(&toggle_bs_act);
             app_clone.set_accels_for_action("app.toggle-sidebar", &["<Ctrl>B"]);
@@ -2081,8 +2112,9 @@ impl App {
             let fc_queue_scroll_ref = queue_scroll.clone();
             let fc_prev_mode: std::cell::Cell<crate::state::Mode> = std::cell::Cell::new(crate::state::Mode::Album);
             let fc_sort_mode: u32 = 0; // fixed to artist sort (was DropDown)
-            let fc_split_view = split_view.clone();
+            let fc_multi_view = multi_view.clone();
             let fc_bottom_panel = bottom_panel.clone();
+            let fc_bottom_sheet = bottom_sheet.clone();
             let fc_bp_title = bp_title.clone();
             let fc_bp_play = bp_play.clone();
             let fc_track_revealer = track_revealer.clone();
@@ -2126,10 +2158,13 @@ impl App {
             let bp_n_cmd = fc_cmd.clone();
             bp_next.connect_clicked(move |_| { let _ = bp_n_cmd.send(MpdCommand::Next); });
 
-            // Bottom queue button → show right rail sidebar as overlay
-            let bq_split = fc_split_view.clone();
+            // Bottom queue button → toggle BottomSheet in narrow mode
+            let bq_mv = fc_multi_view.clone();
+            let bq_bs = fc_bottom_sheet.clone();
             bp_queue_btn.connect_clicked(move |_| {
-                bq_split.set_show_sidebar(!bq_split.shows_sidebar());
+                if bq_mv.layout_name().as_deref() == Some("narrow") {
+                    bq_bs.set_open(!bq_bs.is_open());
+                }
             });
 
             // Wire prev/next album buttons
@@ -2155,10 +2190,16 @@ impl App {
             });
 
             window.add_tick_callback(move |_widget, _fc| {
-                // Hide sidebar and show bottom panel on narrow windows (<800px)
+                // Switch layout on narrow windows (<800px), show bottom transport bar
                 let win_width = _widget.width() as f64;
                 let narrow = win_width < 800.0;
-                fc_split_view.set_show_sidebar(!narrow);
+                let current_narrow = fc_multi_view.layout_name().as_deref() == Some("narrow");
+                if narrow != current_narrow {
+                    fc_multi_view.set_layout_name(if narrow { "narrow" } else { "wide" });
+                    if !narrow {
+                        fc_bottom_sheet.set_open(false);
+                    }
+                }
                 fc_bottom_panel.set_visible(narrow);
 
                 // Ensure queue display matches current mode
