@@ -68,6 +68,7 @@ pub fn try_acquire_lock() -> Result<LockOutcome, String> {
             // Lock exists — check if PID is alive and is actually mpd-client
             let stale = lock_is_stale();
             if stale {
+                log::warn!("Stale lock file detected (PID {} dead or not mpd-client), overwriting", read_lock_pid().unwrap_or(0));
                 // Stale — remove and retry once
                 let _ = std::fs::remove_file(&path);
                 let mut file = std::fs::OpenOptions::new()
