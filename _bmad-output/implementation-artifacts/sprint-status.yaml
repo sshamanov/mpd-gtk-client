@@ -181,12 +181,12 @@ development_status:
   28-3-search-worker-thread: done
   28-4-notification-router: done
 
-  epic-29: backlog
+  epic-29: done
   29-1-image-crate-migration: done
   29-2-gtklayout-grid-migration: done
   29-3-now-playing-consolidation: done
   29-4-presenter-layer: done
-  29-5-single-reducer: in-progress
+  29-5-single-reducer: done
 
   epic-30: backlog
   30-1-albumart-first-chunk-reuse: backlog

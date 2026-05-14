@@ -1,5 +1,8 @@
 //! Application state — shared playback/queue state and mode-local browsing state. Thread: UI (single-threaded mutations).
 
+use crate::mpd::state_machine::MpdEvent;
+#[cfg(test)]
+use crate::mpd::state_machine::PlaybackUpdate;
 use crate::mpd::{Album, QueueItem, Track};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -179,5 +182,147 @@ impl Store {
 
     pub fn get_state(&self) -> SharedState {
         self.state.clone()
+    }
+}
+
+/// Single reducer — applies an MPD event to application state.
+///
+/// Pure data transformation: no GTK operations, no channel sends, no I/O.
+/// Runs on the GTK thread. Must complete in <1ms.
+pub fn reduce(state: &mut AppState, event: &MpdEvent) {
+    match event {
+        MpdEvent::Connected => {
+            state.connection = ConnectionState::Connected;
+        }
+        MpdEvent::Connecting => {
+            state.connection = ConnectionState::Connecting;
+        }
+        MpdEvent::Disconnected => {
+            state.connection = ConnectionState::Disconnected;
+        }
+        MpdEvent::StateChanged(update) => {
+            if update.state == "stop" {
+                state.current.track = None;
+                state.current.album = None;
+            } else {
+                let dur = update.duration
+                    .map(std::time::Duration::from_secs_f64);
+                state.current.track = Some(Track {
+                    id: update.song.map(|s| s.to_string()).unwrap_or_default(),
+                    title: update.title.clone().unwrap_or_default(),
+                    album_id: update.album.clone().unwrap_or_default(),
+                    path: PathBuf::new(),
+                    duration: dur,
+                    format: update.audio_format.as_ref().map(|f| f.display_text()),
+                });
+                state.current.album = Some(Album {
+                    id: update.album.clone().unwrap_or_default(),
+                    title: update.album.clone().unwrap_or_default(),
+                    artist: update.artist.clone().unwrap_or_default(),
+                    year: None,
+                    genre: None,
+                    cover_path: None,
+                    tracks: vec![],
+                });
+            }
+        }
+        // Events with no state changes — widget-only
+        MpdEvent::Queue(_)
+        | MpdEvent::Albums(_)
+        | MpdEvent::AlbumsGrouped(_)
+        | MpdEvent::SearchResults(_)
+        | MpdEvent::FileSearchResults(_)
+        | MpdEvent::DirectoryListing(..)
+        | MpdEvent::AlbumTracks(_)
+        | MpdEvent::CoverPaths(_)
+        | MpdEvent::CoverRefreshed { .. }
+        | MpdEvent::LibraryChanged
+        | MpdEvent::Error(_)
+        | MpdEvent::Toast { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState {
+            playback: PlaybackStatus { state: PlaybackState::Stopped, current_position: 0, volume: 100 },
+            current: CurrentContext { track: None, album: None },
+            queue: QueueState { items: vec![], current_position: None },
+            connection: ConnectionState::Disconnected,
+            album_browsing: AlbumBrowsingState {
+                scroll_position: (0.0, 0.0),
+                selected_album_id: None,
+                hover_album_id: None,
+                group_expansion: HashMap::new(),
+                custom_album_order: Vec::new(),
+            },
+            folder_browsing: FolderBrowsingState {
+                expanded_paths: vec![],
+                selected_track_id: None,
+                scroll_position: 0.0,
+            },
+            mode: Mode::Album,
+        }
+    }
+
+    #[test]
+    fn test_reduce_connected() {
+        let mut state = test_state();
+        assert!(matches!(state.connection, ConnectionState::Disconnected));
+        reduce(&mut state, &MpdEvent::Connected);
+        assert!(matches!(state.connection, ConnectionState::Connected));
+    }
+
+    #[test]
+    fn test_reduce_disconnected() {
+        let mut state = test_state();
+        state.connection = ConnectionState::Connected;
+        reduce(&mut state, &MpdEvent::Disconnected);
+        assert!(matches!(state.connection, ConnectionState::Disconnected));
+    }
+
+    #[test]
+    fn test_reduce_connecting() {
+        let mut state = test_state();
+        assert!(matches!(state.connection, ConnectionState::Disconnected));
+        reduce(&mut state, &MpdEvent::Connecting);
+        assert!(matches!(state.connection, ConnectionState::Connecting));
+    }
+
+    #[test]
+    fn test_reduce_state_changed_playing() {
+        let mut state = test_state();
+        let update = PlaybackUpdate {
+            state: "play".into(),
+            song: Some(42),
+            title: Some("Test Song".into()),
+            artist: Some("Test Artist".into()),
+            album: Some("Test Album".into()),
+            elapsed: Some(10.0),
+            duration: Some(200.0),
+            volume: 80,
+            ..Default::default()
+        };
+        reduce(&mut state, &MpdEvent::StateChanged(update));
+        assert!(state.current.track.is_some());
+        assert_eq!(state.current.track.as_ref().unwrap().title, "Test Song");
+        assert!(state.current.album.is_some());
+        assert_eq!(state.current.album.as_ref().unwrap().title, "Test Album");
+    }
+
+    #[test]
+    fn test_reduce_state_changed_stop() {
+        let mut state = test_state();
+        state.current.track = Some(Track {
+            id: "1".into(), title: "X".into(), album_id: "A".into(),
+            path: PathBuf::new(), duration: None, format: None,
+        });
+        let update = PlaybackUpdate { state: "stop".into(), ..Default::default() };
+        reduce(&mut state, &MpdEvent::StateChanged(update));
+        assert!(state.current.track.is_none());
+        assert!(state.current.album.is_none());
     }
 }

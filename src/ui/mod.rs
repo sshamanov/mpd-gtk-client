@@ -1953,13 +1953,28 @@ impl App {
                     let fwd = event.clone();
                     match event {
                         MpdEvent::Connected => {
+                            if let Ok(mut app_state) = fc_state.write() {
+                                crate::state::reduce(&mut app_state, &MpdEvent::Connected);
+                            }
                             fc_scmd.send(SearchCommand::Reset);
                             let _ = fc_cmd.send(MpdCommand::ListAlbumsGrouped("Albums".into()));
                             let _ = fc_cmd.send(MpdCommand::ListQueue);
                         }
-                        MpdEvent::Connecting => {}
-                        MpdEvent::Disconnected => {}
+                        MpdEvent::Connecting => {
+                            if let Ok(mut app_state) = fc_state.write() {
+                                crate::state::reduce(&mut app_state, &MpdEvent::Connecting);
+                            }
+                        }
+                        MpdEvent::Disconnected => {
+                            if let Ok(mut app_state) = fc_state.write() {
+                                crate::state::reduce(&mut app_state, &MpdEvent::Disconnected);
+                            }
+                        }
                         MpdEvent::StateChanged(update) => {
+                            // Reduce: write SharedState.current (canonical)
+                            if let Ok(mut app_state) = fc_state.write() {
+                                crate::state::reduce(&mut app_state, &MpdEvent::StateChanged(update.clone()));
+                            }
                             fc_current_song_pos.set(update.song.map(|s| s as i32));
                             let album_changed = fc_current_album.borrow().as_deref() != update.album.as_deref();
                             *fc_current_album.borrow_mut() = update.album.clone();
@@ -1996,7 +2011,7 @@ impl App {
                                     }
                                 }
                             }
-                            handle_now_playing(&fc_state, update.clone(), NowPlayingWidgets {
+                            handle_now_playing(&update, NowPlayingWidgets {
     title: &fc_tl,
     artist: &fc_ar,
     album: &fc_al,
@@ -2739,52 +2754,16 @@ impl PlaybackDisplay {
     }
 }
 
-/// Single entry point for now-playing updates: writes SharedState, updates widgets, forwards to MPRIS.
+/// Update now-playing widgets and forward to MPRIS after state has been written by `reduce()`.
+/// SharedState.current must already be populated before calling this function.
 fn handle_now_playing(
-    state: &SharedState,
-    update: PlaybackUpdate,
+    update: &PlaybackUpdate,
     w: NowPlayingWidgets,
     mpris_tx: &std::sync::mpsc::Sender<PlaybackUpdate>,
 ) {
-    // 1. WRITE SharedState.current (canonical)
-    if let Ok(mut app_state) = state.write() {
-        if update.state == "stop" {
-            app_state.current.track = None;
-            app_state.current.album = None;
-        } else {
-            let dur = update.duration
-                .map(std::time::Duration::from_secs_f64);
-            let track_name = update.title.clone().unwrap_or_default();
-            let album_name = update.album.clone().unwrap_or_default();
-            let artist_name = update.artist.clone().unwrap_or_default();
-            app_state.current.track = Some(crate::mpd::Track {
-                id: update.song.map(|s| s.to_string()).unwrap_or_default(),
-                title: track_name,
-                album_id: album_name.clone(),
-                path: std::path::PathBuf::new(),
-                duration: dur,
-                format: update.audio_format.as_ref().map(|f| f.display_text()),
-            });
-            app_state.current.album = Some(crate::mpd::Album {
-                id: album_name.clone(),
-                title: album_name,
-                artist: artist_name,
-                year: None,
-                genre: None,
-                cover_path: None,
-                tracks: vec![],
-            });
-        }
-    }
-
-    // 2. READ back into PlaybackDisplay view model
-    let display = PlaybackDisplay::from_update(&update);
-
-    // 3. UPDATE all GTK now-playing widgets
+    let display = PlaybackDisplay::from_update(update);
     update_now_playing(w, &display);
-
-    // 4. FORWARD to MPRIS emitter
-    let _ = mpris_tx.send(update);
+    let _ = mpris_tx.send(update.clone());
 }
 
 fn update_now_playing(

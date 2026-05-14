@@ -1,6 +1,6 @@
 # Story 29.5: Single Reducer
 
-Status: ready-for-dev
+Status: done
 
 ## Story
 
@@ -137,13 +137,24 @@ fn reduce(state: &mut AppState, event: &MpdEvent) {
 ## Dev Agent Record
 
 ### Implementation Plan
-(To be filled by dev agent)
+
+1. Add `reduce()` function in `src/state/mod.rs` with StateChanged, Connected, Disconnected, Connecting handlers
+2. Wire `reduce()` into the MPD event dispatch in `src/ui/mod.rs` — replace inline `fc_state.write()` calls
+3. Add unit tests for reduce() with multiple event types
+4. Run full test suite to verify zero regressions
 
 ### Completion Notes
-(To be filled by dev agent)
+
+- Added `reduce()` function handling: Connected, Disconnected, Connecting, StateChanged
+- Wired into 4 event handlers: Connected, Disconnected, Connecting, StateChanged
+- Queue, CoverPaths, LibraryChanged, and other handlers had NO `fc_state.write()` calls to extract (UI-local RefCells)
+- Added 5 unit tests: connected, disconnected, connecting, state-changed-playing, state-changed-stop
+- All 94 tests pass (23 lib + 50 bin + 21 smoke), zero regressions, zero warnings
 
 ### Change Log
-(To be filled by dev agent)
+
+- Modified `src/state/mod.rs`: added `reduce()` function + 5 unit tests, added Connecting handler
+- Modified `src/ui/mod.rs`: wired reduce() into Connected, Disconnected, Connecting, StateChanged handlers
 
 ## References
 - [Source: architecture.md §2280-2313] Single reducer ADR — reduce() function, AppEvent enum, enforcement rules
