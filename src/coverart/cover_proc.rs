@@ -95,33 +95,37 @@ fn process_success(
     let md5 = format!("{:x}", Md5::digest(data));
 
     // Check CoverProvider cache — if hash matches and timestamp not newer, skip
-    if let Ok(ref prov) = provider.read() {
-        if let Some(cached) = prov.get(key) {
-            if cached.md5 == md5 {
-                if mtime.is_none() {
-                    log::debug!("[cover-proc] '{key}': hash unchanged, emitting cached path");
-                    emit_cover_path(key, &md5, cache_dir, event_tx);
-                    return;
-                }
-                if let Some(cached_ts) = cached.timestamp {
-                    if cached_ts >= mtime.unwrap_or(0) {
-                        log::debug!(
-                            "[cover-proc] '{key}': timestamp not newer (cached: {cached_ts}, mtime: {})",
-                            mtime.unwrap_or(0)
-                        );
+    match provider.read() {
+        Ok(ref prov) => {
+            if let Some(cached) = prov.get(key) {
+                if cached.md5 == md5 {
+                    if mtime.is_none() {
+                        log::debug!("[cover-proc] '{key}': hash unchanged, emitting cached path");
+                        emit_cover_path(key, &md5, cache_dir, event_tx);
                         return;
+                    }
+                    if let Some(cached_ts) = cached.timestamp {
+                        if cached_ts >= mtime.unwrap_or(0) {
+                            log::debug!(
+                                "[cover-proc] '{key}': timestamp not newer (cached: {cached_ts}, mtime: {})",
+                                mtime.unwrap_or(0)
+                            );
+                            return;
+                        }
                     }
                 }
             }
         }
+        Err(e) => log::error!("[cover-proc] CoverProvider RwLock poisoned (read): {e}"),
     }
 
     // New or updated cover — write JPEG to disk cache
     write_cache(key, data, &md5, mtime, cache_dir);
 
     // Update CoverProvider in-memory index
-    if let Ok(ref prov) = provider.read() {
-        prov.update_entry(key, &md5, mtime);
+    match provider.read() {
+        Ok(ref prov) => prov.update_entry(key, &md5, mtime),
+        Err(e) => log::error!("[cover-proc] CoverProvider RwLock poisoned (update_entry): {e}"),
     }
 
     // Emit CoverPaths (path-based delivery for cached covers)

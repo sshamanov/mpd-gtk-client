@@ -99,7 +99,9 @@ impl CoverProvider {
     /// No disk I/O beyond `stat()` and optional corrupt-file read + delete.
     pub fn get(&self, album_id: &str) -> Option<CachedCover> {
         let entry = {
-            let index = self.index.read().ok()?;
+            let index = self.index.read().map_err(|e| {
+                log::error!("[cover_provider] RwLock poisoned (get): {e}");
+            }).ok()?;
             index.get(album_id)?.clone()
         };
 
@@ -139,10 +141,13 @@ impl CoverProvider {
     /// filesystem — that is the responsibility of the component that writes
     /// the cache (ActualRead, Story 13.2).
     pub fn invalidate(&self, album_id: &str) {
-        if let Ok(mut index) = self.index.write() {
-            if index.remove(album_id).is_some() {
-                log::debug!("[cover_provider] Invalidated index entry for '{album_id}'");
+        match self.index.write() {
+            Ok(mut index) => {
+                if index.remove(album_id).is_some() {
+                    log::debug!("[cover_provider] Invalidated index entry for '{album_id}'");
+                }
             }
+            Err(e) => log::error!("[cover_provider] RwLock poisoned (invalidate): {e}"),
         }
     }
 
@@ -152,23 +157,28 @@ impl CoverProvider {
     /// `get()` call returns the updated data without an extra disk scan.
     /// Unlike `invalidate()`, this preserves the entry for dedup comparisons.
     pub(crate) fn update_entry(&self, album_id: &str, md5: &str, timestamp: Option<u64>) {
-        if let Ok(mut index) = self.index.write() {
-            index.insert(
-                album_id.to_string(),
-                IndexEntry {
-                    md5: md5.to_string(),
-                    timestamp,
-                },
-            );
-            log::debug!(
-                "[cover_provider] Updated index entry for '{album_id}' -> {md5}"
-            );
+        match self.index.write() {
+            Ok(mut index) => {
+                index.insert(
+                    album_id.to_string(),
+                    IndexEntry {
+                        md5: md5.to_string(),
+                        timestamp,
+                    },
+                );
+                log::debug!(
+                    "[cover_provider] Updated index entry for '{album_id}' -> {md5}"
+                );
+            }
+            Err(e) => log::error!("[cover_provider] RwLock poisoned (update_entry): {e}"),
         }
     }
 
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
-        self.index.read().map(|i| i.len()).unwrap_or(0)
+        self.index.read().map(|i| i.len()).map_err(|e| {
+            log::error!("[cover_provider] RwLock poisoned (len): {e}");
+        }).unwrap_or(0)
     }
 
     /// Returns true if the index is empty.
