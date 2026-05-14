@@ -54,7 +54,11 @@ impl CoverProvider {
     const WEBP_HEAD: [u8; 4] = [0x52, 0x49, 0x46, 0x46]; // RIFF
     const WEBP_TAIL: [u8; 4] = [0x57, 0x45, 0x42, 0x50]; // WEBP
 
+    /// Default max cache size (1000 MB) before LRU eviction.
+    pub const DEFAULT_MAX_SIZE_BYTES: u64 = 1000 * 1024 * 1024;
+
     /// Create a new CoverProvider, building the in-memory index from disk.
+    /// Runs orphaned file GC and LRU eviction at startup.
     ///
     /// If the cache directory cannot be created or the index file is corrupt,
     /// an empty index is used and warnings are logged. Never panics.
@@ -87,10 +91,15 @@ impl CoverProvider {
             }
         };
 
-        Self {
+        let provider = Self {
             cache_dir,
             index: RwLock::new(index),
-        }
+        };
+
+        provider.gc_orphaned_files();
+        provider.evict_lru(Self::DEFAULT_MAX_SIZE_BYTES);
+
+        provider
     }
 
     /// Look up a cached cover by album ID.
@@ -189,6 +198,104 @@ impl CoverProvider {
     /// Returns true if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Delete orphaned `.jpg` files in the cache directory not referenced by index.json.
+    /// Returns the number of files removed.
+    pub fn gc_orphaned_files(&self) -> u64 {
+        let index = match self.index.read() {
+            Ok(i) => i,
+            Err(e) => {
+                log::error!("[cover_provider] RwLock poisoned (gc_orphaned_files): {e}");
+                return 0;
+            }
+        };
+
+        let dir = match fs::read_dir(&self.cache_dir) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("[cover_provider] Cannot read cache dir for GC: {e}");
+                return 0;
+            }
+        };
+
+        let mut removed: u64 = 0;
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".jpg") {
+                continue;
+            }
+            let md5 = &name[..name.len() - 4];
+            if !index.values().any(|e| e.md5 == md5) {
+                if fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+
+        if removed > 0 {
+            log::info!(
+                "[cover_provider] GC removed {} orphaned .jpg files from {:?}",
+                removed,
+                self.cache_dir
+            );
+        }
+        removed
+    }
+
+    /// Evict least-recently-used cache entries until total cache size is under `max_size_bytes`.
+    /// Removes both the file and the index entry. Returns the number of files evicted.
+    pub fn evict_lru(&self, max_size_bytes: u64) -> u64 {
+        let mut index = match self.index.write() {
+            Ok(i) => i,
+            Err(e) => {
+                log::error!("[cover_provider] RwLock poisoned (evict_lru): {e}");
+                return 0;
+            }
+        };
+
+        // Collect files with their sizes and mtimes
+        let mut files: Vec<(String, u64, Option<std::time::SystemTime>)> = Vec::new();
+        let mut total_size: u64 = 0;
+        for entry in index.values() {
+            let path = self.cache_dir.join(format!("{}.jpg", entry.md5));
+            if let Ok(meta) = fs::metadata(&path) {
+                total_size += meta.len();
+                files.push((entry.md5.clone(), meta.len(), meta.modified().ok()));
+            }
+        }
+
+        if total_size <= max_size_bytes {
+            return 0;
+        }
+
+        // Sort by mtime ascending (oldest first)
+        files.sort_by(|a, b| a.2.cmp(&b.2));
+
+        let mut evicted: u64 = 0;
+        for (md5, size, _) in &files {
+            if total_size <= max_size_bytes {
+                break;
+            }
+            let path = self.cache_dir.join(format!("{md5}.jpg"));
+            if fs::remove_file(&path).is_ok() {
+                total_size = total_size.saturating_sub(*size);
+                index.retain(|_, v| &v.md5 != md5);
+                evicted += 1;
+            }
+        }
+
+        if evicted > 0 {
+            log::info!(
+                "[cover_provider] LRU evicted {} files (cache size after: {} MB)",
+                evicted,
+                total_size / (1024 * 1024)
+            );
+        }
+        evicted
     }
 
     // ── Private helpers ──

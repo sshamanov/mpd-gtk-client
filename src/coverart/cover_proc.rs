@@ -138,6 +138,11 @@ fn process_success(
     // Emit CoverPaths (path-based delivery for cached covers)
     emit_cover_path(key, &md5, cache_dir, event_tx);
 
+    // LRU eviction if cache exceeds size limit
+    if let Ok(ref prov) = provider.read() {
+        prov.evict_lru(CoverProvider::DEFAULT_MAX_SIZE_BYTES);
+    }
+
     // Decode JPEG → resize to 200×200 RGBA via image crate
     match decode_and_resize(data) {
         Ok(rgba) => {

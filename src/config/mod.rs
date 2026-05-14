@@ -55,6 +55,9 @@ pub struct Config {
     pub mpris: MprisConfig,
     #[serde(default)]
     pub notifications: NotificationsConfig,
+    /// Cover art cache settings.
+    #[serde(default)]
+    pub cover_cache: CoverCacheConfig,
     /// Named connection profiles (epic 15). Key = profile name.
     #[serde(default)]
     pub profiles: Option<HashMap<String, ProfileConfig>>,
@@ -125,6 +128,22 @@ pub struct NotificationsConfig {
     pub mode: NotificationMode,
 }
 
+/// Cover art cache settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverCacheConfig {
+    /// Maximum cache size in megabytes before LRU eviction kicks in (default: 1000).
+    #[serde(default = "default_cache_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+fn default_cache_max_size_mb() -> u64 { 1000 }
+
+impl Default for CoverCacheConfig {
+    fn default() -> Self {
+        Self { max_size_mb: 1000 }
+    }
+}
+
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
 
@@ -135,6 +154,7 @@ impl Default for Config {
             mpd_port: default_port(),
             mpris: MprisConfig { enabled: false },
             notifications: NotificationsConfig::default(),
+            cover_cache: CoverCacheConfig::default(),
             profiles: None,
             default_profile: None,
             last_profile: None,
