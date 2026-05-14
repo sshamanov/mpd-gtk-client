@@ -194,7 +194,7 @@ development_status:
   30-3-unix-socket-read-timeout: done
   30-4-cover-rwlock-poison: done
   30-5-insertnext-silent-noop: done
-  30-6-dead-atomicbool-statics: backlog
+  30-6-dead-atomicbool-statics: done
   30-7-cli-action-overwrite-warning: backlog
 
   epic-27: done
