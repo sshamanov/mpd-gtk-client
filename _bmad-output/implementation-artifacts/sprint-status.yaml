@@ -191,7 +191,7 @@ development_status:
   epic-30: in-progress
   30-1-albumart-first-chunk-reuse: done
   30-2-readpicture-version-check: done
-  30-3-unix-socket-read-timeout: backlog
+  30-3-unix-socket-read-timeout: done
   30-4-cover-rwlock-poison: backlog
   30-5-insertnext-silent-noop: backlog
   30-6-dead-atomicbool-statics: backlog
