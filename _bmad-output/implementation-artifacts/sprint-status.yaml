@@ -188,8 +188,8 @@ development_status:
   29-4-presenter-layer: done
   29-5-single-reducer: done
 
-  epic-30: backlog
-  30-1-albumart-first-chunk-reuse: backlog
+  epic-30: in-progress
+  30-1-albumart-first-chunk-reuse: done
   30-2-readpicture-version-check: backlog
   30-3-unix-socket-read-timeout: backlog
   30-4-cover-rwlock-poison: backlog
