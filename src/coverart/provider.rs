@@ -50,6 +50,9 @@ pub struct CoverProvider {
 
 impl CoverProvider {
     const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
+    const PNG_MAGIC: [u8; 4] = [0x89, 0x50, 0x4E, 0x47]; // ‰PNG
+    const WEBP_HEAD: [u8; 4] = [0x52, 0x49, 0x46, 0x46]; // RIFF
+    const WEBP_TAIL: [u8; 4] = [0x57, 0x45, 0x42, 0x50]; // WEBP
 
     /// Create a new CoverProvider, building the in-memory index from disk.
     ///
@@ -117,8 +120,10 @@ impl CoverProvider {
             return None;
         }
 
-        // Validate JPEG header — corrupt files are deleted
-        if !Self::is_valid_jpeg(&path) {
+        // Validate image header for known formats (JPEG, PNG, WebP).
+        // Non-JPEG images are accepted — GDK can load them from disk.
+        // Only truly corrupt files (no known magic bytes) are removed.
+        if !Self::is_valid_image(&path) {
             log::warn!(
                 "[cover_provider] Corrupt cache file for '{album_id}': {:?} — deleting",
                 path
@@ -201,17 +206,33 @@ impl CoverProvider {
         Ok(index)
     }
 
-    /// Check that a file has a valid JPEG header (FF D8 FF).
-    fn is_valid_jpeg(path: &Path) -> bool {
+    /// Check that a file has a valid image header (JPEG, PNG, or WebP).
+    fn is_valid_image(path: &Path) -> bool {
         let mut file = match fs::File::open(path) {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut header = [0u8; 3];
-        if file.read_exact(&mut header).is_err() {
-            return false;
+        let mut header = [0u8; 12];
+        match file.read_exact(&mut header) {
+            Ok(_) => {}
+            Err(_) => {
+                // File is too small for full header — try JPEG minimal check
+                return header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF;
+            }
         }
-        header == Self::JPEG_MAGIC
+        // JPEG
+        if header[0..3] == Self::JPEG_MAGIC {
+            return true;
+        }
+        // PNG
+        if header[0..4] == Self::PNG_MAGIC {
+            return true;
+        }
+        // WebP: RIFF .... WEBP
+        if header[0..4] == Self::WEBP_HEAD && header[8..12] == Self::WEBP_TAIL {
+            return true;
+        }
+        false
     }
 }
 

@@ -167,7 +167,10 @@ fn decode_and_resize(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(resized.into_raw())
 }
 
-/// Write cover JPEG data to disk cache (md5-named file) and update index.json.
+/// Write cover data to disk cache normalized as JPEG (md5-named file) and update index.json.
+///
+/// If the MPD returns non-JPEG data (PNG, WebP), it is decoded and re-encoded to JPEG
+/// before writing. The MD5 hash is always computed from the original MPD binary data.
 fn write_cache(
     album_key: &str,
     data: &[u8],
@@ -175,18 +178,53 @@ fn write_cache(
     timestamp: Option<u64>,
     cache_dir: &Path,
 ) {
+    let jpeg_data = ensure_jpeg(data);
     let jpeg_path = cache_dir.join(format!("{md5}.jpg"));
-    if let Err(e) = fs::write(&jpeg_path, data) {
+    if let Err(e) = fs::write(&jpeg_path, &jpeg_data) {
         log::warn!("[cover-proc] Failed to write cache for '{album_key}': {e}");
     } else {
         log::info!(
             "[cover-proc] Cached cover for '{album_key}' at {:?} ({} bytes)",
             jpeg_path,
-            data.len()
+            jpeg_data.len()
         );
     }
 
     update_index_json(cache_dir, album_key, md5, timestamp);
+}
+
+/// If data is already JPEG, return it unchanged. Otherwise decode and re-encode as JPEG.
+fn ensure_jpeg(data: &[u8]) -> Vec<u8> {
+    if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        return data.to_vec();
+    }
+    match image::load_from_memory(data) {
+        Ok(img) => {
+            let mut buf = Vec::new();
+            match img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg) {
+                Ok(_) => {
+                    log::info!(
+                        "[cover-proc] Converted non-JPEG ({} bytes) to JPEG ({} bytes)",
+                        data.len(),
+                        buf.len()
+                    );
+                    buf
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[cover-proc] JPEG re-encode failed: {e}, writing original data"
+                    );
+                    data.to_vec()
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "[cover-proc] Non-JPEG decode failed: {e}, writing original data"
+            );
+            data.to_vec()
+        }
+    }
 }
 
 /// Update the index.json sidecar file with a new or updated entry.
