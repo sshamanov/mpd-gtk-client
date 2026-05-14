@@ -186,7 +186,7 @@ development_status:
   29-2-gtklayout-grid-migration: done
   29-3-now-playing-consolidation: done
   29-4-presenter-layer: done
-  29-5-single-reducer: backlog
+  29-5-single-reducer: in-progress
 
   epic-30: backlog
   30-1-albumart-first-chunk-reuse: backlog
