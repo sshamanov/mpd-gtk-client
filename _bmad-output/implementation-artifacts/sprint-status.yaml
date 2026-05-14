@@ -185,7 +185,7 @@ development_status:
   29-1-image-crate-migration: done
   29-2-gtklayout-grid-migration: done
   29-3-now-playing-consolidation: done
-  29-4-presenter-layer: backlog
+  29-4-presenter-layer: ready-for-dev
   29-5-single-reducer: backlog
 
   epic-30: backlog
