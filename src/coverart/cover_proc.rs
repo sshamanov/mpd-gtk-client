@@ -151,10 +151,14 @@ fn process_success(
                 data.len(),
                 rgba.len()
             );
-            let _ = event_tx.try_send(MpdEvent::CoverRefreshed {
+            if let Err(e) = event_tx.try_send(MpdEvent::CoverRefreshed {
                 album_id: key.to_string(),
                 data: rgba,
-            });
+            }) {
+                log::warn!(
+                    "[cover-proc] Failed to send CoverRefreshed for '{key}': {e:?}"
+                );
+            }
         }
         Err(e) => {
             log::warn!("[cover-proc] '{key}': JPEG decode failed ({e}), skipping CoverRefreshed (placeholder fallback)");
@@ -305,5 +309,14 @@ fn emit_cover_path(
     } else {
         covers.insert(album_key.to_string(), None);
     }
-    let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
+    if let Err(e) = event_tx.try_send(MpdEvent::CoverPaths(covers)) {
+        static FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n % 10 == 1 {
+            log::warn!(
+                "[cover-proc] Failed to send CoverPaths ({} total drops): {e:?}",
+                n
+            );
+        }
+    }
 }

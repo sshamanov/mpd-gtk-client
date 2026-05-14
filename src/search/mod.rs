@@ -38,7 +38,11 @@ impl SearchIndex {
                 idx.entry(token).or_default().push(i);
             }
         }
-        if let Ok(mut guard) = self.index.write() { *guard = idx; }
+        if let Ok(mut guard) = self.index.write() {
+            *guard = idx;
+        } else {
+            log::error!("[search] RwLock poisoned (build), search index not updated");
+        }
     }
 
     /// Return the number of indexed albums.

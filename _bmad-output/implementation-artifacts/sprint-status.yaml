@@ -200,14 +200,14 @@ development_status:
   epic-27: done
   27-1-responsive-right-rail: done
 
-  epic-31: backlog
+  epic-31: done
   31-1-guard-multiple-cover-proc-workers: done
   31-2-prevent-mpd-cover-thread-stall: done
   31-3-handle-non-jpeg-covers: done
   31-4-jpeg-decode-size-guard: done
   31-5-atomic-index-json-corruption-recovery: done
   31-6-orphaned-cache-file-gc: done
-  31-7-log-cover-silent-failures: backlog
+  31-7-log-cover-silent-failures: done
 
   epic-32: backlog
   32-1-searchresults-generation-counter: backlog
