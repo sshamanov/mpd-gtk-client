@@ -159,8 +159,26 @@ fn process_success(
     }
 }
 
+/// Maximum image dimension accepted for decode (width or height).
+/// 4096×4096 → 64 MB RGBA intermediate buffer, well within safe limits for real album art.
+/// Rejects MPD protocol maximum 16384×16384 (1 GB buffer) to prevent OOM.
+const MAX_DIM: u32 = 4096;
+
 /// Decode JPEG bytes via the `image` crate and resize to 200×200 RGBA (Lanczos3).
+///
+/// Checks image dimensions via header parse before full decode — rejects images
+/// exceeding `MAX_DIM` to avoid allocating an intermediate RGBA buffer large enough
+/// to OOM the process.
 fn decode_and_resize(data: &[u8]) -> Result<Vec<u8>, String> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("{e}"))?;
+    let (w, h) = reader.into_dimensions().map_err(|e| format!("{e}"))?;
+    if w > MAX_DIM || h > MAX_DIM {
+        return Err(format!(
+            "image dimensions {w}x{h} exceed MAX_DIM ({MAX_DIM}), rejecting to prevent OOM"
+        ));
+    }
     let img = image::load_from_memory(data).map_err(|e| format!("{e}"))?;
     let rgba = img.to_rgba8();
     let resized = image::imageops::resize(&rgba, 200, 200, FilterType::Lanczos3);
