@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-13"
+last_updated: "2026-05-14"
 
 
 project: mpd-client
@@ -199,3 +199,29 @@ development_status:
 
   epic-27: done
   27-1-responsive-right-rail: done
+
+  epic-31: backlog
+  31-1-guard-multiple-cover-proc-workers: done
+  31-2-prevent-mpd-cover-thread-stall: backlog
+  31-3-handle-non-jpeg-covers: backlog
+  31-4-jpeg-decode-size-guard: backlog
+  31-5-atomic-index-json-corruption-recovery: backlog
+  31-6-orphaned-cache-file-gc: backlog
+  31-7-log-cover-silent-failures: backlog
+
+  epic-32: backlog
+  32-1-searchresults-generation-counter: backlog
+  32-2-fix-search-race-on-reconnect: backlog
+  32-3-remove-mpd-search-fallback: backlog
+
+  epic-33: backlog
+  33-1-join-notification-router-thread: backlog
+  33-2-selective-event-cloning-for-router: backlog
+  33-3-document-toast-channel-sizing: backlog
+  33-4-extract-toast-timeout-constants: backlog
+
+  epic-34: backlog
+  34-1-eliminate-redundant-config-load: backlog
+  34-2-guard-backspace-at-root: backlog
+  34-3-fix-notifications-doc-comment: backlog
+  34-4-log-image-decode-failures: backlog

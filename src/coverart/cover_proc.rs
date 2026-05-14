@@ -42,7 +42,13 @@ pub fn spawn(
     cover_provider: Arc<RwLock<CoverProvider>>,
     cache_dir: std::path::PathBuf,
     stop: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) {
+    // Atomically acquire the running guard — only one Cover Proc worker at a time.
+    if running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        log::warn!("[cover-proc] Another Cover Proc worker is still running, skipping spawn");
+        return;
+    }
     std::thread::Builder::new()
         .name("cover-proc".into())
         .spawn(move || {
@@ -78,6 +84,7 @@ pub fn spawn(
                 }
             }
 
+            running.store(false, Ordering::Release);
             log::info!("[cover-proc] Thread terminated");
         })
         .expect("Failed to spawn cover-proc thread");

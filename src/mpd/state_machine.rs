@@ -322,6 +322,7 @@ impl MpdEventLoop {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let stop_search = stop.clone();
+        let cover_proc_running = Arc::new(AtomicBool::new(false));
         let metadata_cache = std::sync::Arc::new(crate::metadata::MetadataCache::new());
         let mc_thread = metadata_cache.clone();
 
@@ -379,7 +380,7 @@ impl MpdEventLoop {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
                                     mc_thread.clear();
                                     let cover_target = target.clone();
-                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread, cover_target);
+                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread, cover_target, &cover_proc_running);
                                     // When connected_loop exits, connection was lost.
                                     // Preserve backoff across the reconnect cycle.
                                     let backoff = ExponentialBackoff::new();
@@ -466,6 +467,7 @@ fn connected_loop(
     noidle_socket: Arc<Mutex<Option<MpdStream>>>,
     metadata_cache: &crate::metadata::MetadataCache,
     cover_target: ConnectionTarget,
+    cover_proc_running: &Arc<AtomicBool>,
 ) {
     let mut last_status = Instant::now();
     let mut last_song_pos: Option<u32>;
@@ -493,6 +495,7 @@ fn connected_loop(
         cover_provider.clone(),
         cache_dir.clone(),
         stop.clone(),
+        cover_proc_running.clone(),
     );
 
     // Set the stream clone for the main thread's CommandSender

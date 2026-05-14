@@ -1461,3 +1461,410 @@ As a user browsing by album grid, I want to choose between sort modes, so that I
 **Then** the sort applies within each group
 
 **Technical Notes:** Sort operates on the album list already cached in memory. See architecture.md §1131 for full sort strategy design.
+
+---
+
+## Epic 31: Cover Pipeline Reliability
+
+**Goal:** Fix bugs in the cover art pipeline identified during code review of epics 28-2 and 29-1. These include data corruption risks (multiple Cover Proc workers, non-atomic index.json writes), crash risks (no JPEG size guard, blocking send without timeout), and silent failure paths (RwLock poison, try_send drops, decode failures).
+
+**Deferred from:** Code review 28-2-cover-proc-worker and 29-1-image-crate-migration (2026-05-13)
+
+### Story 31.1: Guard Against Multiple Cover Proc Workers on Reconnect
+
+As a developer, I want only one Cover Proc worker thread active at a time, so that concurrent index.json writes from multiple workers cannot corrupt the cache index.
+
+**Acceptance Criteria:**
+
+**Given** the MPD connection drops and reconnects
+**When** a new Cover Proc worker is spawned before the old one has fully terminated
+**Then** the new spawn is blocked until the old worker has exited
+**And** index.json is never read or written by two threads simultaneously
+
+**Given** the Cover Proc worker is running normally
+**When** the shutdown signal is sent
+**Then** the worker drains its remaining queue before exiting (or after a timeout)
+
+**Technical Notes:** The race window exists because `cover_proc::spawn()` is called during reconnection without ensuring the previous worker has stopped. Fix: use an `Arc<AtomicBool>` as a "permit" — the spawn function checks and sets it atomically; the old worker clears it on exit. Alternatively, use a `thread::JoinHandle` stored on `MpdEventLoop` and `join()` before re-spawning. The index.json file is read at spawn time and written after each cache update — concurrent writes from multiple workers produce inconsistent state.
+
+### Story 31.2: Prevent MPD Cover Thread Stall When Cover Proc Panics
+
+As a developer, I want the MPD Cover thread to detect when the Cover Proc worker has stopped consuming results, so that the MPD Cover thread does not block forever on a full channel.
+
+**Acceptance Criteria:**
+
+**Given** the Cover Proc worker panics and stops consuming from the result channel
+**When** the MPD Cover thread attempts `result_tx.send(result)`
+**Then** the send does not block indefinitely
+**And** the MPD Cover thread detects the stall and exits or reconnects
+**And** a log message is emitted at error level
+
+**Given** the Cover Proc worker is running normally
+**When** the MPD Cover thread sends results
+**Then** behavior is unchanged — results are delivered as before
+
+**Technical Notes:** `mpsc::SyncSender::send()` blocks when the channel buffer is full. If the Cover Proc worker panics, it stops receiving, the channel fills up, and the MPD Cover thread blocks forever. The `result_tx` in `cover.rs` uses `let _ = result_tx.send(...)` which is blocking. Fix options: (a) use `send_timeout` from a crossbeam channel, (b) spawn a monitoring thread that checks the `stop` flag, (c) use `try_send` with a retry-and-check-stop loop. Option (b) or (c) keeps the existing `std::sync::mpsc` channel. The detect-and-reconnect path should log a warning and let the idle timeout (30s) close the thread naturally.
+
+### Story 31.3: Handle Non-JPEG Cached Covers Without Delete Loop
+
+As a developer, I want non-JPEG cover images (PNG, WebP) cached as `.jpg` to be handled gracefully, so that they don't enter an infinite delete-recycle loop via `CoverProvider::is_valid_jpeg`.
+
+**Acceptance Criteria:**
+
+**Given** the cache contains a non-JPEG file with a `.jpg` extension (e.g., PNG or WebP cover data)
+**When** `CoverProvider::get(album_id)` is called
+**Then** the file is detected as non-JPEG (header check fails)
+**And** instead of deleting the file and returning None (which triggers re-fetch and re-cache as .jpg, creating a loop), the provider either:
+  - Returns a CachedCover with a note that it's non-JPEG (for the caller to handle), or
+  - Converts the non-JPEG to JPEG on first access, or
+  - Marks the entry as "known non-JPEG" to skip future re-fetches
+
+**Given** a non-JPEG cover is fetched from MPD (albumart returns PNG data)
+**When** `write_cache` is called
+**Then** the data is converted to JPEG before being written to disk as `.jpg`
+**Or** the cache uses the actual file extension (.png, .webp) and the index tracks it
+
+**Technical Notes:** The root cause is that `albumart` returns whatever format MPD has (often JPEG, but can be PNG), and the cache always writes to `{md5}.jpg`. Then `CoverProvider::is_valid_jpeg` rejects non-JPEG files, calls `fs::remove_file`, and `invalidate()` — causing the next fetch cycle to re-cache the same non-JPEG data as .jpg, which is then immediately deleted again. Fix options: (a) in `write_cache`, detect the actual image format from magic bytes and convert to JPEG via the `image` crate before writing, (b) use the actual format extension in the cache filename and update `is_valid_jpeg` to check for multiple formats, (c) skip the `is_valid_jpeg` check entirely and rely on the `image::load_from_memory` decode in the Cover Proc worker to validate. Option (a) is preferred — it normalizes all cached covers to JPEG in `write_cache`, which is already in the cover_proc thread where image processing is expected.
+
+### Story 31.4: JPEG Decode Size Guard
+
+As a developer, I want the JPEG decode path in the Cover Proc worker to reject images larger than a configured maximum dimension, so that the intermediate RGBA buffer (4 bytes per pixel) does not cause an OOM crash.
+
+**Acceptance Criteria:**
+
+**Given** the Cover Proc worker receives a very large cover image (e.g., 16384x16384 pixels, the MPD protocol maximum)
+**When** `decode_and_resize()` processes the raw bytes
+**Then** the function checks whether the decoded image dimensions (width, height) exceed a maximum threshold (default: 4096x4096 pixels, ~64MB RGBA)
+**And** if exceeded, the image is rejected with a warning log and no CoverRefreshed event is emitted
+**And** the existing CoverPaths event (for disk-cached fallback) is still emitted so the UI can load the JPEG from disk via GDK's built-in decoder
+
+**Given** a normal cover image (e.g., 500x500 pixels)
+**When** `decode_and_resize()` processes the data
+**Then** behavior is unchanged — decode, resize to 200x200, emit RGBA
+
+**Technical Notes:** The `image::load_from_memory` call decodes the full image into memory before resize. A 16384x16384 RGBA buffer = 1GB. The current 200x200 target zoom has no impact on intermediate memory. Fix: decode the image header first to get dimensions (`image::image_dimensions()`), check against a MAX_DIM constant (4096 pixels), reject if exceeded. Use `image::load_from_memory` only after the size check passes. The JPEG can still be served from disk cache via GDK's built-in decoder (which has its own size guards) — so the CoverPaths event provides a safe fallback.
+
+### Story 31.5: Atomic index.json with Corruption Recovery and Failed Write Protection
+
+As a developer, I want the cover cache index.json to be updated atomically and to handle corruption without silently losing all entries, so that the cache remains consistent across crashes and transient errors.
+
+**Acceptance Criteria:**
+
+**Given** index.json is corrupt (invalid JSON, truncated)
+**When** `CoverProvider::load_index()` is called at startup
+**Then** the corrupt file is backed up to `index.json.bad` (not silently replaced with empty map)
+**And** a warning log includes the backup path
+**And** the provider starts with an empty index (same behavior as before, but with a recoverable backup)
+
+**Given** a JPEG write to cache via `fs::write()` fails (disk full, permissions)
+**When** `write_cache` completes
+**Then** `update_index_json` is NOT called (the index should not reference a file that was not written)
+**And** a warning is logged about the skipped index update
+
+**Given** index.json is updated after a successful cache write
+**When** the temp-file-plus-rename pattern is used
+**Then** `fs::write` writes to `index.json.tmp` first
+**And** `fs::rename` atomically replaces `index.json` with `index.json.tmp`
+**And** if either step fails, the original `index.json` is preserved
+
+**Technical Notes:** The temp-file-plus-rename pattern already exists in `update_index_json` (lines 194-223 of cover_proc.rs), but `update_index_json` is called unconditionally after `write_cache` (line 182) even when `fs::write` for the JPEG fails. The fix: move `update_index_json` inside the success branch of `fs::write`. For corrupt index.json at startup (`provider.rs` line 199-200), replace `unwrap_or_default()` with a backup-then-warn approach that saves the corrupt file before creating a fresh index.
+
+### Story 31.6: Orphaned Cache File GC / LRU Eviction
+
+As a developer, I want orphaned `{md5}.jpg` files in the cover cache to be cleaned up, so that the cache directory does not grow unboundedly when album art changes.
+
+**Acceptance Criteria:**
+
+**Given** the cover cache contains `.jpg` files that are no longer referenced by any entry in `index.json`
+**When** the application starts (or periodically, e.g., every 1000 cache writes)
+**Then** orphaned files are deleted
+**And** a debug log reports the number of files removed
+
+**Given** the cache directory exceeds a configurable size limit (default: 1GB)
+**When** a new cover is written to cache
+**Then** old or least-recently-used entries are evicted until the cache size is below the limit
+**And** evicted entries are removed from index.json atomically
+
+**Technical Notes:** GC scan: list all `.jpg` files in the cache directory, cross-reference against all MD5 hashes in `index.json`, delete unreferenced files. LRU: track last-access time (from filesystem mtime or an in-memory LRU list), evict oldest entries when over budget. The GC runs at startup (fast scan) and optionally on a background timer. Configurable via `[cover_cache] max_size_mb = 1000` in config.toml. Must not run concurrently with cache writes — coordinate via the Cover Proc worker's lifecycle.
+
+### Story 31.7: Log Cover Pipeline Silent Failure Paths
+
+As a developer, I want silent failure paths in the cover pipeline to log diagnostic messages, so that operational issues are detectable without digging through every `if let Ok` pattern.
+
+**Acceptance Criteria:**
+
+**Given** `CoverProvider`'s `RwLock` is poisoned
+**When** any method (`get`, `invalidate`, `update_entry`, `len`) encounters a poisoned lock
+**Then** the existing `log::error!` call is confirmed to exist (or added if missing)
+**And** all call sites are audited for consistent error logging
+
+**Given** `try_send` fails when emitting `CoverPaths` or `CoverRefreshed` events (channel full)
+**When** the send is dropped
+**Then** a `log::warn!` message is emitted at most once per burst (rate-limited)
+**And** the message includes the event type and album ID
+
+**Given** the `image::open` decode in `decode_and_resize` fails
+**When** the `if let Ok` pattern silently skips the failure
+**Then** a `log::warn!` message is emitted with the error details
+
+**Given** `fs::write` to the cache directory fails
+**When** the JPEG file write fails
+**Then** a warning is already logged (verify existing behavior)
+**And** the related `update_index_json` is NOT called (handled by story 31.5)
+
+**Technical Notes:** Audit all `if let Ok` patterns in `cover_proc.rs`, `provider.rs`, and `actual_read.rs`. Current state: `provider.rs` already logs `RwLock` poison at error level (lines 103, 150, 162, 173, 180). Other call sites may be inconsistent. The `try_send` failures use `let _ = ...` which silently discards the error — replace with `if let Err(e) = ... { log::warn!(...) }`. The `if let Ok` pattern on line 42 of `search/mod.rs` for the RwLock write guard is a consistent pattern but misses diagnostics — add `log::error!` before the `return Vec::new()` in `search()`.
+
+---
+
+## Epic 32: Search Worker Data Integrity
+
+**Goal:** Fix data integrity bugs in the search worker identified during code review of epic 28-3. Stale search results can overwrite fresh results (no generation counter), search during reconnection returns empty results (race between Reset and BuildIndex), and every local search also triggers an unnecessary MPD Search command.
+
+**Deferred from:** Code review 28-3-search-worker-thread (2026-05-13)
+
+### Story 32.1: Generation Counter for SearchResults
+
+As a developer, I want `SearchResults` events to carry a generation counter, so that the UI can discard stale results from slow queries that arrive after newer queries have completed.
+
+**Acceptance Criteria:**
+
+**Given** the user types a search query rapidly (e.g., "a" then "ab" within 200ms)
+**When** the first query's results arrive after the second query's results
+**Then** the UI discards the first (stale) result set
+**And** only the second (latest) result set is displayed
+**And** no flicker or race between old and new results is visible
+
+**Given** the search worker emits `MpdEvent::SearchResults`
+**When** the event is constructed
+**Then** it includes a monotonically incrementing generation counter
+**And** the UI stores the latest generation number and compares before applying results
+
+**Technical Notes:** The UI already has a generation counter for debounced input (`search_gen` in ui/mod.rs, line 728). However, this counter is never sent to the search worker, so the worker's `SearchResults` response doesn't carry it back. Fix: add `generation: u64` to the `SearchCommand::Search` variant, have the worker echo it back in `MpdEvent::SearchResults`, and have the UI compare `event.generation == local_generation` before applying. The `MpdEvent::SearchResults` enum variant currently wraps `Vec<(String, String)>` — change to `SearchResults { results: Vec<(String, String)>, generation: u64 }`. Check all match arms on `MpdEvent::SearchResults` in `ui/mod.rs`.
+
+### Story 32.2: Fix Search Race on Reconnect
+
+As a user reconnecting to MPD, I want the search index to be ready before search is available, so that searches during reconnection do not silently return empty results.
+
+**Acceptance Criteria:**
+
+**Given** the MPD connection is re-established
+**When** `MpdEvent::Connected` fires
+**Then** the search index is reset (`SearchCommand::Reset`)
+**And** `ListAlbumsGrouped` is sent to fetch fresh album data
+**When** the `MpdEvent::Albums` response arrives
+**Then** `SearchCommand::BuildIndex` is sent with the fresh album data
+**And** only after `BuildIndex` completes is search available
+**And** any `SearchCommand::Search` received before `BuildIndex` returns empty results (preferred over stale results)
+
+**Given** the user searches during the Connected→Albums window
+**When** the search worker receives a `Search` command before `BuildIndex`
+**Then** it returns empty results (index is empty, no panic)
+**And** the UI shows "Indexing..." or a neutral state (not "no matches found" for the query)
+**And** a debug log indicates the search was attempted before index was built
+
+**Technical Notes:** The race: `Connected` fires → `SearchCommand::Reset` is sent → the user can search immediately because the UI is already interactive → `SearchCommand::Search` arrives at the worker before `BuildIndex` completes → the empty index returns no results. The fix is lightweight: in the search worker, track whether an index has been built (`index.album_count() > 0`), and if a `Search` arrives with no index, return `MpdEvent::SearchIndexing` (a new event variant) instead of `SearchResults`. The UI handles `SearchIndexing` by showing "Indexing..." placeholder or suppressing results. The `MpdEvent` enum already has a `SearchResults` variant — add `SearchIndexing` as a new variant with no payload.
+
+### Story 32.3: Remove Unconditional MPD Search Fallback
+
+As a developer, I want local search queries to not also trigger a full MPD `search` command, so that MPD traffic is not doubled on every keystroke and result races between local and MPD results are eliminated.
+
+**Acceptance Criteria:**
+
+**Given** the user types a search query in Album Mode
+**When** the debounced search fires
+**Then** only `SearchCommand::Search(query)` is sent to the local search worker
+**And** the unconditional `MpdCommand::Search(query)` on line 785 of `ui/mod.rs` is NOT sent
+
+**Given** the local search worker returns results
+**When** `MpdEvent::SearchResults` arrives at the UI
+**Then** results are displayed as currently implemented (no change to display logic)
+
+**Technical Notes:** Line 784-785 in `ui/mod.rs`:
+```rust
+scmd.send(SearchCommand::Search(qc.clone()));
+let _ = tx.send(MpdCommand::Search(qc));  // Remove this line
+```
+The MPD `Search` fallback was added before the local search worker existed. Now that the local search worker (story 28-3) handles all queries with an in-memory index, the MPD fallback is redundant. The MPD round-trip adds 50-200ms latency per keystroke and creates a race condition where MPD results arrive after the debounce timeout and overwrite local results. Remove the MPD `Search` send entirely. The `MpdCommand::Search` variant and its handler in `state_machine.rs` can be kept for other uses (e.g., explicit search from CLI or future features) but should no longer be called from the search-changed handler.
+
+---
+
+## Epic 33: Notification Router Lifecycle
+
+**Goal:** Fix lifecycle and efficiency issues in the Notification Router identified during code review of epic 28-4. These include a resource leak (thread never joined), memory waste (full MpdEvent clone when only Toast/Connected/Disconnected needed), and code quality items (documentation for channel sizing, hardcoded timeout constants).
+
+**Deferred from:** Code review 28-4-notification-router (2026-05-13)
+
+### Story 33.1: Join Notification Router Thread on Shutdown
+
+As a developer, I want the notification-router thread to be joined on shutdown, so that the thread's resources are properly cleaned up and we can verify it exited cleanly.
+
+**Acceptance Criteria:**
+
+**Given** the application is shutting down
+**When** `notif_stop.store(true, ...)` is called
+**Then** the notification-router thread exits within 500ms
+**And** the main thread calls `join()` on the thread handle (with 1-second timeout)
+**And** if the thread does not exit in time, a warning is logged but shutdown proceeds
+
+**Given** the notification-router thread is running normally
+**When** the shutdown signal is sent
+**Then** the thread's main loop exits at the next `if stop.load(...)` check
+**And** a `log::info!("[notification-router] Thread terminated")` message is logged
+
+**Technical Notes:** Currently `notifications::router::spawn()` returns nothing — the `JoinHandle` from `std::thread::Builder::spawn()` is discarded. The `spawn()` function should return `JoinHandle<()>` so the caller (`main.rs`) can store it and call `join()` on shutdown. The join should have a timeout: `handle.join()` blocks indefinitely, so either use `handle.is_finished()` polling with `thread::park_timeout` (similar to the existing MPD event loop join pattern in main.rs lines 300-312) or use `handle.thread().unpark()` + `handle.join()`. The existing pattern in main.rs handles this well — follow it.
+
+### Story 33.2: Selective MpdEvent Cloning for Router Forwarding
+
+As a developer, I want only the `MpdEvent` variants that the Notification Router actually processes to be cloned and forwarded, so that large event variants (CoverRefreshed with JPEG data, AlbumTracks with Vec<path>) are not unnecessarily cloned on every frame.
+
+**Acceptance Criteria:**
+
+**Given** any `MpdEvent` is received by the GTK thread's event loop
+**When** `event.clone()` on line 1953 of `ui/mod.rs` executes
+**Then** the clone is replaced with a selective match that only clones variants needed by the Notification Router (`Toast`, `Connected`, `Disconnected`)
+**And** for all other variants, no clone occurs and `ftx.try_send` is skipped entirely
+
+**Given** `mpd-event` channel carries a `CoverRefreshed` with 160KB of RGBA data
+**When** the event is processed by the GTK thread
+**Then** the cover data is NOT cloned for the Notification Router
+**And** the UI still processes the event normally for cover updates
+
+**Technical Notes:** Current code (ui/mod.rs lines 1953 and 2598):
+```rust
+let fwd = event.clone();
+// ... process event ...
+let _ = ftx.try_send(fwd);
+```
+Replace with a match that extracts only the router-relevant data:
+```rust
+let router_event = match &event {
+    MpdEvent::Toast { .. } | MpdEvent::Connected | MpdEvent::Disconnected => Some(event.clone()),
+    _ => None,
+};
+// ... process event ...
+if let Some(ev) = router_event {
+    let _ = ftx.try_send(ev);
+}
+```
+This ensures large variants (CoverRefreshed, AlbumTracks, Queue, Albums, SearchResults) are not cloned for the router. The router ignores everything except Toast/Connected/Disconnected anyway (confirmed in router.rs `handle_event`).
+
+### Story 33.3: Document Toast Channel Sizing
+
+As a developer, I want the sizing rationale for the Toast channel (256), event channel (1024), and search channel (64) documented, so that future maintainers understand the capacity planning.
+
+**Acceptance Criteria:**
+
+**Given** the channel instantiation sites
+**When** a developer reads the code
+**Then** each channel's buffer size is accompanied by a comment explaining the rationale for the chosen capacity
+**And** the three channel sizes are cross-referenced with their relative throughput expectations
+
+**Technical Notes:** Sites to document:
+- `main.rs` line 260: `mpsc::sync_channel::<MpdEvent>(256)` — Toast/NotificationRouter channel
+- `state_machine.rs` line 329: `mpsc::sync_channel::<SearchCommand>(64)` — Search worker command channel
+- Backpressure strategy: when any of these channels fill up, `try_send` drops the event. The capacity should be large enough to absorb bursts during normal operation (e.g., rapid album grid scrolling generates many cover events) but small enough that backpressure signals congestion quickly. Document the expected burst profile: Toast events are rare (connection state changes, at most a few per minute); Search commands are triggered by keystrokes (max ~1 per 150ms debounce). A one-line comment per channel is sufficient.
+
+### Story 33.4: Extract Hardcoded Toast Timeout Constants
+
+As a developer, I want toast timeout values defined as named constants, so that they are shared between the ToastLevel documentation and the timeout dispatch logic.
+
+**Acceptance Criteria:**
+
+**Given** the toast timeout values are currently hardcoded in a match arm in `ui/mod.rs` (lines 2588-2591)
+**When** the code is inspected
+**Then** the timeout values are defined as named constants (e.g., `const TOAST_TIMEOUT_ERROR: u32 = 0;` for persistent, `const TOAST_TIMEOUT_WARN: u32 = 5;` for warning, `const TOAST_TIMEOUT_INFO: u32 = 3;` for info)
+**And** the constants are defined either in `state_machine.rs` alongside the `ToastLevel` enum or in a shared module
+**And** a doc comment on each constant explains the user-visible duration
+
+**Technical Notes:** Current match arm (lines 2588-2591 in ui/mod.rs):
+```rust
+crate::mpd::state_machine::ToastLevel::Error => 0,     // persistent
+crate::mpd::state_machine::ToastLevel::Warn => 5,       // 5 seconds
+crate::mpd::state_machine::ToastLevel::Info => 3,       // 3 seconds
+```
+These should become named constants in `src/mpd/state_machine.rs` alongside the `ToastLevel` enum:
+```rust
+impl ToastLevel {
+    pub const fn default_timeout_seconds(&self) -> u32 {
+        match self {
+            ToastLevel::Error => 0,   // persistent (no auto-dismiss)
+            ToastLevel::Warn => 5,    // 5 seconds
+            ToastLevel::Info => 3,    // 3 seconds
+        }
+    }
+}
+```
+The constants serve as both documentation of the timeout policy and the single source of truth for the actual values.
+
+---
+
+## Epic 34: General Code Quality
+
+**Goal:** Fix minor code quality issues identified during code reviews — redundant I/O (config loaded twice), incorrect behavior (BackSpace at root sends empty path), misleading documentation, and silent error paths.
+
+**Deferred from:** Code reviews 28-2, 28-4, and 29-1 (2026-05-13)
+
+### Story 34.1: Eliminate Redundant Config::load() Call
+
+As a developer, I want `Config::load()` called only once during startup, so that the TOML file is not parsed twice when the window close handler is set up.
+
+**Acceptance Criteria:**
+
+**Given** the application starts
+**When** the startup sequence runs
+**Then** `Config::load()` is called exactly once (in `main.rs` line 164-167 or equivalent)
+**And** the window close handler (`ui/mod.rs` line 394) reuses the already-loaded config instead of calling `Config::load()` again
+
+**Given** the window close handler saves geometry
+**When** the user resizes the window and closes it
+**Then** the geometry is still saved correctly
+**And** the saved config preserves all fields from the originally loaded config plus the geometry update
+
+**Technical Notes:** Two options: (a) pass the loaded config reference into the close handler closure, or (b) read the geometry from `Config` once and store it, then save a minimal struct. Option (a) is simpler: capture the loaded config in the `application.connect_activate` closure and pass it into the close handler. The config is already loaded in `main.rs` and can be threaded through `App::new()` or captured in the activate closure. Currently the close handler at `ui/mod.rs` line 394 calls `Config::load()` independently — remove that call and use the already-loaded config.
+
+### Story 34.2: Guard BackSpace at Root in Folder Tree
+
+As a developer, I want pressing BackSpace at the root of the folder tree to be a no-op, so that an empty string is never sent as a `ListDirectory` command.
+
+**Acceptance Criteria:**
+
+**Given** the folder tree is at the root level (no parent directory)
+**When** the user presses BackSpace or Left arrow
+**Then** the key press is consumed without sending any MPD command
+**And** a debug log notes that the user is at the root level
+
+**Given** the folder tree is at a non-root level (has a parent)
+**When** the user presses BackSpace or Left arrow
+**Then** the existing behavior is preserved — the parent directory is navigated to via `ListDirectory(parent)`
+
+**Technical Notes:** In `src/ui/widgets/folder_tree.rs`, the BackSpace/Left handler at line 115 unconditionally computes a parent path and sends `ListDirectory(parent)`. When already at root, the parent is an empty string. Add a guard: check if `dir_path` (the current root of the breadcrumb) is empty or is "/" — if so, return without sending any command. The `parent` computation on line 110-111 already handles this case poorly (produces ""). Fix: check before constructing the command whether a parent actually exists.
+
+### Story 34.3: Fix Misleading Notifications Module Doc Comment
+
+As a developer, I want the notifications module doc comment to accurately describe the event flow, so that future maintainers are not confused by "architecture-speak" leaking into documentation.
+
+**Acceptance Criteria:**
+
+**Given** the `src/notifications/mod.rs` file
+**When** line 3 is read
+**Then** the comment `Two paths for toast events after 'reduce()':` is corrected to accurately describe that toast events arrive from the GTK thread's event loop via the `toast_tx` channel, not after a `reduce()` call
+**And** the updated comment briefly explains the two actual paths (GTK in-app toast overlay + D-Bus desktop notification)
+
+**Technical Notes:** The `reduce()` function exists in `src/state/mod.rs` and processes state changes, but it has nothing to do with routing events to the notification router. The doc comment should be updated to reflect the actual architecture: the GTK thread receives all `MpdEvent`s from the event channel, processes them (including calling `reduce()` for state), and then forwards `Toast`/`Connected`/`Disconnected` variants to the Notification Router via the `toast_tx` channel.
+
+### Story 34.4: Add Diagnostic Log for image::open Decode Failures
+
+As a developer, I want `image::open` decode failures in the Cover Proc worker to produce a diagnostic log message, so that corrupted cover files in the cache are traceable without requiring deep code inspection.
+
+**Acceptance Criteria:**
+
+**Given** a cover JPEG file on disk is corrupted or truncated
+**When** the Cover Proc worker calls `image::load_from_memory(data)` in `decode_and_resize`
+**Then** if the decode fails, a `log::warn!` message is emitted including the album key and error details
+**And** the `Err` path returns gracefully (existing behavior, unchanged)
+
+**Given** a cover file decodes successfully
+**When** `decode_and_resize` processes the data
+**Then** no additional log messages are emitted (no regression)
+
+**Technical Notes:** In `cover_proc.rs`, the `decode_and_resize` function at line 156 returns `Result<Vec<u8>, String>`. The caller at line 136 logs the error: `log::warn!("[cover-proc] '{key}': JPEG decode failed ({e}), skipping CoverRefreshed...")`. However, the error string from `image::load_from_memory` is not descriptive enough. Fix: in `decode_and_resize`, before calling `image::load_from_memory`, log the data size and album key so that administrators can correlate the failure with specific album data. The existing `log::warn!` call at line 148 already logs the album key — confirm this is sufficient, and add data size if missing.
