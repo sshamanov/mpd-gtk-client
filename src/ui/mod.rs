@@ -260,35 +260,14 @@ fn reposition(layout: &gtk4::Fixed, cells: &[AlbumCell], width: f64) {
 /// - Years / Genres: every album gets the group header as caption
 /// - Artists: show track artists that differ from the AlbumArtist
 fn group_caption_for_view(view_mode: &str, header: &str, meta: &AlbumMeta) -> Option<Vec<String>> {
-    match view_mode {
-        "Albums" => None,
-        "Years" => None, // year badge handles year display
-        "Genres" => Some(vec![header.to_string()]),
-        "Artists" => {
-            let aa = meta.album_artist.to_lowercase();
-            let mut seen = std::collections::HashSet::new();
-            let unique: Vec<String> = meta.track_artists.iter()
-                .filter(|a| a.to_lowercase() != aa)
-                .filter(|a| seen.insert(a.to_lowercase()))
-                .take(6)
-                .map(|s| s.to_string())
-                .collect();
-            if unique.is_empty() { None } else { Some(unique) }
-        }
-        _ => None,
-    }
+    crate::presenters::browse::album_grid::group_caption(view_mode, header, meta).map(|gc| match gc {
+        crate::presenters::types::GroupCaption::Header(h) => vec![h],
+        crate::presenters::types::GroupCaption::TrackArtists(v) => v,
+    })
 }
 
-/// Format the year badge: `'84` for years < 2000, full 4 digits for >= 2000.
 fn format_year_badge(year: Option<&str>) -> Option<String> {
-    year.and_then(|y| {
-        let y_num: u32 = y.parse().ok()?;
-        if y_num < 2000 {
-            Some(format!("'{}", &y[y.len().saturating_sub(2)..]))
-        } else {
-            Some(y.to_string())
-        }
-    })
+    crate::presenters::format::year_badge(year)
 }
 
 type SharedIds = std::rc::Rc<std::cell::RefCell<HashMap<i32, i32>>>;

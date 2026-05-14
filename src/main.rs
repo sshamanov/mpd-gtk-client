@@ -13,6 +13,7 @@ pub mod mpd;
 pub mod mpris;
 pub mod notifications;
 pub mod metadata;
+pub mod presenters;
 pub mod search;
 pub mod state;
 pub mod ui;
