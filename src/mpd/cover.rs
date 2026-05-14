@@ -40,6 +40,33 @@ pub enum CoverFetchResult {
     },
 }
 
+/// Send a `CoverFetchResult` to the Cover Proc worker, retrying on full channel
+/// with shutdown-flag awareness. Logs and drops if disconnected or shutting down.
+fn send_result(
+    result: CoverFetchResult,
+    tx: &mpsc::SyncSender<CoverFetchResult>,
+    shutting_down: &Arc<AtomicBool>,
+) {
+    let mut result = Some(result);
+    while let Some(r) = result.take() {
+        match tx.try_send(r) {
+            Ok(_) => break,
+            Err(mpsc::TrySendError::Full(r)) => {
+                if shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                    log::warn!("[mpd-cover] Shutting down, dropping cover result");
+                    break;
+                }
+                result = Some(r);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                log::error!("[mpd-cover] Cover Proc channel disconnected (worker likely dead), dropping result");
+                break;
+            }
+        }
+    }
+}
+
 /// Sender handle for enqueuing cover jobs to the MPD Cover thread.
 #[derive(Clone)]
 pub struct CoverThreadSender {
@@ -96,10 +123,10 @@ pub fn spawn(
                                 Ok(a) => adapter = Some(a),
                                 Err(e) => {
                                     log::error!("[mpd-cover] Failed to connect: {e}");
-                                    let _ = result_tx.send(CoverFetchResult::Error {
+                                    send_result(CoverFetchResult::Error {
                                         key,
                                         error: format!("MPD connect failed: {e}"),
-                                    });
+                                    }, &result_tx, &shutting_down);
                                     continue;
                                 }
                             }
@@ -115,7 +142,7 @@ pub fn spawn(
                                         "[mpd-cover] '{key}': albumart returned {} bytes",
                                         data.len()
                                     );
-                                    let _ = result_tx.send(CoverFetchResult::Success { key, data, mtime: None });
+                                    send_result(CoverFetchResult::Success { key, data, mtime: None }, &result_tx, &shutting_down);
                                     continue;
                                 }
                                 Ok(None) => {
@@ -135,22 +162,22 @@ pub fn spawn(
                                         "[mpd-cover] '{key}': readpicture returned {} bytes",
                                         data.len()
                                     );
-                                    let _ = result_tx.send(CoverFetchResult::Success { key, data, mtime: Some(mtime) });
+                                    send_result(CoverFetchResult::Success { key, data, mtime: Some(mtime) }, &result_tx, &shutting_down);
                                     continue;
                                 }
                                 Ok(None) => {
                                     log::info!("[mpd-cover] '{key}': albumart + readpicture both empty");
-                                    let _ = result_tx.send(CoverFetchResult::Empty { key });
+                                    send_result(CoverFetchResult::Empty { key }, &result_tx, &shutting_down);
                                 }
                                 Err(e) => {
-                                    let _ = result_tx.send(CoverFetchResult::Error {
+                                    send_result(CoverFetchResult::Error {
                                         key,
                                         error: format!("{e}"),
-                                    });
+                                    }, &result_tx, &shutting_down);
                                 }
                             }
                         } else {
-                            let _ = result_tx.send(CoverFetchResult::Empty { key });
+                            send_result(CoverFetchResult::Empty { key }, &result_tx, &shutting_down);
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {

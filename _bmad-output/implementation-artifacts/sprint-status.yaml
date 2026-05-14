@@ -202,7 +202,7 @@ development_status:
 
   epic-31: backlog
   31-1-guard-multiple-cover-proc-workers: done
-  31-2-prevent-mpd-cover-thread-stall: backlog
+  31-2-prevent-mpd-cover-thread-stall: done
   31-3-handle-non-jpeg-covers: backlog
   31-4-jpeg-decode-size-guard: backlog
   31-5-atomic-index-json-corruption-recovery: backlog
