@@ -211,7 +211,7 @@ development_status:
 
   epic-32: backlog
   32-1-searchresults-generation-counter: done
-  32-2-fix-search-race-on-reconnect: backlog
+  32-2-fix-search-race-on-reconnect: done
   32-3-remove-mpd-search-fallback: backlog
 
   epic-33: backlog

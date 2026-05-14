@@ -2221,6 +2221,11 @@ impl App {
                                 }
                             }
                         }
+                        MpdEvent::SearchIndexing => {
+                            log::debug!("[ui] SearchIndexing — index not yet built");
+                            fc_empty.set_text("Indexing…");
+                            fc_stack.set_visible_child(&fc_empty);
+                        }
                         MpdEvent::SearchResults { results, generation } => {
                             // Discard stale results from slower queries
                             if generation != 0 && generation != search_gen.get() {

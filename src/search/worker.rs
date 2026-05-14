@@ -60,6 +60,7 @@ pub fn spawn(
             log::info!("[search-worker] Thread started");
 
             let mut index = SearchIndex::new();
+            let mut index_ready = false;
 
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -70,12 +71,22 @@ pub fn spawn(
                     match cmd_rx.recv_timeout(Duration::from_millis(500)) {
                         Ok(SearchCommand::BuildIndex(albums)) => {
                             index.build(&albums);
+                            index_ready = true;
                             log::debug!(
                                 "[search-worker] Index built: {} albums",
                                 index.album_count()
                             );
                         }
                         Ok(SearchCommand::Search(query, generation)) => {
+                            if !index_ready {
+                                log::debug!(
+                                    "[search-worker] Query '{}' (gen {}) before index ready — signaling SearchIndexing",
+                                    query,
+                                    generation
+                                );
+                                let _ = event_tx.try_send(MpdEvent::SearchIndexing);
+                                return Ok(());
+                            }
                             let scored = index.search(&query);
                             log::debug!(
                                 "[search-worker] Query '{}' (gen {}) returned {} results",
@@ -91,6 +102,7 @@ pub fn spawn(
                         }
                         Ok(SearchCommand::Reset) => {
                             index = SearchIndex::new();
+                            index_ready = false;
                             log::debug!("[search-worker] Index reset");
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => (),

@@ -72,6 +72,8 @@ pub enum MpdEvent {
     Albums(Vec<crate::mpd::AlbumMeta>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
     SearchResults { results: Vec<(String, String)>, generation: u64 },
+    /// Search index not yet built — signal for UI to show indexing state.
+    SearchIndexing,
     FileSearchResults(Vec<(String, String)>),
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
