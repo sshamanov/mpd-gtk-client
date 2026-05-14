@@ -19,8 +19,8 @@ use crate::search::SearchIndex;
 pub enum SearchCommand {
     /// Rebuild the index from a flat (artist, album) list.
     BuildIndex(Vec<(String, String)>),
-    /// Execute a search query and emit results.
-    Search(String),
+    /// Execute a search query and emit results with the given generation number.
+    Search(String, u64),
     /// Clear the index.
     Reset,
 }
@@ -75,18 +75,19 @@ pub fn spawn(
                                 index.album_count()
                             );
                         }
-                        Ok(SearchCommand::Search(query)) => {
+                        Ok(SearchCommand::Search(query, generation)) => {
                             let scored = index.search(&query);
                             log::debug!(
-                                "[search-worker] Query '{}' returned {} results",
+                                "[search-worker] Query '{}' (gen {}) returned {} results",
                                 query,
+                                generation,
                                 scored.len()
                             );
                             let results: Vec<(String, String)> = scored
                                 .into_iter()
                                 .map(|(a, b, _)| (a, b))
                                 .collect();
-                            let _ = event_tx.try_send(MpdEvent::SearchResults(results));
+                            let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation });
                         }
                         Ok(SearchCommand::Reset) => {
                             index = SearchIndex::new();

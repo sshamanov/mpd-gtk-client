@@ -230,7 +230,7 @@ pub fn reduce(state: &mut AppState, event: &MpdEvent) {
         MpdEvent::Queue(_)
         | MpdEvent::Albums(_)
         | MpdEvent::AlbumsGrouped(_)
-        | MpdEvent::SearchResults(_)
+        | MpdEvent::SearchResults { .. }
         | MpdEvent::FileSearchResults(_)
         | MpdEvent::DirectoryListing(..)
         | MpdEvent::AlbumTracks(_)

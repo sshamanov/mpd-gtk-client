@@ -210,7 +210,7 @@ development_status:
   31-7-log-cover-silent-failures: done
 
   epic-32: backlog
-  32-1-searchresults-generation-counter: backlog
+  32-1-searchresults-generation-counter: done
   32-2-fix-search-race-on-reconnect: backlog
   32-3-remove-mpd-search-fallback: backlog
 

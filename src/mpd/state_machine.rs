@@ -71,7 +71,7 @@ pub enum MpdEvent {
     StateChanged(PlaybackUpdate),
     Albums(Vec<crate::mpd::AlbumMeta>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
-    SearchResults(Vec<(String, String)>),
+    SearchResults { results: Vec<(String, String)>, generation: u64 },
     FileSearchResults(Vec<(String, String)>),
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
@@ -848,7 +848,7 @@ fn process_command(
         }
         MpdCommand::Search(query) => {
             if let Ok(results) = adapter.search_albums(&query) {
-                let _ = event_tx.try_send(MpdEvent::SearchResults(results));
+                let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0 });
             }
         }
         MpdCommand::SearchFiles(query) => {

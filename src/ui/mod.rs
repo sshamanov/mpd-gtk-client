@@ -780,7 +780,7 @@ impl App {
                     move || {
                         if gen_c.get() != this_gen { return; }
                         // Send to search worker (story 28-3): worker emits SearchResults via event_tx
-                        scmd.send(SearchCommand::Search(qc.clone()));
+                        scmd.send(SearchCommand::Search(qc.clone(), this_gen));
                         // MPD search fallback (fires unconditionally; local results arrive first)
                         let _ = tx.send(MpdCommand::Search(qc));
                     },
@@ -2221,7 +2221,12 @@ impl App {
                                 }
                             }
                         }
-                        MpdEvent::SearchResults(results) => {
+                        MpdEvent::SearchResults { results, generation } => {
+                            // Discard stale results from slower queries
+                            if generation != 0 && generation != search_gen.get() {
+                                log::debug!("[ui] Discarding stale SearchResults (gen {generation}, current {cur})", cur = search_gen.get());
+                                return glib::ControlFlow::Continue;
+                            }
                             if results.is_empty() {
                                 fc_empty.set_text("No results found");
                                 fc_stack.set_visible_child(&fc_empty);
