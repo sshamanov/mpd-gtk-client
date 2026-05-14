@@ -97,6 +97,110 @@ pub enum ToastLevel {
     Error,
 }
 
+/// Parsed audio format with sample rate, bit depth, and codec.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioFormat {
+    pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub codec: String,
+    pub is_dsd: bool,
+}
+
+impl AudioFormat {
+    pub fn display_text(&self) -> String {
+        if self.is_dsd {
+            format!("DSD{}", self.bit_depth as u32 * 64)
+        } else if self.bit_depth > 0 && self.sample_rate > 0 {
+            let rate = (self.sample_rate as f64) / 1000.0;
+            let rate_str = format!("{:.1}", rate)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            format!("{}/{} · {}", self.bit_depth, rate_str, self.codec)
+        } else if !self.codec.is_empty() {
+            self.codec.clone()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// Unified audio format parser — checks three MPD fields in priority order.
+///
+/// Priority: `songs_audio` (file format, immutable) → `songs_format` (file sample spec)
+/// → `status_audio` (DAC output, may be resampled). File format wins over output format.
+pub fn parse_mpd_audio_format(
+    songs_audio: Option<&str>,
+    songs_format: Option<&str>,
+    status_audio: Option<&str>,
+) -> Option<AudioFormat> {
+    // 1. Try currentsong Audio field (file format, immutable) — e.g., "dsd64", "44100:24:2"
+    if let Some(audio) = songs_audio {
+        if let Some(fmt) = parse_single_audio_source(audio, false) {
+            return Some(fmt);
+        }
+    }
+    // 2. Try currentsong Format field
+    if let Some(format) = songs_format {
+        if let Some(fmt) = parse_single_audio_source(format, false) {
+            return Some(fmt);
+        }
+    }
+    // 3. Fall back to status audio (DAC output, may be resampled)
+    if let Some(audio) = status_audio {
+        if let Some(fmt) = parse_single_audio_source(audio, true) {
+            return Some(fmt);
+        }
+    }
+    None
+}
+
+fn parse_single_audio_source(raw: &str, _is_dac_output: bool) -> Option<AudioFormat> {
+    let lower = raw.to_lowercase();
+    // DSD: "dsd64", "dsd128:2", "DSD128", "dsd256", "dsd512"
+    let dsd_prefixes = [("dsd64", 64u32, 1u16), ("dsd128", 128, 2), ("dsd256", 256, 4), ("dsd512", 512, 8)];
+    for (prefix, _, multiplier) in &dsd_prefixes {
+        if lower.starts_with(prefix) {
+            let rate = 44100 * 64 * (*multiplier as u32 / 1);
+            return Some(AudioFormat {
+                sample_rate: rate,
+                bit_depth: 1,
+                codec: prefix.to_uppercase(),
+                is_dsd: true,
+            });
+        }
+    }
+    // DSD via format rate: "2822400:1:2" or similar
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() >= 2 {
+        if let Ok(rate) = parts[0].parse::<u32>() {
+            let dsd_base: u32 = 44100 * 64;
+            if rate >= dsd_base && rate % dsd_base == 0 {
+                let mult = rate / dsd_base;
+                let dsd_val = mult * 64;
+                return Some(AudioFormat {
+                    sample_rate: rate,
+                    bit_depth: 1,
+                    codec: format!("DSD{}", dsd_val),
+                    is_dsd: true,
+                });
+            }
+        }
+        if parts.len() == 3 {
+            if let Ok(bits) = parts[1].parse::<u16>() {
+                let rate = parts[0].parse::<u32>().unwrap_or(0);
+                return Some(AudioFormat {
+                    sample_rate: rate,
+                    bit_depth: bits,
+                    codec: String::new(),
+                    is_dsd: false,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Playback state update from the MPD status response.
 #[derive(Debug, Clone, Default)]
 pub struct PlaybackUpdate {
@@ -113,6 +217,7 @@ pub struct PlaybackUpdate {
     pub format: Option<String>,
     pub file: Option<String>,
     pub bitrate: Option<String>,
+    pub audio_format: Option<AudioFormat>,
 }
 
 /// Internal state machine for the MPD connection lifecycle.
@@ -652,8 +757,21 @@ fn process_command(
         }
         MpdCommand::CurrentSong => {
             if let Ok(Some(song)) = adapter.current_song() {
-                let _ = event_tx.try_send(MpdEvent::StateChanged(
-                    parse_song_update(&song)));
+                let mut update = parse_song_update(&song);
+                // Merge cached status fields so elapsed/duration/state are present
+                if let Ok(status) = adapter.status() {
+                    let status_update = parse_status_update(&status);
+                    update.state = status_update.state;
+                    update.elapsed = status_update.elapsed;
+                    update.duration = status_update.duration;
+                    update.volume = status_update.volume;
+                    update.playlist_version = status_update.playlist_version;
+                    update.song = status_update.song;
+                    if update.audio_format.is_none() {
+                        update.audio_format = status_update.audio_format;
+                    }
+                }
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
             }
         }
         MpdCommand::ListAlbums => {
@@ -1097,32 +1215,28 @@ fn sync_queue(
 
 /// Group a flat (artist, album) list by artist name, sorted alphabetically.
 fn parse_status_update(status: &std::collections::HashMap<String, String>) -> PlaybackUpdate {
-    // Extract format badge from status "audio" field (e.g., "dsd64:2" → "DSD64")
+    // Extract format badge from status "audio" field (e.g., "44100:24:2" → "24/44.1")
     let format = status.get("audio").and_then(|audio| {
-        let fmt = audio.split(':').next().unwrap_or(audio);
-        if fmt.eq_ignore_ascii_case("dsd64") {
+        let first = audio.split(':').next().unwrap_or(audio);
+        if first.eq_ignore_ascii_case("dsd64") {
             Some("DSD64".into())
-        } else if fmt.eq_ignore_ascii_case("dsd128") {
+        } else if first.eq_ignore_ascii_case("dsd128") {
             Some("DSD128".into())
-        } else if fmt.eq_ignore_ascii_case("dsd256") {
+        } else if first.eq_ignore_ascii_case("dsd256") {
             Some("DSD256".into())
-        } else if fmt.eq_ignore_ascii_case("dsd512") {
+        } else if first.eq_ignore_ascii_case("dsd512") {
             Some("DSD512".into())
-        } else if let Some(pcm) = fmt.split(':').next() {
-            // PCM format: "44100:24:2" or just the name
-            if pcm.contains(':') {
-                let parts: Vec<&str> = pcm.split(':').collect();
-                if parts.len() >= 2 {
-                    if let Ok(bits) = parts[1].parse::<u32>() {
-                        let rate_str = if let Ok(r) = parts[0].parse::<f64>() {
-                            format!("{:.1}", r / 1000.0).trim_end_matches('0').trim_end_matches('.').to_string()
-                        } else { parts[0].to_string() };
-                        return Some(format!("{}/{}", bits, rate_str));
-                    }
+        } else {
+            // PCM: parse the full "44100:24:2" string
+            let parts: Vec<&str> = audio.split(':').collect();
+            if parts.len() >= 2 {
+                if let Ok(bits) = parts[1].parse::<u32>() {
+                    let rate_str = if let Ok(r) = parts[0].parse::<f64>() {
+                        format!("{:.1}", r / 1000.0).trim_end_matches('0').trim_end_matches('.').to_string()
+                    } else { parts[0].to_string() };
+                    return Some(format!("{}/{}", bits, rate_str));
                 }
             }
-            None
-        } else {
             None
         }
     });
@@ -1144,6 +1258,7 @@ fn parse_status_update(status: &std::collections::HashMap<String, String>) -> Pl
         format,
         file: None,
         bitrate: status.get("bitrate").cloned(),
+        audio_format: parse_mpd_audio_format(None, None, status.get("audio").map(|s| s.as_str())),
     }
 }
 
@@ -1159,6 +1274,11 @@ fn parse_song_update(song: &std::collections::HashMap<String, String>) -> Playba
         year,
         format,
         file: song.get("file").cloned(),
+        audio_format: parse_mpd_audio_format(
+            song.get("Audio").map(|s| s.as_str()),
+            song.get("Format").map(|s| s.as_str()),
+            None,
+        ),
         ..Default::default()
     }
 }
@@ -1185,13 +1305,17 @@ fn format_badge_text(song: &std::collections::HashMap<String, String>) -> Option
                     return Some(format!("DSD{}", mult * 64));
                 }
             }
-            if parts.len() == 3 {
+            if parts.len() >= 2 {
                 if let Ok(bits) = parts[1].parse::<u32>() {
-                    let rate_str = if let Ok(r) = parts[0].parse::<f64>() {
-                        format!("{:.1}", r / 1000.0).trim_end_matches('0').trim_end_matches('.').to_string()
-                    } else { parts[0].to_string() };
-                    return Some(format!("{}/{}", bits, rate_str));
+                    if parts.len() == 3 {
+                        let rate_str = if let Ok(r) = parts[0].parse::<f64>() {
+                            format!("{:.1}", r / 1000.0).trim_end_matches('0').trim_end_matches('.').to_string()
+                        } else { parts[0].to_string() };
+                        return Some(format!("{}/{}", bits, rate_str));
+                    }
+                    // 2-part format: "rate:channels" — return as-is
                 }
+                return Some(format.to_string());
             }
         }
     }
@@ -1211,6 +1335,7 @@ fn fetch_full_update(adapter: &mut MpdAdapter) -> Option<PlaybackUpdate> {
             if update.year.is_none() { update.year = song_update.year; }
             if update.format.is_none() { update.format = song_update.format; }
             if update.file.is_none() { update.file = song_update.file; }
+            if update.audio_format.is_none() { update.audio_format = song_update.audio_format; }
         }
     }
     Some(update)

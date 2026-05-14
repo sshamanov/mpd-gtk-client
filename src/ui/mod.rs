@@ -2017,7 +2017,7 @@ impl App {
                                     }
                                 }
                             }
-                            update_now_playing(NowPlayingWidgets {
+                            handle_now_playing(&fc_state, update.clone(), NowPlayingWidgets {
     title: &fc_tl,
     artist: &fc_ar,
     album: &fc_al,
@@ -2032,7 +2032,7 @@ impl App {
     cover: &fc_np_cover,
     cover_stack: &fc_np_cover_stack,
     cover_paths: &fc_cp_np,
-}, &update);
+}, &fc_mpris_update);
 
                             // Update bottom panel now-playing
                             fc_bp_title.set_label(update.title.as_deref().unwrap_or("No track playing"));
@@ -2040,40 +2040,6 @@ impl App {
                                 "play" => fc_bp_play.set_child(Some(&gtk4::Image::from_icon_name("media-playback-pause-symbolic"))),
                                 _ => fc_bp_play.set_child(Some(&gtk4::Image::from_icon_name("media-playback-start-symbolic"))),
                             }
-
-                            // Populate SharedState CurrentContext for MPRIS and other consumers
-                            if let Ok(mut app_state) = fc_state.write() {
-                                if update.state == "stop" {
-                                    app_state.current.track = None;
-                                    app_state.current.album = None;
-                                } else {
-                                    let dur = update.duration
-                                        .map(std::time::Duration::from_secs_f64);
-                                    let track_name = update.title.clone().unwrap_or_default();
-                                    let album_name = update.album.clone().unwrap_or_default();
-                                    let artist_name = update.artist.clone().unwrap_or_default();
-                                    app_state.current.track = Some(crate::mpd::Track {
-                                        id: update.song.map(|s| s.to_string()).unwrap_or_default(),
-                                        title: track_name,
-                                        album_id: album_name.clone(),
-                                        path: std::path::PathBuf::new(),
-                                        duration: dur,
-                                        format: None,
-                                    });
-                                    app_state.current.album = Some(crate::mpd::Album {
-                                        id: album_name.clone(),
-                                        title: album_name,
-                                        artist: artist_name,
-                                        year: None,
-                                        genre: None,
-                                        cover_path: None,
-                                        tracks: vec![],
-                                    });
-                                }
-                            }
-
-                            // Forward PlaybackUpdate to MPRIS PropertiesChanged emitter
-                            let _ = fc_mpris_update.send(update);
                         }
                         MpdEvent::Albums(albums) => {
                             let flat_for_index: Vec<(String, String)> = albums.iter()
@@ -2727,28 +2693,143 @@ struct NowPlayingWidgets<'a> {
     cover_paths: &'a std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Option<String>>>>,
 }
 
+/// View model for now-playing display — derived from PlaybackUpdate.
+#[allow(dead_code)]
+struct PlaybackDisplay {
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    year: Option<String>,
+    state: String,
+    elapsed: Option<f64>,
+    duration: Option<f64>,
+    format_badge: Option<String>,
+    bitrate: Option<String>,
+    volume: i16,
+    song_id: Option<u32>,
+    file: Option<String>,
+}
+
+impl PlaybackDisplay {
+    fn from_update(update: &PlaybackUpdate) -> Self {
+        let mut format_badge = update.format.clone();
+        // Augment with codec from audio_format if available
+        if let Some(ref af) = update.audio_format {
+            let text = af.display_text();
+            if !text.is_empty() {
+                if let Some(ref existing) = format_badge {
+                    if !existing.contains(&text) {
+                        format_badge = Some(format!("{} · {}", text, existing));
+                    }
+                } else {
+                    format_badge = Some(text);
+                }
+            }
+        }
+        // Add file extension as codec hint
+        if let Some(ref file) = update.file {
+            if let Some(ext) = std::path::Path::new(file)
+                .extension()
+                .and_then(|e| e.to_str())
+            {
+                let ext_upper = ext.to_uppercase();
+                if !format_badge.as_ref().map_or(false, |f| f.contains(&ext_upper)) {
+                    if let Some(ref existing) = format_badge {
+                        format_badge = Some(format!("{} · {}", existing, ext_upper));
+                    } else {
+                        format_badge = Some(ext_upper);
+                    }
+                }
+            }
+        }
+
+        PlaybackDisplay {
+            title: update.title.clone().unwrap_or_default(),
+            artist: update.artist.clone(),
+            album: update.album.clone(),
+            year: update.year.clone(),
+            state: update.state.clone(),
+            elapsed: update.elapsed,
+            duration: update.duration,
+            format_badge,
+            bitrate: update.bitrate.clone(),
+            volume: update.volume,
+            song_id: update.song,
+            file: update.file.clone(),
+        }
+    }
+}
+
+/// Single entry point for now-playing updates: writes SharedState, updates widgets, forwards to MPRIS.
+fn handle_now_playing(
+    state: &SharedState,
+    update: PlaybackUpdate,
+    w: NowPlayingWidgets,
+    mpris_tx: &std::sync::mpsc::Sender<PlaybackUpdate>,
+) {
+    // 1. WRITE SharedState.current (canonical)
+    if let Ok(mut app_state) = state.write() {
+        if update.state == "stop" {
+            app_state.current.track = None;
+            app_state.current.album = None;
+        } else {
+            let dur = update.duration
+                .map(std::time::Duration::from_secs_f64);
+            let track_name = update.title.clone().unwrap_or_default();
+            let album_name = update.album.clone().unwrap_or_default();
+            let artist_name = update.artist.clone().unwrap_or_default();
+            app_state.current.track = Some(crate::mpd::Track {
+                id: update.song.map(|s| s.to_string()).unwrap_or_default(),
+                title: track_name,
+                album_id: album_name.clone(),
+                path: std::path::PathBuf::new(),
+                duration: dur,
+                format: update.audio_format.as_ref().map(|f| f.display_text()),
+            });
+            app_state.current.album = Some(crate::mpd::Album {
+                id: album_name.clone(),
+                title: album_name,
+                artist: artist_name,
+                year: None,
+                genre: None,
+                cover_path: None,
+                tracks: vec![],
+            });
+        }
+    }
+
+    // 2. READ back into PlaybackDisplay view model
+    let display = PlaybackDisplay::from_update(&update);
+
+    // 3. UPDATE all GTK now-playing widgets
+    update_now_playing(w, &display);
+
+    // 4. FORWARD to MPRIS emitter
+    let _ = mpris_tx.send(update);
+}
+
 fn update_now_playing(
     w: NowPlayingWidgets,
-    update: &PlaybackUpdate,
+    display: &PlaybackDisplay,
 ) {
-    let has_track = update.title.is_some() || update.album.is_some();
+    let has_track = display.artist.is_some() || display.album.is_some();
 
-    if let Some(ref t) = update.title {
-        w.title.set_label(t);
+    if !display.title.is_empty() {
+        w.title.set_label(&display.title);
     } else {
         w.title.set_label(if has_track { "" } else { "No track playing" });
     }
-    if let Some(ref a) = update.artist {
+    if let Some(ref a) = display.artist {
         w.artist.set_text(a);
         w.artist.set_visible(true);
     } else {
         w.artist.set_visible(false);
         w.artist.set_text("");
     }
-    if let Some(ref a) = update.album {
+    if let Some(ref a) = display.album {
         w.album.set_text(a);
         w.album.set_visible(true);
-        if let Some(ref y) = update.year {
+        if let Some(ref y) = display.year {
             w.year.set_text(y);
             w.year.set_visible(true);
         } else {
@@ -2773,7 +2854,7 @@ fn update_now_playing(
         w.cover.set_visible(false);
         w.cover_stack.set_visible_child_name("placeholder");
     }
-    match (update.elapsed, update.duration) {
+    match (display.elapsed, display.duration) {
         (Some(el), Some(dur)) => {
             w.pos_label.set_text(&format!("{}:{:02}", el as u64 / 60, el as u64 % 60));
             w.len_label.set_text(&format!("{}:{:02}", dur as u64 / 60, dur as u64 % 60));
@@ -2789,32 +2870,19 @@ fn update_now_playing(
         }
     }
 
-    // Build tech data: format label "24/96 · FLAC" (center) + bitrate "1411kb/s" (right)
-    let mut fmt_parts: Vec<String> = Vec::new();
-    if let Some(ref fmt) = update.format {
-        fmt_parts.push(fmt.clone());
-    }
-    if let Some(ref file) = update.file {
-        if let Some(ext) = std::path::Path::new(file)
-            .extension()
-            .and_then(|e| e.to_str())
-        {
-            fmt_parts.push(ext.to_uppercase());
-        }
-    }
-    if fmt_parts.is_empty() {
-        w.fmt_label.set_visible(false);
-    } else {
-        w.fmt_label.set_text(&fmt_parts.join(" · "));
+    if let Some(ref fmt) = display.format_badge {
+        w.fmt_label.set_text(fmt);
         w.fmt_label.set_visible(true);
+    } else {
+        w.fmt_label.set_visible(false);
     }
-    if let Some(ref br) = update.bitrate {
+    if let Some(ref br) = display.bitrate {
         w.bitrate_label.set_text(&format!("{}kb/s", br));
         w.bitrate_label.set_visible(true);
     } else {
         w.bitrate_label.set_visible(false);
     }
-    match update.state.as_str() {
+    match display.state.as_str() {
         "play" => {
             w.play_pause_btn.set_child(Some(&gtk4::Image::from_icon_name("media-playback-pause-symbolic")));
             w.status_dot.set_css_classes(&["status-dot", "playing"]);
@@ -2828,7 +2896,7 @@ fn update_now_playing(
             w.status_dot.set_css_classes(&["status-dot", "stopped"]);
         }
         _ => {
-            log::warn!("Unknown playback state: {}", update.state);
+            log::warn!("Unknown playback state: {}", display.state);
             w.play_pause_btn.set_child(Some(&gtk4::Image::from_icon_name("media-playback-start-symbolic")));
             w.status_dot.set_css_classes(&["status-dot", "stopped"]);
         }

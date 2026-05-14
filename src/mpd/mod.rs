@@ -159,13 +159,7 @@ pub struct Track {
     pub album_id: String,
     pub path: PathBuf,
     pub duration: Option<Duration>,
-    pub format: Option<AudioFormat>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum AudioFormat {
-    Pcm { bit_depth: u16, sample_rate: u32 },
-    Dsd { rate: u32 },
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
