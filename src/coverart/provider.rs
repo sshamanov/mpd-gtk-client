@@ -194,6 +194,7 @@ impl CoverProvider {
     // ── Private helpers ──
 
     /// Load the index from `cache_dir/index.json`.
+    /// On parse failure, backs up the corrupt file to `index.json.bad`.
     fn load_index(cache_dir: &Path) -> Result<HashMap<String, IndexEntry>, String> {
         let index_path = cache_dir.join("index.json");
         if !index_path.exists() {
@@ -202,7 +203,20 @@ impl CoverProvider {
         let content = fs::read_to_string(&index_path)
             .map_err(|e| format!("read error: {e}"))?;
         let index: HashMap<String, IndexEntry> = serde_json::from_str(&content)
-            .map_err(|e| format!("parse error: {e}"))?;
+            .map_err(|e| {
+                let bad_path = cache_dir.join("index.json.bad");
+                if let Err(rename_err) = fs::rename(&index_path, &bad_path) {
+                    log::warn!(
+                        "[cover_provider] Corrupt index.json (parse error: {e}), could not backup: {rename_err}"
+                    );
+                } else {
+                    log::warn!(
+                        "[cover_provider] Corrupt index.json backed up to {:?} (parse error: {e})",
+                        bad_path
+                    );
+                }
+                format!("parse error: {e}")
+            })?;
         Ok(index)
     }
 

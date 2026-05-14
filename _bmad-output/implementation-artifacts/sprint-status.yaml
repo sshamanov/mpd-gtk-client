@@ -205,7 +205,7 @@ development_status:
   31-2-prevent-mpd-cover-thread-stall: done
   31-3-handle-non-jpeg-covers: done
   31-4-jpeg-decode-size-guard: done
-  31-5-atomic-index-json-corruption-recovery: backlog
+  31-5-atomic-index-json-corruption-recovery: done
   31-6-orphaned-cache-file-gc: backlog
   31-7-log-cover-silent-failures: backlog
 

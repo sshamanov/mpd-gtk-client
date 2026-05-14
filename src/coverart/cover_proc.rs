@@ -200,13 +200,14 @@ fn write_cache(
     let jpeg_path = cache_dir.join(format!("{md5}.jpg"));
     if let Err(e) = fs::write(&jpeg_path, &jpeg_data) {
         log::warn!("[cover-proc] Failed to write cache for '{album_key}': {e}");
-    } else {
-        log::info!(
-            "[cover-proc] Cached cover for '{album_key}' at {:?} ({} bytes)",
-            jpeg_path,
-            jpeg_data.len()
-        );
+        log::warn!("[cover-proc] Skipping index.json update for '{album_key}' (JPEG write failed)");
+        return;
     }
+    log::info!(
+        "[cover-proc] Cached cover for '{album_key}' at {:?} ({} bytes)",
+        jpeg_path,
+        jpeg_data.len()
+    );
 
     update_index_json(cache_dir, album_key, md5, timestamp);
 }
