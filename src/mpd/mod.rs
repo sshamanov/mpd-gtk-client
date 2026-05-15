@@ -193,6 +193,8 @@ pub struct QueueEntry {
     pub album: Option<String>,
     pub duration: Option<f64>,
     pub file: String,
+    pub file_size: Option<u64>,
+    pub mtime: Option<u64>,
 }
 
 /// A directory entry from MPD's lsinfo command.
@@ -778,6 +780,7 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         let mut current = QueueEntry {
             position: 0, id: 0, title: None, artist: None,
             album: None, duration: None, file: String::new(),
+            file_size: None, mtime: None,
         };
         for line in lines {
             if let Some(val) = line.strip_prefix("file: ") {
@@ -785,6 +788,7 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
                     entries.push(std::mem::replace(&mut current, QueueEntry {
                         position: 0, id: 0, title: None, artist: None,
                         album: None, duration: None, file: String::new(),
+                        file_size: None, mtime: None,
                     }));
                 }
                 current.file = val.to_string();
@@ -800,6 +804,10 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
                 current.position = val.parse().unwrap_or(0);
             } else if let Some(val) = line.strip_prefix("Id: ") {
                 current.id = val.parse().unwrap_or(0);
+            } else if let Some(val) = line.strip_prefix("file_size: ") {
+                current.file_size = val.parse().ok();
+            } else if let Some(val) = line.strip_prefix("mtime: ") {
+                current.mtime = val.parse().ok();
             }
         }
         if !current.file.is_empty() {

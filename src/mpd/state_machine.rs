@@ -1360,6 +1360,7 @@ fn try_incremental_sync(
             local_queue.resize(pos + 1, crate::mpd::QueueEntry {
                 position: 0, id: 0, title: None, artist: None,
                 album: None, duration: None, file: String::new(),
+                file_size: None, mtime: None,
             });
         }
         local_queue[pos] = entry;

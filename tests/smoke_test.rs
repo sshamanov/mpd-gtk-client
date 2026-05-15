@@ -58,6 +58,22 @@ fn test_list_queue() {
 }
 
 #[test]
+fn test_queue_entry_file_size_mtime() {
+    let (server, mut client) = common::with_mpd_server();
+    let queue = client.list_queue().unwrap();
+    // First entry has file_size and mtime
+    assert_eq!(queue[0].file_size, Some(10485760));
+    assert_eq!(queue[0].mtime, Some(1704067200));
+    // Second entry has neither (defaults to None)
+    assert_eq!(queue[1].file_size, None);
+    assert_eq!(queue[1].mtime, None);
+    // Third entry also has neither
+    assert_eq!(queue[2].file_size, None);
+    assert_eq!(queue[2].mtime, None);
+    server.assert_received("playlistinfo");
+}
+
+#[test]
 fn test_search_albums() {
     let (server, mut client) = common::with_mpd_server();
     let results = client.search_albums("test query").unwrap();

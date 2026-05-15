@@ -266,6 +266,8 @@ fn make_playlistinfo_response() -> Vec<String> {
         "duration: 240.000".into(),
         "Pos: 0".into(),
         "Id: 10".into(),
+        "file_size: 10485760".into(),
+        "mtime: 1704067200".into(),
         "file: test/02-second.flac".into(),
         "Last-Modified: 2024-01-01T00:00:00Z".into(),
         "Artist: Second Artist".into(),
