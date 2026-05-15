@@ -1946,7 +1946,10 @@ impl App {
                     };
                     batch += 1;
                     drop(guard);
-                    let fwd = event.clone();
+                    let router_event = match &event {
+                        MpdEvent::Toast { .. } | MpdEvent::Connected | MpdEvent::Disconnected => Some(event.clone()),
+                        _ => None,
+                    };
                     match event {
                         MpdEvent::Connected => {
                             if let Ok(mut app_state) = fc_state.write() {
@@ -2601,7 +2604,9 @@ impl App {
                             fc_toast.add_toast(toast);
                         }
                     }
-                    let _ = ftx.try_send(fwd);
+                    if let Some(ev) = router_event {
+                        let _ = ftx.try_send(ev);
+                    }
                     guard = match fc_rx.lock() {
                         Ok(g) => g,
                         Err(poisoned) => {
