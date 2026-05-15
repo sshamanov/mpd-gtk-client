@@ -234,9 +234,9 @@ development_status:
   36-1-mpd-command-batch-variant: done
   36-2-use-batch-for-playalbum-addalbum: done
 
-  epic-37: in-progress
+  epic-37: done
   37-1-filesize-mtime-in-queueentry: done
-  37-2-multifactor-track-identity-on-reconnect: backlog
+  37-2-multifactor-track-identity-on-reconnect: done
 
   epic-38: backlog
   38-1-dedicated-mpd-metadata-connection-thread: backlog

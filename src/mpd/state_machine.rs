@@ -367,6 +367,7 @@ impl MpdEventLoop {
                     backoff: ExponentialBackoff::new(),
                     first_attempt: true,
                 };
+                let mut local_queue: Vec<crate::mpd::QueueEntry> = Vec::new();
 
                 loop {
                     if stop_clone.load(Ordering::Acquire) {
@@ -408,7 +409,7 @@ impl MpdEventLoop {
                                     let _ = event_tx.try_send(MpdEvent::Connected);
                                     mc_thread.clear();
                                     let cover_target = target.clone();
-                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread, cover_target, &cover_proc_running);
+                                    connected_loop(adapter, &cmd_rx, &event_tx, &stop_clone, noidle_socket.clone(), &mc_thread, cover_target, &cover_proc_running, &mut local_queue);
                                     // When connected_loop exits, connection was lost.
                                     // Preserve backoff across the reconnect cycle.
                                     let backoff = ExponentialBackoff::new();
@@ -496,12 +497,12 @@ fn connected_loop(
     metadata_cache: &crate::metadata::MetadataCache,
     cover_target: ConnectionTarget,
     cover_proc_running: &Arc<AtomicBool>,
+    mut local_queue: &mut Vec<crate::mpd::QueueEntry>,
 ) {
     let mut last_status = Instant::now();
     let mut last_song_pos: Option<u32>;
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
-    let mut local_queue: Vec<crate::mpd::QueueEntry> = Vec::new();
     let mut plchanges_count: u32 = 0;
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
@@ -544,6 +545,12 @@ fn connected_loop(
     } else {
         log::error!("[MPD] initial status fetch failed, connection may be dead");
         return;
+    }
+
+    // On reconnect, force a queue sync to reconcile against the preserved snapshot
+    if !local_queue.is_empty() {
+        sync_queue(&mut adapter, event_tx, local_queue,
+            &mut last_playlist_version, None, &mut plchanges_count);
     }
 
     loop {
@@ -1318,7 +1325,19 @@ fn sync_queue(
     // Full sync
     match adapter.list_queue() {
         Ok(queue) => {
-            *local_queue = queue;
+            let had_snapshot = !local_queue.is_empty();
+            if had_snapshot {
+                let (reconciled, removed) = reconcile_after_reconnect(local_queue, queue);
+                *local_queue = reconciled;
+                if removed > 0 {
+                    let _ = event_tx.try_send(MpdEvent::Toast {
+                        message: format!("Removed {removed} missing or modified track(s) from queue"),
+                        level: ToastLevel::Warn,
+                    });
+                }
+            } else {
+                *local_queue = queue;
+            }
             *last_version = Some(ver.clone());
             *plchanges_count = 0;
             let _ = event_tx.try_send(MpdEvent::Queue(local_queue.clone()));
@@ -1333,6 +1352,61 @@ fn version_wrapped(old: Option<&str>, new: Option<&str>) -> bool {
     let (Ok(old_num), Ok(new_num)) = (old_str.parse::<u64>(), new_str.parse::<u64>()) else { return false };
     // A large backward jump means the 32-bit counter wrapped
     new_num < old_num && old_num - new_num > 1_000_000
+}
+
+/// Compare two QueueEntry values for identity match by (file_size, mtime, file) triple.
+/// Falls back to (file, title, artist, album, duration) when file_size or mtime unavailable.
+fn identity_match(old: &crate::mpd::QueueEntry, new: &crate::mpd::QueueEntry) -> bool {
+    if old.file != new.file {
+        return false;
+    }
+    if let (Some(old_sz), Some(new_sz), Some(old_mt), Some(new_mt)) =
+        (old.file_size, new.file_size, old.mtime, new.mtime)
+    {
+        return old_sz == new_sz && old_mt == new_mt;
+    }
+    // Fallback: metadata match
+    old.title == new.title
+        && old.artist == new.artist
+        && old.album == new.album
+        && old.duration == new.duration
+}
+
+/// Reconcile the new MPD queue against the old snapshot after reconnect.
+/// Verifies each old entry against a new one by identity; removes mismatches.
+/// Returns (reconciled_queue, removed_count).
+fn reconcile_after_reconnect(
+    old_snapshot: &[crate::mpd::QueueEntry],
+    new_queue: Vec<crate::mpd::QueueEntry>,
+) -> (Vec<crate::mpd::QueueEntry>, usize) {
+    let mut removed = 0usize;
+
+    // Count old entries missing from the new queue (deleted while disconnected)
+    let missing = old_snapshot
+        .iter()
+        .filter(|old| !new_queue.iter().any(|new| new.file == old.file))
+        .count();
+    removed += missing;
+
+    // Filter new entries: keep if no matching old entry (brand new) or identity matches
+    let reconciled: Vec<crate::mpd::QueueEntry> = new_queue
+        .into_iter()
+        .filter(|entry| {
+            if let Some(old_entry) = old_snapshot.iter().find(|o| o.file == entry.file) {
+                if identity_match(old_entry, entry) {
+                    true
+                } else {
+                    removed += 1;
+                    false
+                }
+            } else {
+                // New entry not in old snapshot — keep it
+                true
+            }
+        })
+        .collect();
+
+    (reconciled, removed)
 }
 
 /// Attempt incremental queue sync via `plchanges`.
@@ -1471,4 +1545,130 @@ fn fetch_full_update(adapter: &mut MpdAdapter) -> Option<PlaybackUpdate> {
         }
     }
     Some(update)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qe(file: &str, file_size: Option<u64>, mtime: Option<u64>,
+          title: Option<&str>, artist: Option<&str>, album: Option<&str>, duration: Option<f64>) -> crate::mpd::QueueEntry {
+        crate::mpd::QueueEntry {
+            position: 0, id: 0,
+            title: title.map(|s| s.to_string()),
+            artist: artist.map(|s| s.to_string()),
+            album: album.map(|s| s.to_string()),
+            duration,
+            file: file.to_string(),
+            file_size,
+            mtime,
+        }
+    }
+
+    #[test]
+    fn test_identity_match_primary_key() {
+        let old = qe("path/track.flac", Some(1024), Some(1000), Some("T"), Some("A"), Some("B"), Some(10.0));
+        let new = qe("path/track.flac", Some(1024), Some(1000), Some("T"), Some("A"), Some("B"), Some(10.0));
+        assert!(identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_different_file_size() {
+        let old = qe("path/track.flac", Some(1024), Some(1000), None, None, None, None);
+        let new = qe("path/track.flac", Some(2048), Some(1000), None, None, None, None);
+        assert!(!identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_different_mtime() {
+        let old = qe("path/track.flac", Some(1024), Some(1000), None, None, None, None);
+        let new = qe("path/track.flac", Some(1024), Some(2000), None, None, None, None);
+        assert!(!identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_different_file() {
+        let old = qe("path/a.flac", Some(1024), Some(1000), None, None, None, None);
+        let new = qe("path/b.flac", Some(1024), Some(1000), None, None, None, None);
+        assert!(!identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_fallback_metadata() {
+        let old = qe("path/track.flac", None, None, Some("Title"), Some("Artist"), Some("Album"), Some(10.0));
+        let new = qe("path/track.flac", None, None, Some("Title"), Some("Artist"), Some("Album"), Some(10.0));
+        assert!(identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_fallback_mismatch() {
+        let old = qe("path/track.flac", None, None, Some("T1"), Some("A1"), Some("B1"), Some(10.0));
+        let new = qe("path/track.flac", None, None, Some("T2"), Some("A1"), Some("B1"), Some(10.0));
+        assert!(!identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_identity_match_partial_file_metadata() {
+        // One has file_size, the other doesn't — must fall back to metadata
+        let old = qe("path/track.flac", Some(1024), None, Some("T"), Some("A"), Some("B"), Some(10.0));
+        let new = qe("path/track.flac", None, Some(1000), Some("T"), Some("A"), Some("B"), Some(10.0));
+        assert!(identity_match(&old, &new));
+    }
+
+    #[test]
+    fn test_reconcile_keeps_matching_entries() {
+        let old = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+            qe("b.flac", Some(200), Some(2), None, None, None, None),
+        ];
+        let new = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+            qe("b.flac", Some(200), Some(2), None, None, None, None),
+        ];
+        let (result, removed) = reconcile_after_reconnect(&old, new);
+        assert_eq!(result.len(), 2);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_reconcile_removes_modified_entry() {
+        let old = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+        ];
+        let new = vec![
+            qe("a.flac", Some(999), Some(1), None, None, None, None), // size changed
+        ];
+        let (result, removed) = reconcile_after_reconnect(&old, new);
+        assert_eq!(result.len(), 0);
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn test_reconcile_detects_missing_entries() {
+        let old = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+            qe("b.flac", Some(200), Some(2), None, None, None, None),
+        ];
+        let new = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+            // b.flac is gone
+        ];
+        let (result, removed) = reconcile_after_reconnect(&old, new);
+        assert_eq!(result.len(), 1);
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn test_reconcile_keeps_new_entry_not_in_old() {
+        let old = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+        ];
+        let new = vec![
+            qe("a.flac", Some(100), Some(1), None, None, None, None),
+            qe("c.flac", Some(300), Some(3), None, None, None, None), // brand new
+        ];
+        let (result, removed) = reconcile_after_reconnect(&old, new);
+        assert_eq!(result.len(), 2);
+        assert_eq!(removed, 0);
+    }
 }
