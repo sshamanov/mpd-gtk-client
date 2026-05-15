@@ -220,7 +220,7 @@ development_status:
   33-1-join-notification-router-thread: done
   33-2-selective-event-cloning-for-router: done
   33-3-document-toast-channel-sizing: done
-  33-4-extract-toast-timeout-constants: backlog
+  33-4-extract-toast-timeout-constants: done
 
   epic-34: backlog
   34-1-eliminate-redundant-config-load: backlog

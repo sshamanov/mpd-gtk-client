@@ -99,6 +99,20 @@ pub enum ToastLevel {
     Error,
 }
 
+impl ToastLevel {
+    /// Default toast timeout in seconds.
+    /// - Error: 0 (persistent, must be manually dismissed)
+    /// - Warn: 5 seconds
+    /// - Info: 3 seconds
+    pub const fn default_timeout_seconds(self) -> u32 {
+        match self {
+            ToastLevel::Error => 0,
+            ToastLevel::Warn => 5,
+            ToastLevel::Info => 3,
+        }
+    }
+}
+
 /// Parsed audio format with sample rate, bit depth, and codec.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioFormat {

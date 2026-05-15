@@ -2594,11 +2594,7 @@ impl App {
                             fc_toast.add_toast(adw::Toast::new(&format!("MPD Error: {msg}")));
                         }
                         MpdEvent::Toast { message, level } => {
-                            let timeout = match level {
-                                crate::mpd::state_machine::ToastLevel::Error => 0u32,
-                                crate::mpd::state_machine::ToastLevel::Warn => 5,
-                                crate::mpd::state_machine::ToastLevel::Info => 3,
-                            };
+                            let timeout = level.default_timeout_seconds();
                             let toast = adw::Toast::new(&message);
                             toast.set_timeout(timeout);
                             fc_toast.add_toast(toast);
