@@ -528,6 +528,18 @@ fn connected_loop(
         cover_proc_running.clone(),
     );
 
+    // Metadata thread (story 38-1): separate MPD connection for metadata-heavy queries
+    let (_metadata_tx, metadata_rx) = mpsc::sync_channel::<MpdCommand>(64);
+    let metadata_target = cover_target.clone();
+    let metadata_event_tx = event_tx.clone();
+    let metadata_stop = stop.clone();
+    std::thread::Builder::new()
+        .name("mpd-metadata".into())
+        .spawn(move || {
+            metadata_thread(metadata_target, metadata_rx, metadata_event_tx, metadata_stop);
+        })
+        .expect("spawn mpd-metadata thread");
+
     // Set the stream clone for the main thread's CommandSender
     if let Ok(clone) = adapter.stream_clone() {
         *noidle_socket.lock().expect("noidle_socket lock") = Some(clone);
@@ -1526,6 +1538,135 @@ fn parse_song_update(song: &std::collections::HashMap<String, String>) -> Playba
 /// Build a compact format badge from MPD currentsong audio metadata.
 fn format_badge_text(song: &std::collections::HashMap<String, String>) -> Option<String> {
     crate::presenters::format::format_badge(song)
+}
+
+/// Metadata thread: separate MPD connection for metadata-heavy queries (story 38-1).
+///
+/// Owns its own `MpdAdapter` connection. Receives `MpdCommand` variants via channel,
+/// executes them on the metadata connection, and sends results as `MpdEvent` via
+/// the shared event channel. Reconnects on connection errors.
+fn metadata_thread(
+    target: ConnectionTarget,
+    cmd_rx: mpsc::Receiver<MpdCommand>,
+    event_tx: mpsc::SyncSender<MpdEvent>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut adapter: Option<MpdAdapter> = None;
+
+    // Connect helper — returns adapter or sends error toast
+    let connect = |adapter: &mut Option<MpdAdapter>| {
+        match MpdAdapter::connect(&target) {
+            Ok(a) => *adapter = Some(a),
+            Err(e) => {
+                log::error!("[mpd-metadata] connect failed: {e}");
+                let _ = event_tx.try_send(MpdEvent::Toast {
+                    message: format!("Metadata connection failed: {e}"),
+                    level: ToastLevel::Error,
+                });
+            }
+        }
+    };
+
+    connect(&mut adapter);
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let cmd = match cmd_rx.recv() {
+            Ok(cmd) => cmd,
+            Err(_) => return, // channel closed
+        };
+
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Ensure connected
+        if adapter.is_none() {
+            connect(&mut adapter);
+            if adapter.is_none() {
+                continue; // connect failed, skip this command
+            }
+        }
+
+        let a = adapter.as_mut().unwrap();
+
+        match cmd {
+            MpdCommand::ListAlbums => {
+                match a.list_albums() {
+                    Ok(albums) => { let _ = event_tx.try_send(MpdEvent::Albums(albums)); }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] list_albums failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::ListAlbumsGrouped(group) => {
+                match a.list_albums_full() {
+                    Ok(albums) => {
+                        let groups = a.list_albums_grouped(&group, &albums);
+                        let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+                    }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] list_albums_full failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::ListDirectory(path) => {
+                match a.lsinfo(&path) {
+                    Ok(entries) => { let _ = event_tx.try_send(MpdEvent::DirectoryListing(path, entries)); }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] lsinfo({path}) failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::ListAlbumTracks(album) => {
+                match a.find_album_tracks(&album) {
+                    Ok(tracks) => { let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks)); }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] find_album_tracks({album}) failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::Search(query) => {
+                match a.search_albums(&query) {
+                    Ok(results) => {
+                        let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0 });
+                    }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] search_albums failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::SearchFiles(query) => {
+                match a.search_files(&query) {
+                    Ok(results) => { let _ = event_tx.try_send(MpdEvent::FileSearchResults(results)); }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] search_files failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            MpdCommand::ListQueue => {
+                match a.list_queue() {
+                    Ok(queue) => { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
+                    Err(e) => {
+                        log::error!("[mpd-metadata] list_queue failed: {e}");
+                        adapter = None;
+                    }
+                }
+            }
+            _ => {
+                log::warn!("[mpd-metadata] unsupported command routed to metadata thread");
+            }
+        }
+    }
 }
 
 /// Fetch a complete PlaybackUpdate: status + currentsong metadata when a song is active.
