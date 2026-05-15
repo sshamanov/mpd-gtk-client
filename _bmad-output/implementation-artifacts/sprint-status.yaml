@@ -238,6 +238,6 @@ development_status:
   37-1-filesize-mtime-in-queueentry: done
   37-2-multifactor-track-identity-on-reconnect: done
 
-  epic-38: in-progress
+  epic-38: done
   38-1-dedicated-mpd-metadata-connection-thread: done
-  38-2-route-metadata-commands-to-dedicated-connection: backlog
+  38-2-route-metadata-commands-to-dedicated-connection: done

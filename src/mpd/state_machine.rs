@@ -529,7 +529,7 @@ fn connected_loop(
     );
 
     // Metadata thread (story 38-1): separate MPD connection for metadata-heavy queries
-    let (_metadata_tx, metadata_rx) = mpsc::sync_channel::<MpdCommand>(64);
+    let (metadata_tx, metadata_rx) = mpsc::sync_channel::<MpdCommand>(64);
     let metadata_target = cover_target.clone();
     let metadata_event_tx = event_tx.clone();
     let metadata_stop = stop.clone();
@@ -646,6 +646,7 @@ fn connected_loop(
                                     &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                                     stop, metadata_cache,
                                     &mut cover_tx, &cover_target, &cover_result_tx, &mut plchanges_count,
+                                    &metadata_tx,
                                 ) {
                                     return;
                                 }
@@ -682,6 +683,7 @@ fn connected_loop(
                         &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                         stop, metadata_cache,
                         &mut cover_tx, &cover_target, &cover_result_tx, &mut plchanges_count,
+                        &metadata_tx,
                     ) {
                         return;
                     }
@@ -764,6 +766,20 @@ fn run_batch_then_sync(
 /// and emit events. Extracted so both idle and poll paths can call it.
 /// Returns `true` if the caller should exit the connected loop (Reconnect/Close).
 #[allow(clippy::too_many_arguments)]
+/// Returns true if the command variant should be routed to the metadata thread
+/// (story 38-2). These are metadata-heavy queries that can block the
+/// command/status connection with large responses.
+fn is_metadata_command(cmd: &MpdCommand) -> bool {
+    matches!(cmd,
+        MpdCommand::ListAlbums
+        | MpdCommand::ListAlbumsGrouped(_)
+        | MpdCommand::ListDirectory(_)
+        | MpdCommand::ListAlbumTracks(_)
+        | MpdCommand::Search(_)
+        | MpdCommand::SearchFiles(_)
+    )
+}
+
 fn process_command(
     cmd: MpdCommand,
     adapter: &mut MpdAdapter,
@@ -782,7 +798,26 @@ fn process_command(
     cover_target: &ConnectionTarget,
     cover_result_tx: &mpsc::SyncSender<CoverFetchResult>,
     plchanges_count: &mut u32,
+    metadata_tx: &mpsc::SyncSender<MpdCommand>,
 ) -> bool {
+    // Route metadata-heavy commands to the dedicated metadata connection.
+    // On failure, recover `cmd` from the error and fall through to main handler.
+    let cmd = if is_metadata_command(&cmd) {
+        match metadata_tx.try_send(cmd) {
+            Ok(()) => return false,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                log::debug!("[MPD] metadata channel full, falling back to main connection");
+                returned
+            }
+            Err(mpsc::TrySendError::Disconnected(returned)) => {
+                log::debug!("[MPD] metadata thread disconnected, falling back to main connection");
+                returned
+            }
+        }
+    } else {
+        cmd
+    };
+
     match cmd {
         MpdCommand::Play => {
             if let Err(e) = adapter.play() { log::error!("Play failed: {e}"); }
