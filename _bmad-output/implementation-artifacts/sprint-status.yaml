@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-14"
+last_updated: "2026-05-15"
 
 
 project: mpd-client
@@ -225,3 +225,19 @@ development_status:
   34-2-guard-backspace-at-root: done
   34-3-fix-notifications-doc-comment: done
   34-4-log-image-decode-failures: done
+
+  epic-35: backlog
+  35-1-incremental-queue-sync-via-plchanges: done
+  35-2-persist-playlist-version-across-reconnects: backlog
+
+  epic-36: backlog
+  36-1-mpd-command-batch-variant: backlog
+  36-2-use-batch-for-playalbum-addalbum: backlog
+
+  epic-37: backlog
+  37-1-filesize-mtime-in-queueentry: backlog
+  37-2-multifactor-track-identity-on-reconnect: backlog
+
+  epic-38: backlog
+  38-1-dedicated-mpd-metadata-connection-thread: backlog
+  38-2-route-metadata-commands-to-dedicated-connection: backlog

@@ -492,6 +492,7 @@ fn connected_loop(
     let mut consecutive_failures: u32;
     let mut last_playlist_version: Option<String> = None;
     let mut local_queue: Vec<crate::mpd::QueueEntry> = Vec::new();
+    let mut plchanges_count: u32 = 0;
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("mpd-client")
@@ -561,7 +562,7 @@ fn connected_loop(
                                         last_song_pos = new_song;
                                         if let Some(ref ver) = pv {
                                             sync_queue(&mut adapter, event_tx, &mut local_queue,
-                                                &mut last_playlist_version, Some(ver));
+                                                &mut last_playlist_version, Some(ver), &mut plchanges_count);
                                         }
                                     }
                                 }
@@ -572,7 +573,7 @@ fn connected_loop(
                                     let _ = event_tx.try_send(MpdEvent::StateChanged(update));
                                     last_status = Instant::now();
                                     sync_queue(&mut adapter, event_tx, &mut local_queue,
-                                        &mut last_playlist_version, pv.as_deref());
+                                        &mut last_playlist_version, pv.as_deref(), &mut plchanges_count);
                                 }
                             }
                             "mixer" => {
@@ -615,7 +616,7 @@ fn connected_loop(
                                     &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                                     &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                                     stop, metadata_cache,
-                                    &mut cover_tx, &cover_target, &cover_result_tx,
+                                    &mut cover_tx, &cover_target, &cover_result_tx, &mut plchanges_count,
                                 ) {
                                     return;
                                 }
@@ -651,7 +652,7 @@ fn connected_loop(
                         &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                         &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                         stop, metadata_cache,
-                        &mut cover_tx, &cover_target, &cover_result_tx,
+                        &mut cover_tx, &cover_target, &cover_result_tx, &mut plchanges_count,
                     ) {
                         return;
                     }
@@ -689,7 +690,7 @@ fn connected_loop(
                         }
                         if song_changed && last_song_pos == new_song {
                             sync_queue(&mut adapter, event_tx, &mut local_queue,
-                                &mut last_playlist_version, current_version.as_deref());
+                                &mut last_playlist_version, current_version.as_deref(), &mut plchanges_count);
                         }
                     } else {
                         consecutive_failures += 1;
@@ -726,6 +727,7 @@ fn process_command(
     cover_tx: &mut Option<CoverThreadSender>,
     cover_target: &ConnectionTarget,
     cover_result_tx: &mpsc::SyncSender<CoverFetchResult>,
+    plchanges_count: &mut u32,
 ) -> bool {
     match cmd {
         MpdCommand::Play => {
@@ -895,12 +897,12 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
         MpdCommand::ListQueue => {
-            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None, plchanges_count);
         }
         MpdCommand::PlayPosition(pos) => {
             if let Err(e) = adapter.send_command(&format!("play {}", pos)) {
@@ -909,7 +911,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -917,13 +919,13 @@ fn process_command(
             if let Err(e) = adapter.send_command(&format!("deleteid {}", id)) {
                 log::error!("DeleteId failed: {e}");
             }
-            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None, plchanges_count);
         }
         MpdCommand::MoveId(id, to_pos) => {
             if let Err(e) = adapter.send_command(&format!("moveid {} {}", id, to_pos)) {
                 log::error!("MoveId failed: {e}");
             }
-            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None);
+            sync_queue(adapter, event_tx, local_queue, last_playlist_version, None, plchanges_count);
         }
         MpdCommand::Add(album) => {
             match adapter.find_album_uris(&album) {
@@ -936,7 +938,7 @@ fn process_command(
                     if let Some(update) = fetch_full_update(adapter) {
                         let pv = update.playlist_version.clone();
                         let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
                     }
                     *last_status = Instant::now();
                 }
@@ -959,7 +961,7 @@ fn process_command(
                     if let Some(update) = fetch_full_update(adapter) {
                         let pv = update.playlist_version.clone();
                         let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
                     }
                     *last_status = Instant::now();
                 }
@@ -994,7 +996,7 @@ fn process_command(
                     if let Some(update) = fetch_full_update(adapter) {
                         let pv = update.playlist_version.clone();
                         let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
                     }
                     *last_status = Instant::now();
                 }
@@ -1014,7 +1016,7 @@ fn process_command(
                     if let Some(update) = fetch_full_update(adapter) {
                         let pv = update.playlist_version.clone();
                         let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
                     }
                     *last_status = Instant::now();
                 }
@@ -1033,7 +1035,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1046,7 +1048,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1074,7 +1076,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1101,7 +1103,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1126,7 +1128,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1164,7 +1166,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1173,7 +1175,7 @@ fn process_command(
             if let Some(update) = fetch_full_update(adapter) {
                 let pv = update.playlist_version.clone();
                 let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref());
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
             }
             *last_status = Instant::now();
         }
@@ -1209,6 +1211,7 @@ fn sync_queue(
     local_queue: &mut Vec<crate::mpd::QueueEntry>,
     last_version: &mut Option<String>,
     current_version: Option<&str>,
+    plchanges_count: &mut u32,
 ) {
     let version = current_version
         .map(|v| v.to_string())
@@ -1224,14 +1227,86 @@ fn sync_queue(
         return;
     }
 
+    // Determine whether to use incremental plchanges or full sync
+    let use_incremental = last_version.is_some()
+        && *plchanges_count < 50
+        && !version_wrapped(last_version.as_deref(), Some(ver.as_str()));
+
+    if use_incremental {
+        match try_incremental_sync(adapter, local_queue, last_version.as_deref()) {
+            Ok(()) => {
+                *plchanges_count += 1;
+                *last_version = Some(ver.clone());
+                let _ = event_tx.try_send(MpdEvent::Queue(local_queue.clone()));
+                return;
+            }
+            Err(e) => {
+                log::warn!("[MPD] plchanges failed ({e}), falling back to full sync");
+            }
+        }
+    }
+
+    // Full sync
     match adapter.list_queue() {
         Ok(queue) => {
             *local_queue = queue;
             *last_version = Some(ver.clone());
+            *plchanges_count = 0;
             let _ = event_tx.try_send(MpdEvent::Queue(local_queue.clone()));
         }
         Err(e) => log::error!("queue sync failed: {e}"),
     }
+}
+
+/// Detect playlist version counter wrap (32-bit counter, delta > 1M).
+fn version_wrapped(old: Option<&str>, new: Option<&str>) -> bool {
+    let (Some(old_str), Some(new_str)) = (old, new) else { return false };
+    let (Ok(old_num), Ok(new_num)) = (old_str.parse::<u64>(), new_str.parse::<u64>()) else { return false };
+    // A large backward jump means the 32-bit counter wrapped
+    new_num < old_num && old_num - new_num > 1_000_000
+}
+
+/// Attempt incremental queue sync via `plchanges`.
+/// Merges added/changed entries into `local_queue` and removes entries
+/// at positions beyond the current playlist length (deletions).
+fn try_incremental_sync(
+    adapter: &mut MpdAdapter,
+    local_queue: &mut Vec<crate::mpd::QueueEntry>,
+    last_version: Option<&str>,
+) -> Result<(), crate::mpd::Error> {
+    let version = last_version.ok_or_else(|| crate::mpd::Error::Protocol("no previous version".into()))?;
+    let changes = adapter.plchanges(version)?;
+    let playlist_len = adapter.status()
+        .ok()
+        .and_then(|s| s.get("playlistlength").cloned())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // Merge changes into local queue by position.
+    // Extend with empty placeholders if a position is beyond the current length
+    // (entries were added by another client beyond our local tail).
+    for entry in changes {
+        let pos = entry.position as usize;
+        if pos >= local_queue.len() {
+            local_queue.resize(pos + 1, crate::mpd::QueueEntry {
+                position: 0, id: 0, title: None, artist: None,
+                album: None, duration: None, file: String::new(),
+            });
+        }
+        local_queue[pos] = entry;
+    }
+
+    // Truncate to playlist length (handles deletions from end)
+    if local_queue.len() > playlist_len {
+        local_queue.truncate(playlist_len);
+    }
+
+    // Re-index positions
+    for (i, entry) in local_queue.iter_mut().enumerate() {
+        entry.position = i as i32;
+    }
+
+    Ok(())
 }
 
 /// Group a flat (artist, album) list by artist name, sorted alphabetically.
