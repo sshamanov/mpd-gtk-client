@@ -385,13 +385,14 @@ impl App {
                 window.set_default_size(geo.width, geo.height);
             }
 
-            // Save window geometry on close (using glib::ObjectExt::set_data pattern)
+            // Save window geometry on close — reuse already-loaded config
             {
                 let w = window.clone();
+                let cfg_for_close = cfg.clone();
                 window.connect_close_request(move |_| {
                     let cur_w = w.default_width();
                     let cur_h = w.default_height();
-                    let mut c = crate::config::Config::load();
+                    let mut c = cfg_for_close.clone();
                     c.window_geometry = Some(crate::config::WindowGeometry {
                         width: cur_w.max(1), height: cur_h.max(1),
                         x: 0, y: 0,

@@ -216,14 +216,14 @@ development_status:
 
   epic-32: done
 
-  epic-33: backlog
+  epic-33: done
   33-1-join-notification-router-thread: done
   33-2-selective-event-cloning-for-router: done
   33-3-document-toast-channel-sizing: done
   33-4-extract-toast-timeout-constants: done
 
   epic-34: backlog
-  34-1-eliminate-redundant-config-load: backlog
+  34-1-eliminate-redundant-config-load: done
   34-2-guard-backspace-at-root: backlog
   34-3-fix-notifications-doc-comment: backlog
   34-4-log-image-decode-failures: backlog
