@@ -188,7 +188,8 @@ fn decode_and_resize(data: &[u8]) -> Result<Vec<u8>, String> {
             "image dimensions {w}x{h} exceed MAX_DIM ({MAX_DIM}), rejecting to prevent OOM"
         ));
     }
-    let img = image::load_from_memory(data).map_err(|e| format!("{e}"))?;
+    let img = image::load_from_memory(data)
+        .map_err(|e| format!("{e} (data size: {} bytes)", data.len()))?;
     let rgba = img.to_rgba8();
     let resized = image::imageops::resize(&rgba, 200, 200, FilterType::Lanczos3);
     Ok(resized.into_raw())
@@ -248,7 +249,8 @@ fn ensure_jpeg(data: &[u8]) -> Vec<u8> {
         }
         Err(e) => {
             log::warn!(
-                "[cover-proc] Non-JPEG decode failed: {e}, writing original data"
+                "[cover-proc] Non-JPEG decode failed ({} bytes): {e}, writing original data",
+                data.len()
             );
             data.to_vec()
         }
