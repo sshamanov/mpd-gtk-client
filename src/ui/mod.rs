@@ -741,7 +741,6 @@ impl App {
             });
 
             // search_changed: debounced with local index check + MPD fallback.
-            let se_tx = cmd_tx.clone();
             let se_gen = search_gen.clone();
             let se_group = prev_group.clone();
             let se_active_group = active_group.clone();
@@ -774,15 +773,12 @@ impl App {
                 let qc = q.clone();
                 let gen_c = se_gen.clone();
                 let scmd = se_scmd.clone();
-                let tx = se_tx.clone();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(150),
                     move || {
                         if gen_c.get() != this_gen { return; }
                         // Send to search worker (story 28-3): worker emits SearchResults via event_tx
                         scmd.send(SearchCommand::Search(qc.clone(), this_gen));
-                        // MPD search fallback (fires unconditionally; local results arrive first)
-                        let _ = tx.send(MpdCommand::Search(qc));
                     },
                 );
             });
