@@ -231,7 +231,7 @@ development_status:
   35-2-persist-playlist-version-across-reconnects: done
 
   epic-36: backlog
-  36-1-mpd-command-batch-variant: backlog
+  36-1-mpd-command-batch-variant: done
   36-2-use-batch-for-playalbum-addalbum: backlog
 
   epic-37: backlog

@@ -60,6 +60,10 @@ pub enum MpdCommand {
     Close,
     /// Trigger MPD's `update` (rescan the music library).
     Update,
+    /// Execute multiple commands as a single atomic MPD command list.
+    /// Sub-commands that map to single MPD protocol lines are collected and sent
+    /// via `command_list_begin`/`command_list_end`.
+    Batch(Vec<MpdCommand>),
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -1191,6 +1195,41 @@ fn process_command(
                 let _ = event_tx.try_send(MpdEvent::LibraryChanged);
             }
         }
+        MpdCommand::Batch(commands) => {
+            if commands.is_empty() {
+                return false;
+            }
+            let mut strings: Vec<String> = Vec::with_capacity(commands.len());
+            for cmd in &commands {
+                let s = command_to_mpd_strings(cmd);
+                if s.is_empty() {
+                    log::error!("[MPD] Batch: unsupported sub-command {:?}", cmd);
+                    let _ = event_tx.try_send(MpdEvent::Toast {
+                        message: format!("Batch error: unsupported sub-command"),
+                        level: crate::mpd::state_machine::ToastLevel::Error,
+                    });
+                    return false;
+                }
+                strings.extend(s);
+            }
+            match adapter.send_batch(&strings) {
+                Ok(_) => {
+                    if let Some(update) = fetch_full_update(adapter) {
+                        let pv = update.playlist_version.clone();
+                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+                    }
+                    *last_status = Instant::now();
+                }
+                Err(e) => {
+                    log::error!("[MPD] Batch failed: {e}");
+                    let _ = event_tx.try_send(MpdEvent::Toast {
+                        message: format!("Batch operation failed: {e}"),
+                        level: crate::mpd::state_machine::ToastLevel::Error,
+                    });
+                }
+            }
+        }
         MpdCommand::Close => {
             log::info!("[MPD] received Close command, sending close to MPD");
             let _ = adapter.send_command("close");
@@ -1201,6 +1240,51 @@ fn process_command(
     false
 }
 
+
+/// Convert an MpdCommand variant to its MPD protocol command string(s).
+/// Returns an empty Vec for variants that don't map to a single command line
+/// (e.g., PlayAlbum which requires find_album_uris lookup).
+fn command_to_mpd_strings(cmd: &MpdCommand) -> Vec<String> {
+    match cmd {
+        MpdCommand::Play => vec!["play".into()],
+        MpdCommand::Pause => vec!["pause".into()],
+        MpdCommand::Stop => vec!["stop".into()],
+        MpdCommand::Next => vec!["next".into()],
+        MpdCommand::Previous => vec!["previous".into()],
+        MpdCommand::Seek(pos) => vec![format!("seekcur {pos}")],
+        MpdCommand::Clear => vec!["clear".into()],
+        MpdCommand::Update => vec!["update".into()],
+        MpdCommand::PlayPosition(pos) => vec![format!("play {pos}")],
+        MpdCommand::DeleteId(id) => vec![format!("deleteid {id}")],
+        MpdCommand::MoveId(id, to_pos) => vec![format!("moveid {id} {to_pos}")],
+        // Complex commands that require URI lookup or directory listing —
+        // caller should use the dedicated single-command variants instead.
+        MpdCommand::PlayAlbum(_)
+        | MpdCommand::PlayUris(_)
+        | MpdCommand::Add(_)
+        | MpdCommand::AddAt(..)
+        | MpdCommand::AddUris(_)
+        | MpdCommand::InsertNext(_)
+        | MpdCommand::InsertNextUris(_)
+        | MpdCommand::PlayDirectory(_)
+        | MpdCommand::AddDirectory(_)
+        | MpdCommand::InsertNextDirectory(_)
+        | MpdCommand::Search(_)
+        | MpdCommand::SearchFiles(_)
+        | MpdCommand::ListDirectory(_)
+        | MpdCommand::PlayFile(_)
+        | MpdCommand::Status
+        | MpdCommand::CurrentSong
+        | MpdCommand::ListAlbums
+        | MpdCommand::ListAlbumsGrouped(_)
+        | MpdCommand::ListQueue
+        | MpdCommand::ListAlbumTracks(_)
+        | MpdCommand::FetchCovers(_)
+        | MpdCommand::Reconnect
+        | MpdCommand::Close
+        | MpdCommand::Batch(_) => vec![],
+    }
+}
 
 /// Sync the local queue copy from MPD when the playlist version has changed.
 /// Skips the round-trip when the version matches (`last_version == current_version`).
