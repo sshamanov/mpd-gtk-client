@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use ureq::Error;
 
+use crate::config::current_month;
+use crate::mpd::state_machine::{MpdEvent, ToastLevel};
+
 /// The User-Agent sent with all MusicBrainz API requests.
 /// MusicBrainz requires a unique per-application User-Agent string.
 const USER_AGENT: &str = concat!("mpd-client/", env!("CARGO_PKG_VERSION"));
@@ -101,21 +104,64 @@ impl CoverOnlineProvider {
 
     /// Look up cover art for the given artist and album.
     ///
-    /// 1. Enforces the rate limit (sleeps if called too soon after the last request).
-    /// 2. Searches MusicBrainz for a matching release.
-    /// 3. Downloads the cover image from Cover Art Archive.
-    /// 4. Returns raw image bytes on success, `None` on failure.
-    pub fn lookup(&mut self, artist: &str, album: &str) -> Option<Vec<u8>> {
+    /// 1. Checks monthly data cap (if cap_mb > 0) — returns None if exceeded.
+    /// 2. Enforces the rate limit (sleeps if called too soon after the last request).
+    /// 3. Searches MusicBrainz for a matching release.
+    /// 4. Downloads the cover image from Cover Art Archive.
+    /// 5. Returns raw image bytes on success, `None` on failure.
+    ///
+    /// Byte counts from HTTP responses are added to `bytes_downloaded`.
+    /// When the cap is first exceeded, a `MpdEvent::Toast` is emitted on `event_tx`.
+    /// Month boundary is checked against `last_reset_month`.
+    pub fn lookup(
+        &mut self,
+        artist: &str,
+        album: &str,
+        cap_mb: u64,
+        bytes_downloaded: &mut u64,
+        last_reset_month: &mut u32,
+        event_tx: &std::sync::mpsc::SyncSender<MpdEvent>,
+    ) -> Option<Vec<u8>> {
         log::debug!("[online_cover] lookup '{album}' by '{artist}'");
 
-        // Step 1: Rate limiting
+        // Step 0: Month boundary check — reset counter on calendar month rollover
+        let now_month = current_month();
+        if now_month != *last_reset_month {
+            log::info!(
+                "[online_cover] Month boundary crossed ({} → {now_month}), resetting byte counter",
+                *last_reset_month
+            );
+            *bytes_downloaded = 0;
+            *last_reset_month = now_month;
+        }
+
+        // Step 1: Cap check — suspend lookups if monthly cap already exceeded
+        let cap_bytes = cap_mb.saturating_mul(1024 * 1024);
+        if cap_mb > 0 && *bytes_downloaded >= cap_bytes {
+            log::info!(
+                "[online_cover] Monthly data cap ({cap_mb} MB) reached, lookups suspended"
+            );
+            return None;
+        }
+
+        // Step 2: Rate limiting
         self.enforce_rate_limit();
 
-        // Step 2: Search MusicBrainz for the release MBID
-        let mbid = self.search_musicbrainz(artist, album)?;
+        // Step 3: Search MusicBrainz for the release MBID
+        let mbid = self.search_musicbrainz(artist, album, bytes_downloaded)?;
 
-        // Step 3: Download cover from Cover Art Archive with backoff on retryable errors
-        self.download_cover_with_backoff(&mbid, album)
+        // Step 4: Download cover from Cover Art Archive with backoff on retryable errors
+        let result = self.download_cover_with_backoff(&mbid, album, bytes_downloaded);
+
+        // Emit toast when cap is first exceeded (the lookup that pushed us over the limit)
+        if cap_mb > 0 && *bytes_downloaded >= cap_bytes {
+            let _ = event_tx.try_send(MpdEvent::Toast {
+                message: "Online cover lookup paused — monthly data cap reached".into(),
+                level: ToastLevel::Warn,
+            });
+        }
+
+        result
     }
 
     /// Wait if the time since the last request is less than the rate limit.
@@ -129,7 +175,13 @@ impl CoverOnlineProvider {
     }
 
     /// Search MusicBrainz for a release matching the given artist and album.
-    fn search_musicbrainz(&mut self, artist: &str, album: &str) -> Option<String> {
+    /// Adds the HTTP response body size to `bytes_downloaded`.
+    fn search_musicbrainz(
+        &mut self,
+        artist: &str,
+        album: &str,
+        bytes_downloaded: &mut u64,
+    ) -> Option<String> {
         let query_str = format!("artist:{} AND release:{}", artist, album);
         let url = format!("{MB_SEARCH_URL}?query={}&fmt=json", urlencode(&query_str));
 
@@ -170,6 +222,9 @@ impl CoverOnlineProvider {
             }
         };
 
+        // Count bytes downloaded
+        *bytes_downloaded = bytes_downloaded.saturating_add(body.len() as u64);
+
         // Parse the JSON response
         let search_response: MbSearchResponse = match serde_json::from_slice(&body) {
             Ok(r) => r,
@@ -193,7 +248,13 @@ impl CoverOnlineProvider {
     }
 
     /// Download cover art from Cover Art Archive with exponential backoff retry.
-    fn download_cover_with_backoff(&mut self, mbid: &str, album: &str) -> Option<Vec<u8>> {
+    /// Adds the HTTP response body size to `bytes_downloaded`.
+    fn download_cover_with_backoff(
+        &mut self,
+        mbid: &str,
+        album: &str,
+        bytes_downloaded: &mut u64,
+    ) -> Option<Vec<u8>> {
         // Rate limit before the CAA request
         self.enforce_rate_limit();
 
@@ -221,6 +282,8 @@ impl CoverOnlineProvider {
                             return None;
                         }
                     };
+                    // Count bytes downloaded
+                    *bytes_downloaded = bytes_downloaded.saturating_add(data.len() as u64);
                     log::debug!(
                         "[online_cover] CAA download successful for '{album}' ({} bytes)",
                         data.len()

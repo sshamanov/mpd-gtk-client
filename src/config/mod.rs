@@ -134,13 +134,49 @@ pub struct CoverCacheConfig {
     /// Maximum cache size in megabytes before LRU eviction kicks in (default: 1000).
     #[serde(default = "default_cache_max_size_mb")]
     pub max_size_mb: u64,
+    /// Monthly data cap for online cover lookups in megabytes (0 = unlimited, default: 500).
+    #[serde(default = "default_monthly_data_cap_mb")]
+    pub monthly_data_cap_mb: u64,
+    /// Total bytes downloaded this month from online cover lookups.
+    #[serde(default)]
+    pub monthly_bytes_downloaded: u64,
+    /// Month number (1-12) when the byte counter was last reset.
+    #[serde(default = "current_month")]
+    pub last_reset_month: u32,
 }
 
 fn default_cache_max_size_mb() -> u64 { 1000 }
+fn default_monthly_data_cap_mb() -> u64 { 500 }
+
+pub(crate) fn current_month() -> u32 {
+    use std::time::SystemTime;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    civil_month_from_days((now.as_secs() / 86400) as i64)
+}
+
+/// Convert days since Unix epoch to month number (1-12).
+/// Uses Howard Hinnant's civil_from_days algorithm (public domain).
+fn civil_month_from_days(days: i64) -> u32 {
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = mp as i32 + if mp < 10 { 3 } else { -9 };
+    m as u32
+}
 
 impl Default for CoverCacheConfig {
     fn default() -> Self {
-        Self { max_size_mb: 1000 }
+        Self {
+            max_size_mb: 1000,
+            monthly_data_cap_mb: 500,
+            monthly_bytes_downloaded: 0,
+            last_reset_month: current_month(),
+        }
     }
 }
 

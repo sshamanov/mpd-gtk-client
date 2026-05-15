@@ -38,6 +38,8 @@ generated: "2026-04-25"
 last_updated: "2026-05-15"
 
 
+
+
 project: mpd-client
 project_key: NOKEY
 tracking_system: file-system
@@ -241,3 +243,11 @@ development_status:
   epic-38: done
   38-1-dedicated-mpd-metadata-connection-thread: done
   38-2-route-metadata-commands-to-dedicated-connection: done
+
+  epic-39: in-progress
+  39-1-network-usage-cap: done
+  39-2-memory-monitoring: ready-for-dev
+
+  epic-40: backlog
+  40-1-layout-profile-export-import: ready-for-dev
+  40-2-layout-reset-defaults: ready-for-dev

@@ -1868,3 +1868,419 @@ As a developer, I want `image::open` decode failures in the Cover Proc worker to
 **Then** no additional log messages are emitted (no regression)
 
 **Technical Notes:** In `cover_proc.rs`, the `decode_and_resize` function at line 156 returns `Result<Vec<u8>, String>`. The caller at line 136 logs the error: `log::warn!("[cover-proc] '{key}': JPEG decode failed ({e}), skipping CoverRefreshed...")`. However, the error string from `image::load_from_memory` is not descriptive enough. Fix: in `decode_and_resize`, before calling `image::load_from_memory`, log the data size and album key so that administrators can correlate the failure with specific album data. The existing `log::warn!` call at line 148 already logs the album key — confirm this is sufficient, and add data size if missing.
+
+---
+
+## Epic 35: Incremental Queue Sync via plchanges
+
+**Goal:** Replace full `playlistinfo` re-fetches on every queue change with incremental updates via MPD's `plchanges <version>` command. Preserve UI state (scroll position, selection, animations) during surgical queue updates while maintaining correctness via periodic full syncs.
+
+**ADRs:** §706 (Queue Update Strategy)
+
+**FRs covered:** FR-Q8 (queue sync)
+
+### Story 35.1: Wire plchanges into State Machine for Incremental Queue Updates
+
+As a user, I want queue updates to be incremental so that my scroll position, selection, and animations are not disrupted by full playlistinfo re-fetches on every queue change.
+
+**Acceptance Criteria:**
+
+**Given** the state machine processes a queue change event (playlist signal from idle)
+**When** the state machine calls the queue update handler
+**Then** it uses `adapter.plchanges(last_version)` instead of `adapter.list_queue()`
+**And** deletions are reconciled by cross-referencing current local positions against the reported playlist length
+
+**Given** 50 incremental updates have occurred since the last full sync
+**When** the 51st queue change is detected
+**Then** a full `playlistinfo` sync is performed to reconcile any drift
+
+**Given** the playlist version counter wraps around (32-bit overflow detection: new_version < old_version with delta > 1M)
+**When** a queue change is detected
+**Then** a full `playlistinfo` sync is performed
+
+**Given** `plchanges` returns an error
+**When** the error is caught
+**Then** the state machine falls back to a full `playlistinfo` re-fetch
+
+**Technical Notes:**
+- `MpdAdapter::plchanges(version)` already exists at `src/mpd/mod.rs:770` but is never called by the state machine
+- The `status` response already carries `playlist: <version>` which is parsed but not stored for plchanges usage
+- Current behavior: `MpdCommand::ListQueue` → `adapter.list_queue()` → full fetch. Change to store `playlist_version` in state, use `plchanges` on subsequent updates.
+- Track `plchanges_call_count` since last full sync in the connected loop state. After 50 incremental calls, force a full sync.
+- Deletions detection: `plchanges` returns only added/changed songs (with new position). Entries at positions >= new playlist length were deleted. Remove them from the local queue.
+- UI integration: update the queue model via surgical `items_changed()` signals where possible, otherwise emit the same `MpdEvent::Queue` with the merged result.
+
+### Story 35.2: Persist and Recover playlist_version Across Reconnections
+
+As a developer, I want the `playlist_version` counter to be reset on reconnect so that the first queue update after reconnection uses a full `playlistinfo` sync rather than stale version comparison.
+
+**Acceptance Criteria:**
+
+**Given** the MPD connection drops and reconnects
+**When** the new `connected_loop` starts
+**Then** the stored `playlist_version` is reset to 0
+**And** the first queue update after reconnect uses a full `playlistinfo` sync (not plchanges)
+
+**Given** a full sync is performed
+**When** the sync completes
+**Then** the new `playlist_version` from the `status` response is stored for subsequent incremental updates
+
+**Technical Notes:** Store `playlist_version: u64` in the `Connected` state of the state machine. Reset on `Disconnected`. Initially fetch full playlistinfo, record the version, then use plchanges for subsequent updates.
+
+---
+
+## Epic 36: Command List Batching for Atomic Operations
+
+**Goal:** Add `MpdCommand::Batch(Vec<MpdCommand>)` variant for atomic bulk operations via MPD's `command_list_begin`/`command_list_end`, reducing channel messages and MPD round-trips. Use for all-or-nothing operations (PlayAlbum, AddAlbum) where transactional semantics are required.
+
+**ADRs:** §689 (Command List Batching)
+
+**FRs covered:** FR-B1 (album browsing), FR-Q5 (play now)
+
+### Story 36.1: Add MpdCommand::Batch Variant
+
+As a developer, I want an `MpdCommand::Batch(Vec<MpdCommand>)` variant so that atomic bulk operations can be sent as a single channel message and executed as a single MPD command list.
+
+**Acceptance Criteria:**
+
+**Given** the MPD state machine processes an `MpdCommand::Batch(commands)`
+**When** the command is dispatched
+**Then** `adapter.command_list_begin()` is called before the first sub-command
+**And** each sub-command is written to the socket via `adapter.send_raw()`
+**And** `adapter.command_list_end()` is called after the last sub-command
+**And** responses are consumed until OK for each command in sequence
+
+**Given** any sub-command in the batch fails (returns ACK)
+**When** the failure is detected
+**Then** the entire batch is aborted per MPD protocol semantics
+**And** an error is logged with the failing command and the batch context
+**And** a `Toast { level: Error, message: "Batch operation failed: ..." }` event is emitted
+
+**Given** a batch is empty
+**When** it reaches the dispatch handler
+**Then** it is a no-op (no MPD commands sent, no errors)
+
+**Technical Notes:**
+- Add variant to `MpdCommand` enum in `src/mpd/state_machine.rs:17`: `Batch(Vec<MpdCommand>)`
+- The dispatch handler (at line ~798) matches `MpdCommand::Batch(cmds)` → calls `adapter.command_list_begin()`, iterates, calls `adapter.command_list_end()`.
+- `MpdAdapter::command_list_begin()` and `command_list_end()` already exist at `src/mpd/mod.rs:386-391`
+- Need a new `adapter.send_raw(cmd: &str)` method that writes to the stream without parsing a response — used during batch mode.
+- Error handling: wrap each sub-command in a `list_ok` check; on first non-OK, send `command_list_end`, consume remaining responses, return error.
+
+### Story 36.2: Use Batch for PlayAlbum and AddAlbum
+
+As a user, I want adding or playing a multi-track album to be faster, so that queue operations complete in a single round-trip regardless of album track count.
+
+**Acceptance Criteria:**
+
+**Given** the user plays an album via `PlayAlbum("AlbumName")`
+**When** the state machine processes the command
+**Then** a `Batch` is constructed containing: `Clear` + `Add(track_uris...)` + `Play(0)`
+**And** the batch is sent as a single MPD command_list transaction
+
+**Given** the user adds an album to the queue via `AddAlbum("AlbumName")`
+**When** the state machine processes the command
+**Then** a `Batch` is constructed containing: `Add(track_uris...)`
+**And** the batch is sent as a single MPD command_list transaction
+
+**Technical Notes:**
+- Both `PlayAlbum` and `AddAlbum` currently fetch album tracks via `ListAlbumTracks` first, then iterate to send individual `Add` commands or build `PlayUris`/`AddUris` vectors
+- The batch construction should happen after `ListAlbumTracks` returns, collecting all URIs into a single `Batch(Vec![...])`
+- `PlayUris` and `AddUris` currently build `command_list_begin/end` manually — they should be refactored to use the new `Batch` variant for consistency
+
+---
+
+## Epic 37: Track Identity for Queue Consistency
+
+**Goal:** Add multi-factor track identity using `(file_size, mtime, path)` triple to QueueEntry for robust queue synchronization across reconnections. Apply rsync-style file identity to detect modifications and stale entries.
+
+**ADRs:** §858 (Track Identity & Queue Synchronization)
+
+**FRs covered:** FR-Q8 (queue sync), FR-P4 (disconnection/reconnection)
+
+### Story 37.1: Add file_size and mtime Fields to QueueEntry
+
+As a developer, I want QueueEntry to carry file_size and mtime metadata so that track identity can be verified across reconnections.
+
+**Acceptance Criteria:**
+
+**Given** a `QueueEntry` struct is constructed from MPD's `playlistinfo` or `plchanges` response
+**When** the response includes `file_size:` and `mtime:` fields
+**Then** these fields are parsed into `QueueEntry.file_size: Option<u64>` and `QueueEntry.mtime: Option<u64>`
+**And** if either field is missing from the MPD response, it defaults to `None`
+
+**Given** the `QueueEntry` struct
+**When** it is serialized or cloned
+**Then** `file_size` and `mtime` are preserved (derive Clone)
+
+**Technical Notes:**
+- MPD's `playlistinfo` response includes optional `file_size:` and `mtime:` lines
+- The current `QueueEntry` struct at `src/mpd/mod.rs:188` has: `position, id, title, artist, album, duration, file`
+- Add: `pub file_size: Option<u64>, pub mtime: Option<u64>`
+- The parser in `MpdAdapter::parse_queue_response()` at `src/mpd/mod.rs:775` needs to extract these fields
+- Both fields are informational only — the queue sync logic uses them for identity verification
+
+### Story 37.2: Implement Multi-Factor Track Identity Verification on Reconnect
+
+As a user, I want the queue to correctly identify tracks across reconnections so that modified or deleted files are detected and removed from the queue gracefully.
+
+**Acceptance Criteria:**
+
+**Given** the MPD connection drops and reconnects, and the queue is re-fetched
+**When** the state machine reconciles the re-fetched queue against the local snapshot
+**Then** each track's identity is verified using the (file_size, mtime, file) triple
+**And** tracks where file_size or mtime differ are treated as "modified — no match" and removed from the queue
+**And** tracks where all three match are treated as unchanged and kept in place
+
+**Given** a track in the queue has no file_size or mtime (MPD did not provide them)
+**When** identity verification runs
+**Then** the fallback uses (file, artist, album, duration) for matching
+**And** if the fallback match fails, the track is removed with a toast notification
+
+**Given** a file referenced in the queue no longer exists in MPD's playlist
+**When** the queue is re-fetched
+**Then** the missing track is removed from the local queue
+**And** a toast notification is shown: "Removed N missing track(s) from queue"
+
+**Technical Notes:**
+- Identity logic as specified in ADR §858: primary key `(file_size, mtime)`, secondary key `file_path`, metadata fallback `(artist, album, year, sample_rate, bit_depth)`
+- The verification runs after reconnection when the queue is first re-fetched via full playlistinfo
+- Identity mismatch → remove from queue with toast. This prevents playing a track that the user has modified or replaced
+- Edge case: network mounts that don't support mtime/file_size → degraded to path+metadata fallback. The mtime from MPD's protocol is the modification time MPD recorded, not the file system mtime — this is the correct source
+
+---
+
+## Epic 38: Dedicated MPD Metadata Connection
+
+**Goal:** Add a third MPD TCP connection dedicated to metadata-heavy queries (`list album group`, `lsinfo`, `ListAlbumTracks`) so that the command/status connection is never blocked by large list responses. Labeled as "future" in the original architecture design.
+
+**ADRs:** §1087 (Concurrency & Threading, §3c Thread Model)
+
+**FRs covered:** NFR-P2 (UI responsiveness), NFR-P1 (Library load time)
+
+### Story 38.1: Spawn Dedicated MPD Metadata Connection Thread
+
+As a developer, I want a third MPD TCP connection dedicated to metadata queries so that the command/status connection is never blocked by large `list` or `lsinfo` responses.
+
+**Acceptance Criteria:**
+
+**Given** the application starts and connects to MPD
+**When** the MPD IO thread establishes the command/status connection
+**Then** a third MPD connection is established for metadata queries (alongside the existing command/status and cover connections)
+**And** the metadata connection uses its own `TcpStream` to the same MPD host and port
+
+**Given** the metadata thread is running
+**When** a metadata command (e.g., `ListAlbumsGrouped`, `ListAlbumTracks`, `ListDirectory`) arrives
+**Then** it is dispatched on the metadata connection, not the command/status connection
+**And** the command/status connection remains free to handle status, queue, and playback commands concurrently
+
+**Given** the MPD connection drops
+**When** reconnection occurs
+**Then** the metadata connection is also re-established
+**And** any in-flight metadata query is re-issued on the new connection
+
+**Technical Notes:**
+- Follow the same pattern as the MPD Cover thread (epic 28-1): a separate TCP connection, created when needed, dropped on disconnect
+- The metadata connection does NOT run an idle loop — it processes queries on-demand, one at a time (MPD protocol is serialized per-connection)
+- Channel: `mpsc::Receiver<MetadataCommand>` where `MetadataCommand` wraps the commands that should be routed to this connection
+- `MpdCommand` variants moved to metadata connection: `ListAlbums`, `ListAlbumsGrouped`, `ListDirectory`, `ListAlbumTracks`, `Search`, `SearchFiles`, `ListQueue` (or keep ListQueue on command/status — it's fast)
+- Startup: the metadata connection is created during the `Connected` phase, after the MPD IO and MPD Cover connections are established
+- Thread lifecycle: persistent thread (like MPD IO), signals via `ShuttingDown` flag
+- The metadata connection's thread does NOT emit events itself — it returns results via a response channel or writes results into the MPD IO thread's event output channel
+
+### Story 38.2: Route Metadata Commands Through the Dedicated Connection
+
+As a developer, I want the state machine to route metadata-heavy commands to the metadata connection so that command/status throughput is not degraded by bulk queries.
+
+**Acceptance Criteria:**
+
+**Given** the UI sends a `ListAlbumsGrouped("Date")` command
+**When** the state machine dispatches it
+**Then** the command is forwarded to the metadata connection's channel (not the command/status connection)
+**And** the result arrives as an `MpdEvent::AlbumsGrouped` on the main event channel (same as today)
+
+**Given** the metadata connection is not yet established (during initial connection setup)
+**When** a metadata command is received
+**Then** it is dispatched on the command/status connection (fallback behavior)
+**And** a debug log notes the fallback
+
+**Given** the metadata connection is established
+**When** a low-latency command (Status, CurrentSong, Play, Pause, Next, etc.) is received
+**Then** it is dispatched on the command/status connection as before (no change)
+**And** no metadata connection overhead is incurred for fast commands
+
+**Technical Notes:**
+- Commands to route to metadata connection: `ListAlbums`, `ListAlbumsGrouped`, `ListDirectory`, `ListAlbumTracks`, `Search`, `SearchFiles`
+- Commands to keep on command/status connection: `Status`, `CurrentSong`, `Play`, `Pause`, `Next`, `Previous`, `Stop`, `Seek`, `Add`, `DeleteId`, `MoveId`, `Clear`, `ListQueue`, `PlayPosition`, `Reconnect`, `Close`, `Update`, `FetchCovers`
+- The routing decision is made in the state machine's `handle_command()` dispatch. Add a `metadata_tx: Option<mpsc::Sender<MpdCommand>>` field to the connected loop state.
+- Response forwarding: the metadata thread executes the command on its connection, parses the response into the appropriate `MpdEvent`, and sends it to the main event channel (the same `event_tx` used by the MPD IO thread).
+- The event channel is shared via `event_tx: mpsc::Sender<MpdEvent>` passed to both the MPD IO thread and the metadata thread. This preserves event ordering: the GTK main thread sees events from both connections on the same channel.
+
+---
+
+## Epic 39: Resource Monitoring & Limits
+
+**Goal:** Users can configure network usage limits for online cover lookups and receive warnings when memory usage exceeds thresholds, providing transparency into the application's resource consumption and preventing unbounded data usage.
+
+**FRs covered:** NFR-S3 (network usage cap), NFR-O3 (memory footprint monitoring)
+**ADRs:** §743 (Notification & System Integration), §621 (Logging & Observability)
+
+### Story 39.1: Configurable Network Usage Cap with Monitoring
+
+As a privacy-conscious user,
+I want to set a monthly network usage cap for online cover lookups,
+So that the application does not exceed my data budget when fetching artwork from the internet.
+
+**Acceptance Criteria:**
+
+**Given** the online-cover-art feature is enabled
+**When** the application fetches covers from online sources (MusicBrainz, Cover Art Archive)
+**Then** total bytes downloaded is tracked per session
+**And** a running total is compared against the configured monthly cap (default: 500MB)
+**And** if the cap is exceeded, online cover lookups are suspended for the remainder of the month
+**And** a toast notification is shown: "Online cover lookup paused — monthly data cap reached"
+
+**Given** the network usage cap is configurable
+**When** the user opens Settings
+**Then** they can set the monthly cap in megabytes (0 = unlimited)
+**And** the current month-to-date usage is displayed in the settings dialog
+**And** the usage counter resets at the start of each calendar month
+
+**Given** online cover lookups are disabled (default)
+**When** the application runs
+**Then** no network usage tracking is needed (no HTTP requests are made)
+
+**Technical Notes:**
+- Network usage tracking applies only to the `online-cover-art` feature (HTTP requests to MusicBrainz/Cover Art Archive)
+- MPD protocol traffic (local network, typically <1MB/hour) is NOT tracked — this cap is for external data only
+- Usage data persisted in config as `[cover_cache] monthly_bytes_downloaded` and `last_reset_month` (integer month number, 1-12)
+- Reset logic: compare current month against `last_reset_month` — if different, zero the counter
+- Warning mechanism: use the existing toast notification system (`ToastLevel::Warn`, 5s duration)
+- The cap is a soft limit — lookups are suspended with a toast, not blocked at the system level
+- Config field: `[cover_cache] monthly_data_cap_mb = 500` (0 = unlimited)
+- Low priority — most users keep online lookups disabled (opt-in by default)
+
+### Story 39.2: Memory Footprint Monitoring with Threshold Warning
+
+As a user,
+I want the application to warn me when memory usage exceeds a safe threshold,
+So that I can take action (close other applications, reduce library size) before the system becomes unresponsive.
+
+**Acceptance Criteria:**
+
+**Given** the application is running
+**When** memory usage exceeds 500MB RSS (Resident Set Size)
+**Then** a warning toast notification is shown: "Memory usage high (XXX MB) — consider closing other applications"
+**And** the warning is shown at most once every 60 seconds (rate-limited)
+**And** memory usage is checked at most once every 30 seconds (polling interval)
+
+**Given** memory usage returns below 500MB after a warning
+**When** the next check runs
+**Then** no warning is shown (threshold no longer exceeded)
+**And** no "memory usage recovered" notification is needed
+
+**Given** memory monitoring is implemented
+**When** a memory check runs
+**Then** the check reads `/proc/self/status` for `VmRSS` on Linux (the only target platform)
+**And** if the proc file is unreadable (permissions, container), the check is silently skipped with a debug log
+**And** the monitoring overhead is minimal (<1ms per check)
+
+**Technical Notes:**
+- Linux-only: read `VmRSS:` from `/proc/self/status` — provides resident memory in kB
+- Convert to MB for user display and threshold comparison
+- Polling: use the existing frame clock or a 30-second `glib::timeout_add_local` timer
+- Rate limiting: store `last_warning_time: Instant` in application state; suppress if <60s since last warning
+- Threshold default: 500MB (configurable via `[memory] warning_threshold_mb = 500` in config.toml)
+- Integration: check runs on the GTK main loop (fast proc read, no blocking). Memory monitoring is NOT part of the profiling instrumentation (epic 21) — it's a user-facing safety feature with toast notifications, not a developer tool
+- The warning toast uses `ToastLevel::Warn` with 5s duration
+- No action is taken beyond the warning — the application does not auto-throttle or reduce memory usage
+
+---
+
+## Epic 40: Layout Profile Management
+
+**Goal:** Users can export and import layout profiles (split ratio, rail width, column count preferences) as JSON files for sharing across installations, and reset individual or all layout dimensions to defaults.
+
+**FRs covered:** PRD §460-464 (User Customization & Persistence), FR-L4 (configurable layout values)
+
+### Story 40.1: Layout Profile Export/Import
+
+As a user who customizes the layout,
+I want to export my layout settings to a JSON file and import them on another machine,
+So that I can maintain a consistent layout across multiple installations without manual reconfiguration.
+
+**Acceptance Criteria:**
+
+**Given** the user has customized layout settings (split ratio, rail width, proportions, column preferences)
+**When** they click "Export Layout..." in the Settings dialog
+**Then** a file chooser dialog opens at a user-selected path
+**And** a JSON file is saved containing all layout-related settings
+**And** the JSON format includes a schema version field for forward compatibility
+
+**Given** the user has a layout profile JSON file from another installation
+**When** they click "Import Layout..." in the Settings dialog
+**Then** a file chooser dialog opens to select the JSON file
+**And** the file is validated against the expected schema
+**And** if valid, all layout settings in the file are applied immediately
+**And** if invalid (bad format, missing fields, wrong schema version), an error toast is shown with a description of the issue
+
+**Given** an import succeeds
+**When** the settings are applied
+**Then** the layout updates immediately (split ratio, rail proportions, column count)
+**And** the imported settings are persisted to config.toml
+**And** no restart is required
+
+**Technical Notes:**
+- Export format (JSON, not TOML — JSON is more portable and human-readable for sharing):
+  ```json
+  {
+    "schema_version": 1,
+    "layout": {
+      "split_ratio": 0.7,
+      "rail_width_min": 320,
+      "rail_width_max": 420,
+      "album_mode_proportions": [0.4, 0.2, 0.4],
+      "folder_mode_proportions": [0.55, 0.45]
+    }
+  }
+  ```
+- Layout settings exported are: `split_ratio`, `rail_width_min`, `rail_width_max`, `album_mode.{now_playing,current_album,queue}`, `folder_mode.{now_playing,queue}`, `column_count_preference`
+- Other config sections (connection, profiles, MPRIS, cover cache) are NOT exported — layout profiles are layout-only
+- Import merges into current config: layout values are overwritten, non-layout values preserved
+- File chooser: use `gtk4::FileChooserNative` with a filter for `.json` files
+- Schema version bumps when the layout settings structure changes; importer rejects unknown versions with a clear message
+
+### Story 40.2: Layout Dimension Reset to Defaults
+
+As a user who has customized layout settings,
+I want to reset individual layout dimensions or all layout settings to their defaults,
+So that I can recover from changes that don't work well for me without manually undoing each setting.
+
+**Acceptance Criteria:**
+
+**Given** the Settings dialog is open with layout customization options
+**When** the user clicks "Reset All Layout Settings"
+**Then** all layout values revert to defaults (split ratio 0.7, rail 320-420px, album 40/20/40, folder 55/45)
+**And** the layout updates immediately to reflect defaults
+**And** a confirmation toast is shown: "Layout settings reset to defaults"
+
+**Given** individual layout dimensions have reset buttons (split ratio reset, proportions reset)
+**When** the user clicks a single dimension's reset button
+**Then** only that dimension reverts to its default value
+**And** other layout settings are preserved unchanged
+**And** the layout updates immediately
+
+**Given** the user resets all or individual layout settings
+**When** the reset completes
+**Then** the updated settings are persisted to config.toml
+**And** the changes are applied immediately without requiring a restart
+
+**Technical Notes:**
+- Default values are defined as constants in one location (e.g., `LayoutDefaults` struct or named constants in the config module)
+- Individual reset buttons per dimension: split ratio, rail min width, rail max width, album mode proportions, folder mode proportions
+- "Reset All" button in the layout section of the Settings dialog
+- Confirmation dialog for "Reset All" (not for individual resets): "This will reset all layout settings to defaults. Continue?"
+- The reset modifies the in-memory config and triggers the layout service to recompute positions
+- Existing `Config::save()` mechanism persists the changes
+
+---

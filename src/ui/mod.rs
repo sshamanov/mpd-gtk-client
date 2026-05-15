@@ -989,6 +989,34 @@ impl App {
                 artist_check.set_tooltip_text(Some("When enabled, Artists view groups by AlbumArtist tag. When disabled, uses Artist tag."));
                 content.append(&artist_check);
 
+                // Network cap section
+                let cap_label = gtk4::Label::new(Some("Online Cover Data Cap (MB, 0 = unlimited):"));
+                cap_label.set_halign(gtk4::Align::Start);
+                cap_label.set_margin_top(12);
+                content.append(&cap_label);
+                let cap_spin = gtk4::SpinButton::new(
+                    Some(&gtk4::Adjustment::new(
+                        scfg.cover_cache.monthly_data_cap_mb as f64,
+                        0.0,
+                        10000.0,
+                        100.0,
+                        500.0,
+                        0.0,
+                    )),
+                    1.0,
+                    0,
+                );
+                cap_spin.set_margin_top(2);
+                content.append(&cap_spin);
+
+                // Current month-to-date usage
+                let usage_mb = scfg.cover_cache.monthly_bytes_downloaded as f64 / (1024.0 * 1024.0);
+                let usage_text = format!("Month-to-date usage: {:.1} MB", usage_mb);
+                let usage_label = gtk4::Label::new(Some(&usage_text));
+                usage_label.set_halign(gtk4::Align::Start);
+                usage_label.set_margin_top(2);
+                content.append(&usage_label);
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");
@@ -1004,10 +1032,12 @@ impl App {
                 let hc_checkbox = hc_check.clone();
                 let auto_start_box = auto_start_check.clone();
                 let artist_checkbox = artist_check.clone();
+                let cap_spin_clone = cap_spin.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.high_contrast = hc_checkbox.is_active();
                     c.use_album_artist = artist_checkbox.is_active();
+                    c.cover_cache.monthly_data_cap_mb = cap_spin_clone.value() as u64;
                     let new_auto_start = auto_start_box.is_active();
                     if new_auto_start != c.auto_start {
                         c.auto_start = new_auto_start;
