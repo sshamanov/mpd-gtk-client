@@ -328,7 +328,9 @@ impl MpdEventLoop {
         let metadata_cache = std::sync::Arc::new(crate::metadata::MetadataCache::new());
         let mc_thread = metadata_cache.clone();
 
-        // Search worker (story 28-3): owns SearchIndex, runs queries off GTK thread
+        // Search worker: commands are triggered by keystrokes (max ~6/s with 150ms
+        // debounce); 64 slots absorbs bursts. try_send drops when full as intentional
+        // backpressure, keeping the UI responsive under heavy typing.
         let (search_cmd_tx, search_cmd_rx) = mpsc::sync_channel::<SearchCommand>(64);
         let search_sender = SearchCommandSender::new(search_cmd_tx);
         let search_event_tx = event_tx.clone();

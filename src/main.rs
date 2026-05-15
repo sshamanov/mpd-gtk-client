@@ -216,7 +216,9 @@ fn main() {
         config.connection_target(),
     ));
 
-    // Create bounded MPD event channel (backpressure: drop events when UI is busy)
+    // Event channel carries all MPD events including rapid cover updates during scrolling;
+    // 1024 slots absorbs the burst from a full grid population (up to ~500 covers with
+    // 2 events each). Backpressure: try_send drops events when UI is busy.
     let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(1024);
     let (event_loop, cmd_tx, metadata_cache, search_cmd_tx) = MpdEventLoop::spawn(
         event_tx,
@@ -257,6 +259,9 @@ fn main() {
     // NotificationRouter — receives cloned MPD events from the GTK thread for
     // desktop notification dispatch via D-Bus (org.freedesktop.Notifications).
     // Skip spawning when mode is Toast (no desktop notifications needed).
+    // Toast channel (256): events are rare — connection state changes and user-triggered
+    // toasts, at most a few per minute. 256 slots never fills under normal operation;
+    // backpressure is not a concern for this channel.
     let (toast_tx, toast_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(256);
     let notif_mode = config.notifications.mode;
     let notif_stop = Arc::new(AtomicBool::new(false));

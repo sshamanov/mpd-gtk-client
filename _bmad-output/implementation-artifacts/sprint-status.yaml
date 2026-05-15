@@ -219,7 +219,7 @@ development_status:
   epic-33: backlog
   33-1-join-notification-router-thread: done
   33-2-selective-event-cloning-for-router: done
-  33-3-document-toast-channel-sizing: backlog
+  33-3-document-toast-channel-sizing: done
   33-4-extract-toast-timeout-constants: backlog
 
   epic-34: backlog
