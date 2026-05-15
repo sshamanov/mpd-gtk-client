@@ -225,5 +225,5 @@ development_status:
   epic-34: backlog
   34-1-eliminate-redundant-config-load: done
   34-2-guard-backspace-at-root: done
-  34-3-fix-notifications-doc-comment: backlog
+  34-3-fix-notifications-doc-comment: done
   34-4-log-image-decode-failures: backlog
