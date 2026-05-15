@@ -88,11 +88,13 @@ mod dbus {
 /// Receives `MpdEvent` from the GTK thread via `rx`, filters for `Toast`,
 /// `Connected`, and `Disconnected` events, checks the notification mode,
 /// and fires desktop notifications via D-Bus when mode is `Desktop` or `Both`.
+///
+/// Returns the `JoinHandle` so the caller can join the thread on shutdown.
 pub fn spawn(
     rx: mpsc::Receiver<MpdEvent>,
     mode: NotificationMode,
     stop: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("notification-router".into())
         .spawn(move || {
@@ -121,7 +123,7 @@ pub fn spawn(
 
             log::info!("[notification-router] Thread terminated");
         })
-        .expect("Failed to spawn notification-router thread");
+        .expect("Failed to spawn notification-router thread")
 }
 
 #[cfg(feature = "mpris")]

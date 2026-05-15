@@ -260,11 +260,12 @@ fn main() {
     let (toast_tx, toast_rx) = std::sync::mpsc::sync_channel::<MpdEvent>(256);
     let notif_mode = config.notifications.mode;
     let notif_stop = Arc::new(AtomicBool::new(false));
-    if notif_mode != config::NotificationMode::Toast {
-        notifications::router::spawn(toast_rx, notif_mode, notif_stop.clone());
+    let notif_handle: Option<std::thread::JoinHandle<()>> = if notif_mode != config::NotificationMode::Toast {
+        Some(notifications::router::spawn(toast_rx, notif_mode, notif_stop.clone()))
     } else {
         drop(toast_rx); // Channel dropped, toast_tx sends become no-ops
-    }
+        None
+    };
 
     // Signal handlers (SIGINT/SIGTERM) were removed — glib::source::unix_signal_add
     // was dropped in glib 0.22. Ctrl+Q calls app.quit() directly. On window close,
@@ -313,6 +314,19 @@ fn main() {
     // Clean up IPC artifacts
     ipc_stop.store(true, Ordering::Relaxed);
     notif_stop.store(true, Ordering::Relaxed);
+    if let Some(handle) = notif_handle {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("Notification-router thread did not exit within 1s, proceeding with shutdown");
+                break;
+            }
+            thread::park_timeout(Duration::from_millis(100));
+        }
+    }
     ipc::remove_socket();
     ipc::remove_lock();
     info!("Exiting");
