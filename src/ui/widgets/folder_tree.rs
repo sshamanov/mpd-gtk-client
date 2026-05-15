@@ -107,6 +107,12 @@ impl FolderBrowser {
         key_ctrl.connect_key_pressed(move |_ctrl, key, _code, _mods| {
             if key == gtk4::gdk::Key::Left || key == gtk4::gdk::Key::BackSpace {
                 let cur = sp_kb.borrow().clone();
+                // At root, parent navigation is meaningless — no-op to avoid sending
+                // an empty ListDirectory command.
+                if cur.is_empty() || cur == "/" {
+                    log::debug!("[folder-tree] BackSpace/Left at root, ignoring");
+                    return gtk4::glib::Propagation::Stop;
+                }
                 let parent = Path::new(&cur)
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
