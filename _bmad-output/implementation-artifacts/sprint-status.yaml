@@ -246,7 +246,7 @@ development_status:
 
   epic-39: in-progress
   39-1-network-usage-cap: done
-  39-2-memory-monitoring: ready-for-dev
+  39-2-memory-monitoring: done
 
   epic-40: backlog
   40-1-layout-profile-export-import: ready-for-dev

@@ -7,6 +7,7 @@ pub mod errors;
 pub mod ipc;
 pub mod keybindings;
 pub mod logging;
+pub mod memory;
 pub mod profiling;
 pub mod mpd;
 #[cfg(feature = "mpris")]

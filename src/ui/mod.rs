@@ -1017,6 +1017,26 @@ impl App {
                 usage_label.set_margin_top(2);
                 content.append(&usage_label);
 
+                // Memory warning threshold
+                let mem_label = gtk4::Label::new(Some("Memory Warning Threshold (MB):"));
+                mem_label.set_halign(gtk4::Align::Start);
+                mem_label.set_margin_top(12);
+                content.append(&mem_label);
+                let mem_spin = gtk4::SpinButton::new(
+                    Some(&gtk4::Adjustment::new(
+                        scfg.memory.warning_threshold_mb as f64,
+                        100.0,
+                        4000.0,
+                        100.0,
+                        500.0,
+                        0.0,
+                    )),
+                    1.0,
+                    0,
+                );
+                mem_spin.set_margin_top(2);
+                content.append(&mem_spin);
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");
@@ -1033,11 +1053,13 @@ impl App {
                 let auto_start_box = auto_start_check.clone();
                 let artist_checkbox = artist_check.clone();
                 let cap_spin_clone = cap_spin.clone();
+                let mem_spin_clone = mem_spin.clone();
                 save_btn.connect_clicked(move |_| {
                     let mut c = Config::load();
                     c.high_contrast = hc_checkbox.is_active();
                     c.use_album_artist = artist_checkbox.is_active();
                     c.cover_cache.monthly_data_cap_mb = cap_spin_clone.value() as u64;
+                    c.memory.warning_threshold_mb = mem_spin_clone.value() as u64;
                     let new_auto_start = auto_start_box.is_active();
                     if new_auto_start != c.auto_start {
                         c.auto_start = new_auto_start;
@@ -1832,6 +1854,7 @@ impl App {
             let fc_scmd = scmd.clone();
             let fc_mc = metadata_cache.clone();
             let fc_toast = toast_overlay.clone();
+            let mem_toast = toast_overlay.clone();
             let fc_ev_cover_paths = cover_paths.clone();
             let fc_ev_cover_tex_cache = cover_texture_cache.clone();
             let fc_mini_cw = mini_cover_widgets.clone();
@@ -2673,6 +2696,35 @@ impl App {
                 );
                 hc_css_cell.set(Some(hc_provider));
             }
+
+            // Memory monitoring timer (30s interval, rate-limited warnings at 60s)
+            let mem_last_warning: std::rc::Rc<std::cell::RefCell<Option<std::time::Instant>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
+            glib::timeout_add_local(std::time::Duration::from_secs(30), move || {
+                if let Some(rss_mb) = crate::memory::read_rss_mb() {
+                    let threshold = crate::config::Config::load().memory.warning_threshold_mb;
+                    if rss_mb >= threshold {
+                        let mut last = mem_last_warning.borrow_mut();
+                        let now = std::time::Instant::now();
+                        let should_warn = match *last {
+                            Some(t) => now.duration_since(t).as_secs() >= 60,
+                            None => true,
+                        };
+                        if should_warn {
+                            *last = Some(now);
+                            let toast = adw::Toast::new(&format!(
+                                "Memory usage high ({} MB) — consider closing other applications",
+                                rss_mb
+                            ));
+                            toast.set_timeout(5);
+                            mem_toast.add_toast(toast);
+                        }
+                    }
+                } else {
+                    log::debug!("[memory] /proc/self/status unreadable, skipping memory check");
+                }
+                glib::ControlFlow::Continue
+            });
         });
 
         application.run();

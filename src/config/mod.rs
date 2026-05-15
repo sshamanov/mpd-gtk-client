@@ -58,6 +58,9 @@ pub struct Config {
     /// Cover art cache settings.
     #[serde(default)]
     pub cover_cache: CoverCacheConfig,
+    /// Memory monitoring settings.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Named connection profiles (epic 15). Key = profile name.
     #[serde(default)]
     pub profiles: Option<HashMap<String, ProfileConfig>>,
@@ -180,6 +183,22 @@ impl Default for CoverCacheConfig {
     }
 }
 
+/// Memory monitoring settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// RSS memory warning threshold in megabytes (default: 500).
+    #[serde(default = "default_warning_threshold_mb")]
+    pub warning_threshold_mb: u64,
+}
+
+fn default_warning_threshold_mb() -> u64 { 500 }
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { warning_threshold_mb: 500 }
+    }
+}
+
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
 
@@ -191,6 +210,7 @@ impl Default for Config {
             mpris: MprisConfig { enabled: false },
             notifications: NotificationsConfig::default(),
             cover_cache: CoverCacheConfig::default(),
+            memory: MemoryConfig::default(),
             profiles: None,
             default_profile: None,
             last_profile: None,
