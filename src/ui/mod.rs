@@ -1037,6 +1037,105 @@ impl App {
                 mem_spin.set_margin_top(2);
                 content.append(&mem_spin);
 
+                // Layout profile export/import
+                let layout_label = gtk4::Label::new(Some("Layout Profile:"));
+                layout_label.set_halign(gtk4::Align::Start);
+                layout_label.set_margin_top(12);
+                content.append(&layout_label);
+                let layout_btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
+                layout_btn_box.set_margin_top(4);
+                let export_btn = gtk4::Button::with_label("Export Layout…");
+                let import_btn = gtk4::Button::with_label("Import Layout…");
+                let layout_status = gtk4::Label::new(None);
+                layout_status.set_halign(gtk4::Align::Start);
+                layout_status.set_margin_top(2);
+                layout_btn_box.append(&export_btn);
+                layout_btn_box.append(&import_btn);
+                content.append(&layout_btn_box);
+                content.append(&layout_status);
+
+                let dw_layout = d.clone();
+                let dw_layout2 = dw_layout.clone();
+                let ls_export = layout_status.clone();
+                export_btn.connect_clicked(move |_| {
+                    let cfg = crate::config::Config::load();
+                    let json = match cfg.export_layout_profile() {
+                        Ok(j) => j,
+                        Err(e) => {
+                            ls_export.set_text(&format!("Export error: {e}"));
+                            return;
+                        }
+                    };
+                    let dialog = gtk4::FileDialog::new();
+                    dialog.set_title("Export Layout Profile");
+                    dialog.set_accept_label(Some("Save"));
+                    let filters = {
+                        let filter = gtk4::FileFilter::new();
+                        filter.add_pattern("*.json");
+                        filter.set_name(Some("JSON Files"));
+                        let store = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                        store.append(&filter);
+                        store
+                    };
+                    dialog.set_filters(Some(&filters));
+                    let dir = gtk4::gio::File::for_path(dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")));
+                    dialog.set_initial_folder(Some(&dir));
+                    let ls = ls_export.clone();
+                    dialog.save(Some(&dw_layout), gtk4::gio::Cancellable::NONE, move |result| {
+                        if let Ok(file) = result {
+                            if let Some(path) = file.path() {
+                                if let Err(e) = std::fs::write(&path, &json) {
+                                    ls.set_text(&format!("Export failed: {e}"));
+                                } else {
+                                    ls.set_text("Layout exported successfully");
+                                }
+                            }
+                        }
+                    });
+                });
+
+                let ls_import = layout_status.clone();
+                import_btn.connect_clicked(move |_| {
+                    let dialog = gtk4::FileDialog::new();
+                    dialog.set_title("Import Layout Profile");
+                    dialog.set_accept_label(Some("Open"));
+                    let filters = {
+                        let filter = gtk4::FileFilter::new();
+                        filter.add_pattern("*.json");
+                        filter.set_name(Some("JSON Files"));
+                        let store = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                        store.append(&filter);
+                        store
+                    };
+                    dialog.set_filters(Some(&filters));
+                    let dir = gtk4::gio::File::for_path(dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from(".")));
+                    dialog.set_initial_folder(Some(&dir));
+                    let ls = ls_import.clone();
+                    let sw = dw_layout2.clone();
+                    dialog.open(Some(&sw), gtk4::gio::Cancellable::NONE, move |result| {
+                        if let Ok(file) = result {
+                            if let Some(path) = file.path() {
+                                match std::fs::read_to_string(&path) {
+                                    Ok(json) => {
+                                        let mut cfg = crate::config::Config::load();
+                                        match cfg.import_layout_profile(&json) {
+                                            Ok(()) => {
+                                                ls.set_text("Layout profile imported successfully");
+                                            }
+                                            Err(e) => {
+                                                ls.set_text(&format!("Import failed: {e}"));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        ls.set_text(&format!("Cannot read file: {e}"));
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+
                 let btn_box = gtk4::Box::new(Orientation::Horizontal, 8);
                 btn_box.set_margin_top(8);
                 let save_btn = gtk4::Button::with_label("Save");

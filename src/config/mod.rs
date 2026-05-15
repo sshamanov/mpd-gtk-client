@@ -61,6 +61,9 @@ pub struct Config {
     /// Memory monitoring settings.
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Layout profile for export/import (not used at runtime, persisted for portability).
+    #[serde(default)]
+    pub layout_profile: Option<LayoutProfile>,
     /// Named connection profiles (epic 15). Key = profile name.
     #[serde(default)]
     pub profiles: Option<HashMap<String, ProfileConfig>>,
@@ -199,6 +202,50 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Layout profile for export/import — split ratio, rail widths, mode proportions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutProfile {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Layout settings bundled for portability.
+    pub layout: LayoutSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutSettings {
+    /// Split ratio between left pane and right rail (0.0–1.0, default 0.7).
+    pub split_ratio: f64,
+    /// Minimum right rail width in pixels (default 320).
+    pub rail_width_min: u32,
+    /// Maximum right rail width in pixels (default 420).
+    pub rail_width_max: u32,
+    /// Album mode proportions: [now_playing, current_album, queue].
+    pub album_mode_proportions: [f64; 3],
+    /// Folder mode proportions: [now_playing, queue].
+    pub folder_mode_proportions: [f64; 2],
+}
+
+impl Default for LayoutProfile {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            layout: LayoutSettings::default(),
+        }
+    }
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            split_ratio: 0.7,
+            rail_width_min: 320,
+            rail_width_max: 420,
+            album_mode_proportions: [0.4, 0.2, 0.4],
+            folder_mode_proportions: [0.55, 0.45],
+        }
+    }
+}
+
 fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 6600 }
 
@@ -211,6 +258,7 @@ impl Default for Config {
             notifications: NotificationsConfig::default(),
             cover_cache: CoverCacheConfig::default(),
             memory: MemoryConfig::default(),
+            layout_profile: None,
             profiles: None,
             default_profile: None,
             last_profile: None,
@@ -378,6 +426,27 @@ impl Config {
             std::io::Error::other(e.to_string())
         })?;
         std::fs::write(&path, content)
+    }
+
+    /// Export layout profile as JSON string.
+    pub fn export_layout_profile(&self) -> Result<String, String> {
+        let profile = self.layout_profile.clone().unwrap_or_default();
+        serde_json::to_string_pretty(&profile).map_err(|e| format!("JSON serialization failed: {e}"))
+    }
+
+    /// Import a layout profile from JSON, storing it in config and persisting to disk.
+    /// Validates schema version — only version 1 is accepted.
+    pub fn import_layout_profile(&mut self, json: &str) -> Result<(), String> {
+        let profile: LayoutProfile = serde_json::from_str(json)
+            .map_err(|e| format!("Invalid JSON: {e}"))?;
+        if profile.schema_version != 1 {
+            return Err(format!(
+                "Unsupported schema version {} (expected 1)",
+                profile.schema_version
+            ));
+        }
+        self.layout_profile = Some(profile);
+        self.save().map_err(|e| format!("Failed to save config: {e}"))
     }
 
     /// Install XDG autostart .desktop file.

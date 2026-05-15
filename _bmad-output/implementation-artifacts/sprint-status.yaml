@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-15"
+last_updated: "2026-05-16"
 
 
 
@@ -248,6 +248,6 @@ development_status:
   39-1-network-usage-cap: done
   39-2-memory-monitoring: done
 
-  epic-40: backlog
-  40-1-layout-profile-export-import: ready-for-dev
+  epic-40: in-progress
+  40-1-layout-profile-export-import: done
   40-2-layout-reset-defaults: ready-for-dev

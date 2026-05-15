@@ -29,6 +29,10 @@ Items planned for the release — may be in-progress or pending.
 - **SIGINT cleanup via `process::exit(0)`** — skips graceful MPD disconnect
 - **D-Bus session bus reconnection** — MPRIS silently stops if D-Bus restarts
 
+## Deferred from: code review of 40-1-layout-profile-export-import (2026-05-16)
+
+- `LayoutProfile` fields (`split_ratio`, `rail_width`, proportions) are never consumed by layout code — import saves to config but doesn't apply changes to running UI (AC 3); no existing layout update path to wire into
+
 ## Deferred from: code review of 28-4-notification-router (2026-05-13)
 
 - `event.clone()` on every MpdEvent wastes memory — clones large variants (CoverRefreshed JPEG, AlbumTracks) that the router ignores; only Toast/Connected/Disconnected needed
