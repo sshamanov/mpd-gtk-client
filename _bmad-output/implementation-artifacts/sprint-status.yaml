@@ -230,9 +230,9 @@ development_status:
   35-1-incremental-queue-sync-via-plchanges: done
   35-2-persist-playlist-version-across-reconnects: done
 
-  epic-36: backlog
+  epic-36: done
   36-1-mpd-command-batch-variant: done
-  36-2-use-batch-for-playalbum-addalbum: backlog
+  36-2-use-batch-for-playalbum-addalbum: done
 
   epic-37: backlog
   37-1-filesize-mtime-in-queueentry: backlog

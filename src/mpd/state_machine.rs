@@ -64,6 +64,12 @@ pub enum MpdCommand {
     /// Sub-commands that map to single MPD protocol lines are collected and sent
     /// via `command_list_begin`/`command_list_end`.
     Batch(Vec<MpdCommand>),
+    /// Add a single URI to the queue via `addid`.
+    AddId(String),
+    /// Add a single URI at a specific position via `addid <uri> <pos>`.
+    AddIdAt(String, i32),
+    /// Add a single URI via plain `add` (does not return an ID).
+    AddUri(String),
 }
 
 /// Events emitted by the MPD background thread to the UI thread.
@@ -710,6 +716,31 @@ fn connected_loop(
     }
 }
 
+/// Execute a batch of MPD protocol command strings via `send_batch`,
+/// then fetch a full status update and sync the queue.
+fn run_batch_then_sync(
+    adapter: &mut MpdAdapter,
+    event_tx: &mpsc::SyncSender<MpdEvent>,
+    local_queue: &mut Vec<crate::mpd::QueueEntry>,
+    last_playlist_version: &mut Option<String>,
+    last_status: &mut Instant,
+    plchanges_count: &mut u32,
+    cmds: &[String],
+    label: &str,
+) {
+    match adapter.send_batch(cmds) {
+        Ok(_) => {
+            if let Some(update) = fetch_full_update(adapter) {
+                let pv = update.playlist_version.clone();
+                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+            }
+            *last_status = Instant::now();
+        }
+        Err(e) => log::error!("[{label}] batch failed: {e}"),
+    }
+}
+
 /// Process a single MPD command — dispatch to the appropriate adapter method
 /// and emit events. Extracted so both idle and poll paths can call it.
 /// Returns `true` if the caller should exit the connected loop (Reconnect/Close).
@@ -936,15 +967,10 @@ fn process_command(
                 Ok(uris) => {
                     if uris.is_empty() { return false; }
                     let cmds: Vec<String> = uris.iter()
-                        .map(|uri| format!("addid \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                        .map(|uri| command_to_mpd_strings(&MpdCommand::AddId(uri.clone())))
+                        .flatten()
                         .collect();
-                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("Add album failed: {e}"); }
-                    if let Some(update) = fetch_full_update(adapter) {
-                        let pv = update.playlist_version.clone();
-                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-                    }
-                    *last_status = Instant::now();
+                    run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "Add");
                 }
                 Err(e) => log::error!("Add album failed: {e}"),
             }
@@ -953,21 +979,11 @@ fn process_command(
             match adapter.find_album_uris(&album) {
                 Ok(uris) => {
                     if uris.is_empty() { return false; }
-                    let mut position = pos;
-                    let cmds: Vec<String> = uris.iter()
-                        .map(|uri| {
-                            let cmd = format!("addid \"{}\" {}", uri.replace("\\", "\\\\").replace("\"", "\\\""), position);
-                            position += 1;
-                            cmd
-                        })
+                    let cmds: Vec<String> = uris.iter().enumerate()
+                        .map(|(i, uri)| command_to_mpd_strings(&MpdCommand::AddIdAt(uri.clone(), pos + i as i32)))
+                        .flatten()
                         .collect();
-                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddAt album failed: {e}"); }
-                    if let Some(update) = fetch_full_update(adapter) {
-                        let pv = update.playlist_version.clone();
-                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-                    }
-                    *last_status = Instant::now();
+                    run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "AddAt");
                 }
                 Err(e) => log::error!("AddAt album failed: {e}"),
             }
@@ -988,21 +1004,11 @@ fn process_command(
                         ));
                         return false;
                     }
-                    let mut cmds = Vec::with_capacity(uris.len());
-                    for (i, uri) in uris.iter().enumerate() {
-                        let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
-                        let target = current_pos + 1 + i as i32;
-                        cmds.push(format!("addid \"{escaped}\" {target}"));
-                    }
-                    if let Err(e) = adapter.send_batch(&cmds) {
-                        log::error!("InsertNext batch failed: {e}");
-                    }
-                    if let Some(update) = fetch_full_update(adapter) {
-                        let pv = update.playlist_version.clone();
-                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-                    }
-                    *last_status = Instant::now();
+                    let cmds: Vec<String> = uris.iter().enumerate()
+                        .map(|(i, uri)| command_to_mpd_strings(&MpdCommand::AddIdAt(uri.clone(), current_pos + 1 + i as i32)))
+                        .flatten()
+                        .collect();
+                    run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "InsertNext");
                 }
                 Err(e) => log::error!("InsertNext find failed: {e}"),
             }
@@ -1010,51 +1016,31 @@ fn process_command(
         MpdCommand::PlayAlbum(album) => {
             match adapter.find_album_uris(&album) {
                 Ok(uris) => {
-                    let mut cmds = vec!["clear".to_string()];
+                    let mut cmds: Vec<String> = command_to_mpd_strings(&MpdCommand::Clear);
                     for uri in &uris {
-                        let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
-                        cmds.push(format!("addid \"{escaped}\""));
+                        cmds.extend(command_to_mpd_strings(&MpdCommand::AddId(uri.clone())));
                     }
-                    cmds.push("play 0".to_string());
-                    if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayAlbum failed: {e}"); }
-                    if let Some(update) = fetch_full_update(adapter) {
-                        let pv = update.playlist_version.clone();
-                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-                    }
-                    *last_status = Instant::now();
+                    cmds.extend(command_to_mpd_strings(&MpdCommand::PlayPosition(0)));
+                    run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "PlayAlbum");
                 }
                 Err(e) => log::error!("PlayAlbum failed: {e}"),
             }
         }
         MpdCommand::PlayUris(uris) => {
             if uris.is_empty() { return false; }
-            let mut cmds: Vec<String> = vec!["clear".to_string()];
-            for uri in uris {
-                let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
-                cmds.push(format!("add \"{escaped}\""));
+            let mut cmds: Vec<String> = command_to_mpd_strings(&MpdCommand::Clear);
+            for uri in &uris {
+                cmds.extend(command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())));
             }
-            cmds.push("play 0".to_string());
-            if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayUris failed: {e}"); }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-            }
-            *last_status = Instant::now();
+            cmds.extend(command_to_mpd_strings(&MpdCommand::PlayPosition(0)));
+            run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "PlayUris");
         }
         MpdCommand::AddUris(uris) => {
             if uris.is_empty() { return false; }
             let cmds: Vec<String> = uris.iter()
-                .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                .flat_map(|uri| command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())))
                 .collect();
-            if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddUris failed: {e}"); }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-            }
-            *last_status = Instant::now();
+            run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "AddUris");
         }
         MpdCommand::InsertNextUris(uris) => {
             if uris.is_empty() { return false; }
@@ -1066,25 +1052,18 @@ fn process_command(
             if current_pos < 0 {
                 log::warn!("InsertNextUris: no current track, falling back to AddUris");
                 let cmds: Vec<String> = uris.iter()
-                    .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                    .flat_map(|uri| command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())))
                     .collect();
-                if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris fallback failed: {e}"); }
+                run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "InsertNextUris (fallback)");
             } else {
-                let mut cmds = Vec::with_capacity(uris.len());
-                for (i, uri) in uris.iter().enumerate() {
-                    let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
-                    cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
-                }
-                if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextUris failed: {e}"); }
+                let cmds: Vec<String> = uris.iter().enumerate()
+                    .flat_map(|(i, uri)| command_to_mpd_strings(&MpdCommand::AddIdAt(uri.clone(), current_pos + 1 + i as i32)))
+                    .collect();
+                run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "InsertNextUris");
             }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-            }
-            *last_status = Instant::now();
         }
         MpdCommand::PlayDirectory(dir) => {
+            let mut did_batch = false;
             match adapter.lsinfo(&dir) {
                 Ok(entries) => {
                     let uris: Vec<String> = entries.iter()
@@ -1094,24 +1073,28 @@ fn process_command(
                         })
                         .collect();
                     if !uris.is_empty() {
-                        let mut cmds: Vec<String> = vec!["clear".to_string()];
+                        let mut cmds: Vec<String> = command_to_mpd_strings(&MpdCommand::Clear);
                         for uri in &uris {
-                            cmds.push(format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")));
+                            cmds.extend(command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())));
                         }
-                        cmds.push("play 0".to_string());
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("PlayDirectory failed: {e}"); }
+                        cmds.extend(command_to_mpd_strings(&MpdCommand::PlayPosition(0)));
+                        run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "PlayDirectory");
+                        did_batch = true;
                     }
                 }
                 Err(e) => log::error!("PlayDirectory lsinfo failed: {e}"),
             }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+            if !did_batch {
+                if let Some(update) = fetch_full_update(adapter) {
+                    let pv = update.playlist_version.clone();
+                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                    sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+                }
+                *last_status = Instant::now();
             }
-            *last_status = Instant::now();
         }
         MpdCommand::AddDirectory(dir) => {
+            let mut did_batch = false;
             match adapter.lsinfo(&dir) {
                 Ok(entries) => {
                     let uris: Vec<String> = entries.iter()
@@ -1122,21 +1105,25 @@ fn process_command(
                         .collect();
                     if !uris.is_empty() {
                         let cmds: Vec<String> = uris.iter()
-                            .map(|uri| format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")))
+                            .flat_map(|uri| command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())))
                             .collect();
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("AddDirectory failed: {e}"); }
+                        run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "AddDirectory");
+                        did_batch = true;
                     }
                 }
                 Err(e) => log::error!("AddDirectory lsinfo failed: {e}"),
             }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+            if !did_batch {
+                if let Some(update) = fetch_full_update(adapter) {
+                    let pv = update.playlist_version.clone();
+                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                    sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+                }
+                *last_status = Instant::now();
             }
-            *last_status = Instant::now();
         }
         MpdCommand::InsertNextDirectory(dir) => {
+            let mut did_batch = false;
             match adapter.lsinfo(&dir) {
                 Ok(entries) => {
                     let uris: Vec<String> = entries.iter()
@@ -1151,28 +1138,29 @@ fn process_command(
                             .and_then(|s| s.get("song").cloned())
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(-1);
-                        let mut cmds = Vec::with_capacity(uris.len());
-                        if current_pos < 0 {
-                            for uri in &uris {
-                                cmds.push(format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\"")));
-                            }
+                        let cmds: Vec<String> = if current_pos < 0 {
+                            uris.iter()
+                                .flat_map(|uri| command_to_mpd_strings(&MpdCommand::AddUri(uri.clone())))
+                                .collect()
                         } else {
-                            for (i, uri) in uris.iter().enumerate() {
-                                let escaped = uri.replace("\\", "\\\\").replace("\"", "\\\"");
-                                cmds.push(format!("addid \"{escaped}\" {}", current_pos + 1 + i as i32));
-                            }
-                        }
-                        if let Err(e) = adapter.send_batch(&cmds) { log::error!("InsertNextDirectory failed: {e}"); }
+                            uris.iter().enumerate()
+                                .flat_map(|(i, uri)| command_to_mpd_strings(&MpdCommand::AddIdAt(uri.clone(), current_pos + 1 + i as i32)))
+                                .collect()
+                        };
+                        run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &cmds, "InsertNextDirectory");
+                        did_batch = true;
                     }
                 }
                 Err(e) => log::error!("InsertNextDirectory lsinfo failed: {e}"),
             }
-            if let Some(update) = fetch_full_update(adapter) {
-                let pv = update.playlist_version.clone();
-                let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+            if !did_batch {
+                if let Some(update) = fetch_full_update(adapter) {
+                    let pv = update.playlist_version.clone();
+                    let _ = event_tx.try_send(MpdEvent::StateChanged(update));
+                    sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
+                }
+                *last_status = Instant::now();
             }
-            *last_status = Instant::now();
         }
         MpdCommand::Clear => {
             if let Err(e) = adapter.send_command("clear") { log::error!("Clear failed: {e}"); }
@@ -1205,36 +1193,24 @@ fn process_command(
                 if s.is_empty() {
                     log::error!("[MPD] Batch: unsupported sub-command {:?}", cmd);
                     let _ = event_tx.try_send(MpdEvent::Toast {
-                        message: format!("Batch error: unsupported sub-command"),
+                        message: "Batch error: unsupported sub-command".into(),
                         level: crate::mpd::state_machine::ToastLevel::Error,
                     });
                     return false;
                 }
                 strings.extend(s);
             }
-            match adapter.send_batch(&strings) {
-                Ok(_) => {
-                    if let Some(update) = fetch_full_update(adapter) {
-                        let pv = update.playlist_version.clone();
-                        let _ = event_tx.try_send(MpdEvent::StateChanged(update));
-                        sync_queue(adapter, event_tx, local_queue, last_playlist_version, pv.as_deref(), plchanges_count);
-                    }
-                    *last_status = Instant::now();
-                }
-                Err(e) => {
-                    log::error!("[MPD] Batch failed: {e}");
-                    let _ = event_tx.try_send(MpdEvent::Toast {
-                        message: format!("Batch operation failed: {e}"),
-                        level: crate::mpd::state_machine::ToastLevel::Error,
-                    });
-                }
-            }
+            run_batch_then_sync(adapter, event_tx, local_queue, last_playlist_version, last_status, plchanges_count, &strings, "Batch");
         }
         MpdCommand::Close => {
             log::info!("[MPD] received Close command, sending close to MPD");
             let _ = adapter.send_command("close");
             stop.store(true, Ordering::Release);
             return true;
+        }
+        // Sub-commands only used within Batch — no standalone handling needed.
+        MpdCommand::AddId(_) | MpdCommand::AddIdAt(..) | MpdCommand::AddUri(_) => {
+            log::warn!("[MPD] {:?} should only be used within a Batch", cmd);
         }
     }
     false
@@ -1257,6 +1233,15 @@ fn command_to_mpd_strings(cmd: &MpdCommand) -> Vec<String> {
         MpdCommand::PlayPosition(pos) => vec![format!("play {pos}")],
         MpdCommand::DeleteId(id) => vec![format!("deleteid {id}")],
         MpdCommand::MoveId(id, to_pos) => vec![format!("moveid {id} {to_pos}")],
+        MpdCommand::AddId(uri) => {
+            vec![format!("addid \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\""))]
+        }
+        MpdCommand::AddIdAt(uri, pos) => {
+            vec![format!("addid \"{}\" {pos}", uri.replace("\\", "\\\\").replace("\"", "\\\""))]
+        }
+        MpdCommand::AddUri(uri) => {
+            vec![format!("add \"{}\"", uri.replace("\\", "\\\\").replace("\"", "\\\""))]
+        }
         // Complex commands that require URI lookup or directory listing —
         // caller should use the dedicated single-command variants instead.
         MpdCommand::PlayAlbum(_)
