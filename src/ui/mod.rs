@@ -402,6 +402,14 @@ impl App {
                 });
             }
 
+            // Layout profile values cached for tick-callback and import-handler access
+            let lp = cfg.layout_profile.as_ref()
+                .map(|p| p.layout.clone())
+                .unwrap_or_default();
+            let rail_width_min = std::rc::Rc::new(std::cell::Cell::new(lp.rail_width_min));
+            let rail_width_max = std::rc::Rc::new(std::cell::Cell::new(lp.rail_width_max));
+            let split_ratio = std::rc::Rc::new(std::cell::Cell::new(lp.split_ratio));
+
             let multi_view = adw::MultiLayoutView::new();
 
             // --- Left pane: group bar + album grid ---
@@ -929,6 +937,9 @@ impl App {
             let btn_clone = settings_btn.clone();
             let cp_save = conn_params.clone();
             let stx = cmd_tx.clone();
+            let s_rwmin = rail_width_min.clone();
+            let s_rwmax = rail_width_max.clone();
+            let s_sratio = split_ratio.clone();
             settings_btn.connect_clicked(move |_| {
                 let scfg = Config::load();
                 let d = gtk4::Window::new();
@@ -1095,6 +1106,9 @@ impl App {
                 });
 
                 let ls_import = layout_status.clone();
+                let rwmin = s_rwmin.clone();
+                let rwmax = s_rwmax.clone();
+                let sratio = s_sratio.clone();
                 import_btn.connect_clicked(move |_| {
                     let dialog = gtk4::FileDialog::new();
                     dialog.set_title("Import Layout Profile");
@@ -1112,6 +1126,9 @@ impl App {
                     dialog.set_initial_folder(Some(&dir));
                     let ls = ls_import.clone();
                     let sw = dw_layout2.clone();
+                    let irwmin = rwmin.clone();
+                    let irwmax = rwmax.clone();
+                    let isratio = sratio.clone();
                     dialog.open(Some(&sw), gtk4::gio::Cancellable::NONE, move |result| {
                         if let Ok(file) = result {
                             if let Some(path) = file.path() {
@@ -1120,6 +1137,12 @@ impl App {
                                         let mut cfg = crate::config::Config::load();
                                         match cfg.import_layout_profile(&json) {
                                             Ok(()) => {
+                                                // Refresh cached layout values so tick callback picks them up
+                                                if let Some(ref lp) = cfg.layout_profile {
+                                                    irwmin.set(lp.layout.rail_width_min);
+                                                    irwmax.set(lp.layout.rail_width_max);
+                                                    isratio.set(lp.layout.split_ratio);
+                                                }
                                                 ls.set_text("Layout profile imported successfully");
                                             }
                                             Err(e) => {
@@ -1811,7 +1834,7 @@ impl App {
             let wide_left = adw::LayoutSlot::new("left");
             let wide_right = adw::LayoutSlot::new("right");
             wide_left.set_hexpand(true);
-            wide_right.set_size_request(320, -1);
+            wide_right.set_size_request(rail_width_min.get() as i32, -1);
             wide_box.append(&wide_left);
             wide_box.append(&wide_right);
             let wide_layout = adw::Layout::new(&wide_box);
@@ -2065,6 +2088,15 @@ impl App {
                     }
                 }
                 fc_bottom_panel.set_visible(narrow);
+
+                // Update right rail width from layout profile (wide mode only)
+                if !narrow {
+                    let rw_min = rail_width_min.get() as f64;
+                    let rw_max = rail_width_max.get() as f64;
+                    let sr = split_ratio.get();
+                    let rail_w = (win_width * (1.0 - sr)).clamp(rw_min, rw_max) as i32;
+                    wide_right.set_size_request(rail_w, -1);
+                }
 
                 // Ensure queue display matches current mode
                 let cur_mode = fc_state.read().map(|s| s.mode).unwrap_or(crate::state::Mode::Album);
