@@ -325,6 +325,36 @@ So that the queue order is always what I intended.
 
 **Technical Notes:** The race window is <10ms. The `item_ids` map is rebuilt on each `MpdEvent::Queue`. The fix should either (a) use the same generation counter that queue events carry, or (b) debounce rapid key events and operate on the final state only.
 
+### Story 6.8: Implement Drop for MpdAdapter to Send Clean MPD Close
+
+As a developer,
+I want the `MpdAdapter` to implement `Drop` so that the TCP socket sends `close\n` to MPD before being dropped,
+So that MPD never sees an abrupt TCP disconnect from the client.
+
+**Acceptance Criteria:**
+
+**Given** the `MpdAdapter` is dropped (e.g., during error recovery in the state machine, or during any code path where the adapter goes out of scope without an explicit `Close` command)
+**When** Rust's `Drop::drop()` runs
+**Then** the adapter sends `close\n` to the MPD TCP stream before the socket is closed
+**And** the write is best-effort (if the stream is already broken, the error is silently ignored)
+**And** no panic occurs in the Drop impl
+
+**Given** an explicit `MpdCommand::Close` has already been sent to MPD before the adapter is dropped
+**When** `Drop::drop()` runs
+**Then** the drop is a no-op (no double-close, no error)
+
+**Given** the application shuts down normally
+**When** `main.rs` sends `MpdCommand::Close` and the state machine processes it
+**Then** the `Drop` impl for `MpdAdapter` does not send `close\n` again (idempotent)
+**And** no warning or error is logged from the Drop path
+
+**Technical Notes:**
+- Currently `MpdAdapter` has no `Drop` implementation. When it goes out of scope, the `TcpStream` is dropped immediately, which sends a TCP RST or FIN to MPD. MPD logs this as an abrupt disconnect.
+- The fix: implement `Drop for MpdAdapter` that writes `close\n` to the writer's stream via `self.send_raw("close")` (or direct `writeln!` to the `BufWriter`). The write should be best-effort: `let _ = writeln!(self.writer, "close"); let _ = self.writer.flush();`.
+- To avoid double-close when `MpdCommand::Close` has already been dispatched, add a `closed: AtomicBool` flag to `MpdAdapter` that is set by the explicit `close()` method and checked in `Drop`.
+- The `close()` method in `MpdAdapter` (which sends `close\n` to MPD) should set the flag. `Drop` checks the flag and only sends `close\n` if it hasn't been sent yet.
+- ADR reference: `architecture.md` §168 (MPD Adapter Architecture), §979 (Startup/Shutdown Lifecycle)
+
 ---
 
 ## Epic 7: Cover Art & Visual Polish
@@ -2282,5 +2312,162 @@ So that I can recover from changes that don't work well for me without manually 
 - Confirmation dialog for "Reset All" (not for individual resets): "This will reset all layout settings to defaults. Continue?"
 - The reset modifies the in-memory config and triggers the layout service to recompute positions
 - Existing `Config::save()` mechanism persists the changes
+
+### Story 40.3: Wire LayoutProfile Values into Layout Code
+
+As a user importing a layout profile,
+I want the imported layout values (split ratio, rail width, proportions) to take effect immediately,
+So that importing a profile changes the actual UI layout, not just the saved config.
+
+**Acceptance Criteria:**
+
+**Given** the user imports a layout profile JSON with custom split_ratio, rail_width, and proportions
+**When** the import succeeds
+**Then** the layout of the UI updates immediately to reflect the imported values
+**And** the split ratio, rail width, and internal proportions in both album mode and folder mode use the imported values
+**And** no restart is required
+
+**Given** the layout profile values are stored in the Config struct
+**When** the UI layout is initially configured or the window is resized
+**Then** the UI reads `config.layout_profile.split_ratio` for the left/right pane split
+**And** reads `config.layout_profile.rail_width_min`/`rail_width_max` for the right rail clamp
+**And** reads `config.layout_profile.album_mode_proportions` for the album mode right-rail sections (now playing, current album, queue)
+**And** reads `config.layout_profile.folder_mode_proportions` for the folder mode right-rail sections (now playing, queue)
+
+**Given** `layout_profile` is `None` in the loaded config
+**When** the UI layout is set up
+**Then** the default hardcoded values are used (split 0.7, rail 320-420px, album 40/20/40, folder 55/45)
+**And** no layout values crash or produce invalid geometry
+
+**Given** the user resizes the window or changes settings
+**When** layout recomputation occurs
+**Then** the layout code reads from the same config-backed values (not a separate hardcoded copy)
+
+**Technical Notes:**
+- Currently `LayoutProfile` fields (`split_ratio`, `rail_width_min`, `rail_width_max`, `album_mode_proportions`, `folder_mode_proportions`) are defined in `src/config/mod.rs` and persisted via export/import, but are never read by `src/ui/mod.rs` or any layout computation code.
+- The fix requires identifying all places in `src/ui/mod.rs` where layout geometry is hardcoded and replacing them with reads from `config.layout_profile` (or `config.layout_profile.clone().unwrap_or_default()`) at the point of layout initialization and on window resize.
+- Layout update on import: the import handler in `ui/mod.rs` (line ~1121) already calls `config.import_layout_profile()`. After the import, it should trigger the same layout recomputation that runs on window resize or settings save.
+- Key layout values to wire: (a) `Paned::set_position()` for the split ratio, (b) `set_size_request()` or CSS `min-width`/`max-width` for rail width clamping, (c) fractional allocations for right-rail internal paned widgets.
+- No new config values needed — the existing `LayoutProfile` struct already contains all required fields.
+- This is a purely structural change; no new UI or settings dialog modifications needed.
+- Test by: importing a layout profile with e.g., split_ratio=0.5, verifying the split handle moves to 50/50.
+- ADR reference: `architecture.md` §443 (Grid Layout — coordinate-based album grid), §419 (Layout & Responsive Architecture)
+
+### Story 40.4: Wire LayoutProfile Mode Proportions into Layout Code
+
+As a user importing a layout profile with custom mode proportions,
+I want the imported album mode and folder mode proportions to take effect immediately,
+So that the right-rail internal sections resize to match my saved preferences.
+
+**Acceptance Criteria:**
+
+**Given** the user imports a layout profile JSON with custom `album_mode_proportions` and `folder_mode_proportions`
+**When** the import succeeds
+**Then** the album mode right-rail sections (now playing, current album, queue) resize to match the imported proportions
+**And** the folder mode right-rail sections (now playing, queue) resize to match the imported proportions
+**And** no restart is required
+
+**Given** the layout profile has `album_mode_proportions: [0.5, 0.2, 0.3]` and `folder_mode_proportions: [0.6, 0.4]`
+**When** the UI sets up the right-rail paned widgets on mode switch
+**Then** the first paned in album mode allocates 50% to now-playing, 20% to current album, 30% to queue
+**And** the first paned in folder mode allocates 60% to now-playing, 40% to queue
+
+**Given** `layout_profile` is `None` in the loaded config (no profile imported)
+**When** the UI layout is set up
+**Then** the default hardcoded proportions are used (album `[0.4, 0.2, 0.4]`, folder `[0.55, 0.45]`)
+**And** no layout values crash or produce invalid geometry
+
+**Technical Notes:**
+- `src/config/mod.rs` defines `LayoutProfile { layout: LayoutSettings { album_mode_proportions, folder_mode_proportions, ... } }` with defaults `[0.4, 0.2, 0.4]` and `[0.55, 0.45]`.
+- These fields are currently exported/imported in JSON but NEVER read by `src/ui/mod.rs` layout code.
+- The right-rail internal proportions are currently hardcoded in the startup layout and mode-switch code paths (`src/ui/mod.rs`).
+- Unlike `split_ratio` and `rail_width_*` (consumed in story 40.3), proportions have NO live-update path during mode switch or resize.
+- Requires: (a) reading `config.layout_profile.layout.album_mode_proportions` / `folder_mode_proportions` at startup (fallback to defaults when None), (b) applying proportions when mode switches between Album/Folder, (c) updating the import handler to trigger proportion recomputation after import.
+- ADR reference: `architecture.md` §419 (Layout & Responsive Architecture)
+
+---
+
+## Epic 41: Search Track Caps
+
+**Goal:** Search results track caps are mode-aware and configurable — Album Mode caps at 100 track results, Folder Mode at 500, with config file overrides.
+
+**FRs covered:** PRD §654 (Performance — response time), architecture.md §2616 (Elicitation-Driven Refinements — Mode-Aware Search Track Cap)
+
+**Architecture ref:** Consolidated Refinements §10 (Performance Architecture) — table shows search cap
+
+### Story 41.1: Configurable Mode-Aware Search Track Caps
+
+As a user searching in Album Mode vs Folder Mode,
+I want the track result cap to differ by mode (100 for albums, 500 for folders),
+So that Album Mode stays focused on album-level results while Folder Mode returns all matching files.
+
+**Acceptance Criteria:**
+
+**Given** the user searches for a common term that matches >100 tracks in Album Mode
+**When** the search results are displayed
+**Then** track results are capped at 100
+**And** an inline note reads "Showing 100 of N track results" when cap is active
+
+**Given** the user searches for the same term in Folder Mode
+**When** the search results are displayed
+**Then** track results are capped at 500 (not 100)
+**And** an inline note reads "Showing 500 of N track results" when cap is active
+
+**Given** the user sets `search_track_cap_album = 200` and `search_track_cap_folder = 1000` in config.toml
+**When** a search is performed
+**Then** Album Mode uses 200 as the track result cap
+**And** Folder Mode uses 1000 as the track result cap
+
+**Given** the user has no config overrides for track caps
+**When** a search is performed
+**Then** the default caps are used (album: 100, folder: 500)
+
+**Technical Notes:**
+- Search worker currently uses a single hardcoded track cap — split into `search_track_cap_album` and `search_track_cap_folder` config values with defaults `100` and `500`.
+- The search query/request must carry the cap value (or a mode hint) so the search worker applies the correct limit.
+- Config values added to `config.toml` under a `[search]` section or attached to the existing search config.
+- Inline "Showing X of Y" note is a new UI element appended below search results when cap is active — use an existing toast or status label pattern.
+- Architecture ref: architecture.md §2613-2618 (Elicitation-Driven Refinements — Mode-Aware Search Track Cap)
+
+---
+
+## Epic 42: Folder Browser Visual Polish
+
+**Goal:** Normalized directory entries (CUE sheets, DSD folders) have a visual indicator in the folder tree so users can distinguish collapsed multi-file entries from regular files.
+
+**FRs covered:** PRD §545 (Folder Rows — technical data), PRD §237 (Folder Discovery Flow — normalize cue/DSD)
+
+**Architecture ref:** architecture.md §2624-2630 (Elicitation-Driven Refinements — Normalized Entry Visual Indicator)
+
+### Story 42.1: Visual Indicator for Normalized Directory Entries
+
+As a user browsing the folder tree,
+I want to see a visual indicator on normalized entries (cue sheets, DSD folders),
+So that I can distinguish a collapsed multi-file entry from a regular single-track file.
+
+**Acceptance Criteria:**
+
+**Given** the folder tree contains a CUE sheet directory that has been normalized into a single `CueSummary` entry
+**When** the entry is rendered in the folder tree
+**Then** it shows a subtle visual indicator (e.g., dimmed text label "CUE" or a distinct icon/glyph)
+**And** the indicator is discoverable but non-intrusive
+
+**Given** the folder tree contains a DSD folder that has been normalized into a single album entry
+**When** the entry is rendered in the folder tree
+**Then** it shows a visual indicator (e.g., dimmed text label "DSD" or distinct icon/glyph)
+
+**Given** a regular file entry (not normalized)
+**When** rendered in the folder tree
+**Then** it has NO normalized indicator
+
+**Given** the user hovers or selects a normalized entry
+**When** the entry has focus
+**Then** a tooltip or expanded label explains the normalization (e.g., "Cue sheet — 7 tracks" or "DSD folder — 1 album")
+
+**Technical Notes:**
+- `NormalizedEntry` enum in `src/presenters/folder_norm.rs` already has `CueSummary` and `DsdSummary` variants — the indicator rendering is a UI-only change.
+- Add a CSS class `.normalized-badge` to style the indicator text (small, dimmed, right-aligned in the row).
+- The badge should be a `GtkLabel` appended to the row's right side, not replacing existing metadata.
+- Architecture ref: architecture.md §2624-2630 (Elicitation-Driven Refinements — Normalized Entry Visual Indicator)
 
 ---

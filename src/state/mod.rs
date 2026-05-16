@@ -232,7 +232,7 @@ pub fn reduce(state: &mut AppState, event: &MpdEvent) {
         | MpdEvent::AlbumsGrouped(_)
         | MpdEvent::SearchResults { .. }
         | MpdEvent::SearchIndexing
-        | MpdEvent::FileSearchResults(_)
+        | MpdEvent::FileSearchResults(..)
         | MpdEvent::DirectoryListing(..)
         | MpdEvent::AlbumTracks(_)
         | MpdEvent::CoverPaths(_)

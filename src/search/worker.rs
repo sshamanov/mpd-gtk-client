@@ -19,8 +19,8 @@ use crate::search::SearchIndex;
 pub enum SearchCommand {
     /// Rebuild the index from a flat (artist, album) list.
     BuildIndex(Vec<(String, String)>),
-    /// Execute a search query and emit results with the given generation number.
-    Search(String, u64),
+    /// Execute a search query and emit results with the given generation number and cap.
+    Search(String, u64, usize),
     /// Clear the index.
     Reset,
 }
@@ -77,7 +77,7 @@ pub fn spawn(
                                 index.album_count()
                             );
                         }
-                        Ok(SearchCommand::Search(query, generation)) => {
+                        Ok(SearchCommand::Search(query, generation, cap)) => {
                             if !index_ready {
                                 log::debug!(
                                     "[search-worker] Query '{}' (gen {}) before index ready — signaling SearchIndexing",
@@ -87,18 +87,19 @@ pub fn spawn(
                                 let _ = event_tx.try_send(MpdEvent::SearchIndexing);
                                 return Ok(());
                             }
-                            let scored = index.search(&query);
+                            let (scored, total) = index.search(&query, cap);
                             log::debug!(
-                                "[search-worker] Query '{}' (gen {}) returned {} results",
+                                "[search-worker] Query '{}' (gen {}) returned {} of {} results",
                                 query,
                                 generation,
-                                scored.len()
+                                scored.len(),
+                                total
                             );
                             let results: Vec<(String, String)> = scored
                                 .into_iter()
                                 .map(|(a, b, _)| (a, b))
                                 .collect();
-                            let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation });
+                            let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation, total });
                         }
                         Ok(SearchCommand::Reset) => {
                             index = SearchIndex::new();

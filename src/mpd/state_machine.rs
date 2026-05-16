@@ -26,7 +26,7 @@ pub enum MpdCommand {
     ListAlbums,
     ListAlbumsGrouped(String),
     Search(String),
-    SearchFiles(String),
+    SearchFiles(String, usize),
     ListDirectory(String),
     PlayFile(String),
     ListQueue,
@@ -81,10 +81,10 @@ pub enum MpdEvent {
     StateChanged(PlaybackUpdate),
     Albums(Vec<crate::mpd::AlbumMeta>),
     AlbumsGrouped(crate::mpd::AlbumGroup),
-    SearchResults { results: Vec<(String, String)>, generation: u64 },
+    SearchResults { results: Vec<(String, String)>, generation: u64, total: usize },
     /// Search index not yet built — signal for UI to show indexing state.
     SearchIndexing,
-    FileSearchResults(Vec<(String, String)>),
+    FileSearchResults(Vec<(String, String)>, usize),
     DirectoryListing(String, Vec<crate::mpd::DirEntry>),
     Queue(Vec<crate::mpd::QueueEntry>),
     LibraryChanged,
@@ -776,7 +776,7 @@ fn is_metadata_command(cmd: &MpdCommand) -> bool {
         | MpdCommand::ListDirectory(_)
         | MpdCommand::ListAlbumTracks(_)
         | MpdCommand::Search(_)
-        | MpdCommand::SearchFiles(_)
+        | MpdCommand::SearchFiles(..)
     )
 }
 
@@ -957,12 +957,15 @@ fn process_command(
         }
         MpdCommand::Search(query) => {
             if let Ok(results) = adapter.search_albums(&query) {
-                let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0 });
+                let total = results.len();
+                let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0, total });
             }
         }
-        MpdCommand::SearchFiles(query) => {
-            if let Ok(results) = adapter.search_files(&query) {
-                let _ = event_tx.try_send(MpdEvent::FileSearchResults(results));
+        MpdCommand::SearchFiles(query, cap) => {
+            if let Ok(mut results) = adapter.search_files(&query) {
+                let total = results.len();
+                results.truncate(cap);
+                let _ = event_tx.try_send(MpdEvent::FileSearchResults(results, total));
             }
         }
         MpdCommand::ListDirectory(path) => {
@@ -1310,7 +1313,7 @@ fn command_to_mpd_strings(cmd: &MpdCommand) -> Vec<String> {
         | MpdCommand::AddDirectory(_)
         | MpdCommand::InsertNextDirectory(_)
         | MpdCommand::Search(_)
-        | MpdCommand::SearchFiles(_)
+        | MpdCommand::SearchFiles(..)
         | MpdCommand::ListDirectory(_)
         | MpdCommand::PlayFile(_)
         | MpdCommand::Status
@@ -1672,7 +1675,8 @@ fn metadata_thread(
             MpdCommand::Search(query) => {
                 match a.search_albums(&query) {
                     Ok(results) => {
-                        let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0 });
+                        let total = results.len();
+                        let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0, total });
                     }
                     Err(e) => {
                         log::error!("[mpd-metadata] search_albums failed: {e}");
@@ -1680,9 +1684,13 @@ fn metadata_thread(
                     }
                 }
             }
-            MpdCommand::SearchFiles(query) => {
+            MpdCommand::SearchFiles(query, cap) => {
                 match a.search_files(&query) {
-                    Ok(results) => { let _ = event_tx.try_send(MpdEvent::FileSearchResults(results)); }
+                    Ok(mut results) => {
+                        let total = results.len();
+                        results.truncate(cap);
+                        let _ = event_tx.try_send(MpdEvent::FileSearchResults(results, total));
+                    }
                     Err(e) => {
                         log::error!("[mpd-metadata] search_files failed: {e}");
                         adapter = None;

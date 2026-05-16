@@ -49,22 +49,20 @@ impl SearchIndex {
     pub fn album_count(&self) -> usize { self.albums.len() }
 
     /// Search the local index with relevance scoring.
-    /// Returns (artist, album, score) sorted by score descending (stable for ties).
-    /// Results below MIN_SCORE are excluded.
-    pub fn search(&self, query: &str) -> Vec<(String, String, u32)> {
+    /// Returns (results, total_before_truncation).
+    pub fn search(&self, query: &str, max_results: usize) -> (Vec<(String, String, u32)>, usize) {
         const MIN_SCORE: u32 = 20;
-        const MAX_RESULTS: usize = 200;
 
-        let Ok(index) = self.index.read() else { return Vec::new(); };
+        let Ok(index) = self.index.read() else { return (Vec::new(), 0); };
         let tokens: Vec<String> = tokenize(query);
-        if tokens.is_empty() { return Vec::new(); }
+        if tokens.is_empty() { return (Vec::new(), 0); }
 
         let mut result_sets: Vec<HashSet<usize>> = tokens.iter()
             .filter_map(|t| index.get(t))
             .map(|v| v.iter().copied().collect())
             .collect();
 
-        if result_sets.is_empty() { return Vec::new(); }
+        if result_sets.is_empty() { return (Vec::new(), 0); }
 
         // Intersect all token result sets
         let mut results: HashSet<usize> = result_sets.remove(0);
@@ -89,9 +87,9 @@ impl SearchIndex {
             a_idx.cmp(&b_idx)
         }));
 
-        // Truncate to max results
-        scored.truncate(MAX_RESULTS);
-        scored
+        let total = scored.len();
+        scored.truncate(max_results);
+        (scored, total)
     }
 }
 

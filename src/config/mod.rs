@@ -86,10 +86,18 @@ pub struct Config {
     /// Group by AlbumArtist (true) or Artist (false) in Artists view.
     #[serde(default = "default_true")]
     pub use_album_artist: bool,
+    /// Maximum search results to display in Album Mode (default: 100).
+    #[serde(default = "default_album_cap")]
+    pub search_track_cap_album: u32,
+    /// Maximum search results to display in Folder Mode (default: 500).
+    #[serde(default = "default_folder_cap")]
+    pub search_track_cap_folder: u32,
 }
 
 fn default_false() -> bool { false }
 fn default_true() -> bool { true }
+fn default_album_cap() -> u32 { 100 }
+fn default_folder_cap() -> u32 { 500 }
 
 /// A named MPD connection profile — either a Unix socket path or TCP host:port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +275,8 @@ impl Default for Config {
             high_contrast: false,
             auto_start: false,
             use_album_artist: true,
+            search_track_cap_album: default_album_cap(),
+            search_track_cap_folder: default_folder_cap(),
         }
     }
 }

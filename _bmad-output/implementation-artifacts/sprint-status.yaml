@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-17"
+last_updated: "2026-05-16"
 
 
 
@@ -253,3 +253,10 @@ development_status:
   40-1-layout-profile-export-import: done
   40-2-layout-reset-defaults: out-of-scope
   40-3-layoutprofile-consume-in-layout: done
+  40-4-wire-layout-profile-proportions: out-of-scope
+
+  epic-41: done
+  41-1-mode-aware-search-track-caps: done
+
+  epic-42: backlog
+  42-1-visual-indicator-normalized-entries: backlog

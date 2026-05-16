@@ -410,6 +410,10 @@ impl App {
             let rail_width_max = std::rc::Rc::new(std::cell::Cell::new(lp.rail_width_max));
             let split_ratio = std::rc::Rc::new(std::cell::Cell::new(lp.split_ratio));
 
+            // Search result caps (mode-aware)
+            let search_cap_album = std::rc::Rc::new(std::cell::Cell::new(cfg.search_track_cap_album as usize));
+            let search_cap_folder = std::rc::Rc::new(std::cell::Cell::new(cfg.search_track_cap_folder as usize));
+
             let multi_view = adw::MultiLayoutView::new();
 
             // --- Left pane: group bar + album grid ---
@@ -528,8 +532,15 @@ impl App {
             folder_search_results.set_has_frame(true);
             folder_search_results.set_visible(false);
 
+            // Inline note for folder search cap ("Showing 500 of 800 track results")
+            let folder_cap_note = Label::new(None);
+            folder_cap_note.set_halign(gtk4::Align::Center);
+            folder_cap_note.set_margin_top(4);
+            folder_cap_note.set_visible(false);
+
             folder_content.append(&folder_search);
             folder_content.append(&folder_search_results);
+            folder_content.append(&folder_cap_note);
             folder_content.append(&folder_browser.borrow().container.clone());
 
             // Top bar: Album/Folder switch (icons) + refresh + group switcher — single row
@@ -782,12 +793,13 @@ impl App {
                 let qc = q.clone();
                 let gen_c = se_gen.clone();
                 let scmd = se_scmd.clone();
+                let cap_album = search_cap_album.clone();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(150),
                     move || {
                         if gen_c.get() != this_gen { return; }
                         // Send to search worker (story 28-3): worker emits SearchResults via event_tx
-                        scmd.send(SearchCommand::Search(qc.clone(), this_gen));
+                        scmd.send(SearchCommand::Search(qc.clone(), this_gen, cap_album.get()));
                     },
                 );
             });
@@ -798,23 +810,29 @@ impl App {
             let fs_results = folder_search_results.clone();
             let fs_results2 = folder_search_results.clone();
             let fs_browser2 = folder_browser.clone();
+            let fs_cap = search_cap_folder.clone();
+            let fs_cap_note = folder_cap_note.clone();
+            let fs_cap_note2 = folder_cap_note.clone();
             folder_search.connect_search_changed(move |entry| {
                 let q = entry.text().to_string();
                 if q.is_empty() {
                     fs_results.set_visible(false);
+                    fs_cap_note.set_visible(false);
                     fs_browser.borrow().container.set_visible(true);
                     return;
                 }
                 let cmd = fs_cmd.clone();
+                let cap = fs_cap.get();
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(150),
                     move || {
-                        let _ = cmd.send(MpdCommand::SearchFiles(q));
+                        let _ = cmd.send(MpdCommand::SearchFiles(q, cap));
                     },
                 );
             });
             folder_search.connect_stop_search(move |_| {
                 fs_results2.set_visible(false);
+                fs_cap_note2.set_visible(false);
                 fs_browser2.borrow().container.set_visible(true);
             });
 
@@ -874,8 +892,16 @@ impl App {
             });
             left_scroll.add_controller(grid_target);
 
+            // Inline note for album search cap ("Showing 100 of 250 track results")
+            let album_cap_note = Label::new(None);
+            album_cap_note.set_halign(gtk4::Align::Center);
+            album_cap_note.set_margin_top(2);
+            album_cap_note.set_margin_bottom(4);
+            album_cap_note.set_visible(false);
+
             album_content.append(&search_entry);
             album_content.append(&left_stack);
+            album_content.append(&album_cap_note);
 
             // --- Bottom panel (visible when sidebar hidden on narrow windows) ---
             let bottom_panel = Box::new(Orientation::Horizontal, 8);
@@ -1970,6 +1996,8 @@ impl App {
             let fc_fb = folder_browser.clone();
             let fc_fs_list = folder_search_list.clone();
             let fc_fs_container = folder_search_results.clone();
+            let fc_album_cap_note = album_cap_note.clone();
+            let fc_folder_cap_note = folder_cap_note.clone();
             let fc_ql = queue_list.clone();
             let fc_queue_popover = queue_popover.clone();
             let fc_ids = item_ids_w.clone();
@@ -2409,16 +2437,19 @@ impl App {
                             log::debug!("[ui] SearchIndexing — index not yet built");
                             fc_empty.set_text("Indexing…");
                             fc_stack.set_visible_child(&fc_empty);
+                            fc_album_cap_note.set_visible(false);
                         }
-                        MpdEvent::SearchResults { results, generation } => {
+                        MpdEvent::SearchResults { results, generation, total } => {
                             // Discard stale results from slower queries
                             if generation != 0 && generation != search_gen.get() {
                                 log::debug!("[ui] Discarding stale SearchResults (gen {generation}, current {cur})", cur = search_gen.get());
                                 return glib::ControlFlow::Continue;
                             }
+                            let capped = total > results.len();
                             if results.is_empty() {
                                 fc_empty.set_text("No results found");
                                 fc_stack.set_visible_child(&fc_empty);
+                                fc_album_cap_note.set_visible(false);
                             } else {
                                 let layout = fc_layout.clone();
                                 let cells_rc = fc_ev_cells.clone();
@@ -2472,9 +2503,20 @@ impl App {
                                 fc_stack.set_visible_child(&fc_scroll);
                                 // Enqueue cover art fetch for search results
                                 let _ = cmd.send(MpdCommand::FetchCovers(results.clone()));
+                                // Inline note when results are capped
+                                if capped {
+                                    fc_album_cap_note.set_text(&format!(
+                                        "Showing {} of {} track results",
+                                        results.len(),
+                                        total
+                                    ));
+                                    fc_album_cap_note.set_visible(true);
+                                } else {
+                                    fc_album_cap_note.set_visible(false);
+                                }
                             }
                         }
-                        MpdEvent::FileSearchResults(results) => {
+                        MpdEvent::FileSearchResults(results, total) => {
                             // Populate folder search results
                             fc_fs_list.remove_all();
                             for (path, name) in &results {
@@ -2498,9 +2540,22 @@ impl App {
                                 row.set_child(Some(&hbox));
                                 fc_fs_list.append(&row);
                             }
+                            let capped = total > results.len();
                             if !results.is_empty() {
                                 fc_fs_container.set_visible(true);
                                 fc_fb.borrow().container.set_visible(false);
+                                if capped {
+                                    fc_folder_cap_note.set_text(&format!(
+                                        "Showing {} of {} track results",
+                                        results.len(),
+                                        total
+                                    ));
+                                    fc_folder_cap_note.set_visible(true);
+                                } else {
+                                    fc_folder_cap_note.set_visible(false);
+                                }
+                            } else {
+                                fc_folder_cap_note.set_visible(false);
                             }
                         }
                         MpdEvent::DirectoryListing(path, entries) => {
