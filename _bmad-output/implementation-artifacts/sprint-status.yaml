@@ -244,10 +244,10 @@ development_status:
   38-1-dedicated-mpd-metadata-connection-thread: done
   38-2-route-metadata-commands-to-dedicated-connection: done
 
-  epic-39: in-progress
+  epic-39: done
   39-1-network-usage-cap: done
   39-2-memory-monitoring: done
 
-  epic-40: in-progress
+  epic-40: done
   40-1-layout-profile-export-import: done
-  40-2-layout-reset-defaults: ready-for-dev
+  40-2-layout-reset-defaults: out-of-scope
