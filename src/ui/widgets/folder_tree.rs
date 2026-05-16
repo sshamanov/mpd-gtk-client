@@ -24,6 +24,8 @@ pub struct FolderBrowser {
     expanded: Rc<RefCell<HashSet<String>>>,
     /// CUE-associated audio file URIs per directory
     cue_tracks: Rc<RefCell<HashMap<String, Vec<String>>>>,
+    /// DSD file URIs per directory (for grouped playback)
+    dsd_tracks: Rc<RefCell<HashMap<String, Vec<String>>>>,
     /// Whether the root has been loaded
     root_loaded: Rc<RefCell<bool>>,
 }
@@ -52,12 +54,14 @@ impl FolderBrowser {
         let dir_cache: Rc<RefCell<HashMap<String, Vec<DirEntry>>>> = Rc::new(RefCell::new(HashMap::new()));
         let expanded: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
         let cue_tracks: Rc<RefCell<HashMap<String, Vec<String>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let dsd_tracks: Rc<RefCell<HashMap<String, Vec<String>>>> = Rc::new(RefCell::new(HashMap::new()));
         let root_loaded: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
         // Row activation: expand/collapse directories, play files/albums
         let tx = cmd_tx.clone();
         let sp = shared_path.clone();
         let ct = cue_tracks.clone();
+        let dt = dsd_tracks.clone();
         let dc = dir_cache.clone();
         let ex = expanded.clone();
         let list_ref = list.clone();
@@ -72,6 +76,11 @@ impl FolderBrowser {
                     if let Some(uris) = ct.borrow().get(path) {
                         let _ = tx.send(MpdCommand::PlayUris(uris.clone()));
                     }
+                } else if name.starts_with("dsd:") {
+                    let path = name.strip_prefix("dsd:").unwrap_or("");
+                    if let Some(uris) = dt.borrow().get(path) {
+                        let _ = tx.send(MpdCommand::PlayUris(uris.clone()));
+                    }
                 } else if name.starts_with("dir:") {
                     let dir_path = name.strip_prefix("dir:").unwrap_or("");
                     let dir_path = dir_path.to_string();
@@ -79,11 +88,11 @@ impl FolderBrowser {
                     if ex.borrow().contains(&dir_path) {
                         // Collapse
                         ex.borrow_mut().remove(&dir_path);
-                        rebuild_list(&list_ref, &dc, &ex, &ct, &sp);
+                        rebuild_list(&list_ref, &dc, &ex, &ct, &dt, &sp);
                     } else if dc.borrow().contains_key(&dir_path) {
                         // Expand from cache
                         ex.borrow_mut().insert(dir_path.clone());
-                        rebuild_list(&list_ref, &dc, &ex, &ct, &sp);
+                        rebuild_list(&list_ref, &dc, &ex, &ct, &dt, &sp);
                     } else {
                         // Fetch from MPD
                         let _ = tx.send(MpdCommand::ListDirectory(dir_path.clone()));
@@ -132,6 +141,7 @@ impl FolderBrowser {
         let rctx_tx = cmd_tx.clone();
         let rctx_list = list.clone();
         let rctx_ct = cue_tracks.clone();
+        let rctx_dt = dsd_tracks.clone();
         let rclick_gesture = gtk4::GestureClick::new();
         rclick_gesture.set_button(3);
         rclick_gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -197,6 +207,30 @@ impl FolderBrowser {
                 } else {
                     return;
                 }
+            } else if name.starts_with("dsd:") {
+                let path = name.strip_prefix("dsd:").unwrap_or("").to_string();
+                if let Some(uris) = rctx_dt.borrow().get(&path) {
+                    let uris_play = uris.clone();
+                    let uris_insert = uris.clone();
+                    let uris_add = uris.clone();
+                    let btn_play = gtk4::Button::with_label("Play Now");
+                    let tp = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayUris(uris_play.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    let btn_next = gtk4::Button::with_label("Play Next");
+                    let tn = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(uris_insert.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    let btn_add = gtk4::Button::with_label("Add to Queue");
+                    let ta = tx.clone();
+                    let pc = pop_close.clone();
+                    btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddUris(uris_add.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
+                    popbox.append(&btn_play);
+                    popbox.append(&btn_next);
+                    popbox.append(&btn_add);
+                } else {
+                    return;
+                }
             } else if name.starts_with("dir:") {
                 let dirpath = name.strip_prefix("dir:").unwrap_or("").to_string();
                 let btn_play = gtk4::Button::with_label("Play Now");
@@ -238,6 +272,7 @@ impl FolderBrowser {
             dir_cache,
             expanded,
             cue_tracks,
+            dsd_tracks,
             root_loaded,
         }
     }
@@ -334,6 +369,22 @@ impl FolderBrowser {
             self.cue_tracks.borrow_mut().insert(path.to_string(), uris);
         }
 
+        // Collect DSD file URIs for grouped playback
+        let has_dsd = entries
+            .iter()
+            .any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff")));
+        if has_dsd {
+            let mut uris: Vec<String> = Vec::new();
+            for entry in &entries {
+                if let DirEntry::File { path: fp, name, .. } = entry {
+                    if ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff") {
+                        uris.push(fp.clone());
+                    }
+                }
+            }
+            self.dsd_tracks.borrow_mut().insert(path.to_string(), uris);
+        }
+
         self.dir_cache.borrow_mut().insert(path.to_string(), entries);
         self.expanded.borrow_mut().insert(path.to_string());
         self.root_loaded.replace(true);
@@ -343,6 +394,7 @@ impl FolderBrowser {
             &self.dir_cache,
             &self.expanded,
             &self.cue_tracks,
+            &self.dsd_tracks,
             &self.shared_path,
         );
     }
@@ -354,6 +406,7 @@ impl FolderBrowser {
             &self.dir_cache,
             &self.expanded,
             &self.cue_tracks,
+            &self.dsd_tracks,
             &self.shared_path,
         );
     }
@@ -365,6 +418,7 @@ fn rebuild_list(
     dir_cache: &Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
     expanded: &Rc<RefCell<HashSet<String>>>,
     cue_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
+    dsd_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
     shared_path: &Rc<RefCell<String>>,
 ) {
     // Clear all rows. Use remove_all() which handles ListBox internal
@@ -392,6 +446,7 @@ fn rebuild_list(
         dir_cache,
         expanded,
         cue_tracks,
+        dsd_tracks,
     );
 
     // Show ".." parent entry if not at root
@@ -408,6 +463,7 @@ fn render_dir(
     dir_cache: &Rc<RefCell<HashMap<String, Vec<DirEntry>>>>,
     expanded: &Rc<RefCell<HashSet<String>>>,
     cue_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
+    dsd_tracks: &Rc<RefCell<HashMap<String, Vec<String>>>>,
 ) {
     let entries = match dir_cache.borrow().get(path) {
         Some(e) => e.clone(),
@@ -421,6 +477,9 @@ fn render_dir(
     let has_cue = entries
         .iter()
         .any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".cue")));
+    let has_dsd = entries
+        .iter()
+        .any(|e| matches!(e, DirEntry::File { name, .. } if ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff")));
 
     let mut has_visible = false;
 
@@ -446,6 +505,7 @@ fn render_dir(
                         dir_cache,
                         expanded,
                         cue_tracks,
+                        dsd_tracks,
                     );
                 }
             }
@@ -477,7 +537,10 @@ fn render_dir(
                 {
                     continue;
                 }
-                // DSD files are shown as individual tracks
+                // DSD files are grouped into a summary row — skip individual rows
+                if has_dsd && (ends_with_ci(name, ".dsf") || ends_with_ci(name, ".dff")) {
+                    continue;
+                }
                 has_visible = true;
                 let badge = format_badge(format, audio);
                 let dur = duration.map(format_duration).unwrap_or_default();
@@ -497,15 +560,24 @@ fn render_dir(
         }
     }
 
-    // Normalized CUE summary row
+    // Normalized CUE summary row with track count tooltip
     if has_cue {
-        let row = cue_summary_row(path, depth);
+        let track_count = cue_tracks.borrow().get(path).map(|v| v.len()).unwrap_or(0);
+        let row = cue_summary_row(path, depth, track_count);
+        list.append(&row);
+        has_visible = true;
+    }
+
+    // Normalized DSD summary row
+    if has_dsd {
+        let file_count = dsd_tracks.borrow().get(path).map(|v| v.len()).unwrap_or(0);
+        let row = dsd_summary_row(path, depth, file_count);
         list.append(&row);
         has_visible = true;
     }
 
     // Empty state
-    if !has_visible && !has_cue {
+    if !has_visible && !has_cue && !has_dsd {
         let empty_row = gtk4::ListBoxRow::new();
         let lbl = Label::new(Some("(empty directory)"));
         lbl.set_css_classes(&["album-grid-status"]);
@@ -610,7 +682,7 @@ fn file_row(
     row
 }
 
-fn cue_summary_row(path: &str, depth: u32) -> gtk4::ListBoxRow {
+fn cue_summary_row(path: &str, depth: u32, track_count: usize) -> gtk4::ListBoxRow {
     let row = gtk4::ListBoxRow::new();
     let indent = (depth * 20 + 8) as i32;
     let hbox = Box::new(Orientation::Horizontal, 4);
@@ -622,13 +694,46 @@ fn cue_summary_row(path: &str, depth: u32) -> gtk4::ListBoxRow {
     icon.set_pixel_size(16);
     hbox.append(&icon);
 
-    let lbl = Label::new(Some("[CUE] Cue Sheet Album"));
-    let info = Label::new(Some("click to play"));
-    info.set_css_classes(&["format-badge"]);
+    let lbl = Label::new(Some("Cue Sheet Album"));
+    lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    hbox.append(&lbl);
+
+    let badge = Label::new(Some("CUE"));
+    badge.set_css_classes(&["normalized-badge"]);
+    hbox.append(&badge);
+
     hbox.set_css_classes(&["dir-entry"]);
     hbox.set_widget_name(&format!("cue:{}", path));
+    let tooltip = format!("Cue sheet — {} track{}", track_count, if track_count == 1 { "" } else { "s" });
+    row.set_tooltip_text(Some(&tooltip));
+    row.set_child(Some(&hbox));
+    row
+}
+
+fn dsd_summary_row(path: &str, depth: u32, file_count: usize) -> gtk4::ListBoxRow {
+    let row = gtk4::ListBoxRow::new();
+    let indent = (depth * 20 + 8) as i32;
+    let hbox = Box::new(Orientation::Horizontal, 4);
+    hbox.set_margin_start(indent);
+    hbox.set_margin_top(3);
+    hbox.set_margin_bottom(3);
+
+    let icon = Image::from_icon_name("audio-x-generic-symbolic");
+    icon.set_pixel_size(16);
+    hbox.append(&icon);
+
+    let lbl = Label::new(Some("DSD Album"));
+    lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     hbox.append(&lbl);
-    hbox.append(&info);
+
+    let badge = Label::new(Some("DSD"));
+    badge.set_css_classes(&["normalized-badge"]);
+    hbox.append(&badge);
+
+    hbox.set_css_classes(&["dir-entry"]);
+    hbox.set_widget_name(&format!("dsd:{}", path));
+    let tooltip = format!("DSD folder — {} file{}", file_count, if file_count == 1 { "" } else { "s" });
+    row.set_tooltip_text(Some(&tooltip));
     row.set_child(Some(&hbox));
     row
 }
