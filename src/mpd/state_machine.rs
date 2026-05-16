@@ -1259,6 +1259,7 @@ fn process_command(
         MpdCommand::Close => {
             log::info!("[MPD] received Close command, sending close to MPD");
             let _ = adapter.send_command("close");
+            adapter.mark_closed();
             stop.store(true, Ordering::Release);
             return true;
         }

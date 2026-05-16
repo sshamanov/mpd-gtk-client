@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-16"
+last_updated: "2026-05-17"
 
 
 
@@ -97,6 +97,7 @@ development_status:
   6-5-dead-code-cleanup: done
   6-6-graceful-mpd-shutdown: done
   6-7-queue-key-race-condition: done
+  6-8-mpd-adapter-drop: done
 
   epic-9: done
   9-3-fix-grouped-double-click: done
@@ -251,3 +252,4 @@ development_status:
   epic-40: done
   40-1-layout-profile-export-import: done
   40-2-layout-reset-defaults: out-of-scope
+  40-3-layoutprofile-consume-in-layout: backlog

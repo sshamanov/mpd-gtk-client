@@ -11,6 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
 
@@ -125,6 +126,7 @@ fn try_unix_socket_connect() -> Result<MpdAdapter, Error> {
                             stream: MpdStream::Unix(stream),
                             protocol_version: Some(version.to_string()),
                             capabilities: MpdCapabilities::from_version(&version),
+                            closed: AtomicBool::new(false),
                         };
                         return Ok(adap);
                     }
@@ -268,6 +270,7 @@ pub struct MpdAdapter {
     stream: MpdStream,
     pub protocol_version: Option<String>,
     pub capabilities: MpdCapabilities,
+    closed: AtomicBool,
 }
 
 /// Feature capability matrix computed from MPD protocol version.
@@ -333,6 +336,7 @@ impl MpdAdapter {
                         reader,
                         protocol_version: Some(version),
                         capabilities: Default::default(),
+                        closed: AtomicBool::new(false),
                     })
                 }
             }
@@ -377,6 +381,7 @@ impl MpdAdapter {
             stream: MpdStream::Tcp(stream),
             protocol_version: Some(version.to_string()),
             capabilities: MpdCapabilities::from_version(&version),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -449,6 +454,11 @@ impl MpdAdapter {
             log::warn!("[adapter] send_command({command:?}) took {:?}, {} lines", elapsed, lines.len());
         }
         Ok(lines)
+    }
+
+    /// Mark the adapter as closed so Drop doesn't send a redundant `close\n`.
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Return a cloned stream handle for writing `noidle` from another thread.
@@ -1137,5 +1147,14 @@ fn normalize_year(date: &str) -> String {
         }
 
         groups
+    }
+}
+
+impl Drop for MpdAdapter {
+    fn drop(&mut self) {
+        if !self.closed.load(Ordering::Acquire) {
+            let _ = writeln!(self.stream, "close");
+            let _ = self.stream.flush();
+        }
     }
 }
