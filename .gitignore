@@ -28,6 +28,8 @@ error.log
 *.log
 
 # AI tools
+.claude/
+.codex
 .codex/
 
 # Temporary files

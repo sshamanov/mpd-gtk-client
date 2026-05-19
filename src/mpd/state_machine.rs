@@ -642,6 +642,7 @@ fn connected_loop(
                         match cmd_rx.try_recv() {
                             Ok(cmd) => {
                                 if process_command(cmd, &mut adapter, event_tx, &mut actual_read, &cover_provider,
+                                    &cache_dir,
                                     &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                                     &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                                     stop, metadata_cache,
@@ -662,7 +663,21 @@ fn connected_loop(
                     use_idle = false;
                 }
                 Err(e) => {
-                    // Transient error — poll briefly then retry idle
+                    // Distinguish fatal from transient idle errors.
+                    // Fatal: connection is dead, must reconnect. Transient: retry idle.
+                    let is_fatal = matches!(&e,
+                        crate::mpd::Error::Connection(io_err)
+                            if io_err.kind() == std::io::ErrorKind::BrokenPipe
+                            || io_err.kind() == std::io::ErrorKind::ConnectionReset
+                            || io_err.kind() == std::io::ErrorKind::ConnectionAborted
+                    ) || matches!(&e,
+                        crate::mpd::Error::Protocol(msg)
+                            if msg.contains("Connection closed")
+                    );
+                    if is_fatal {
+                        log::error!("[MPD] idle connection dead: {e}, triggering reconnect");
+                        return;
+                    }
                     log::warn!("[MPD] idle transient error: {e}, polling fallback");
                     transient_failures += 1;
                     if transient_failures >= 10 {
@@ -679,6 +694,7 @@ fn connected_loop(
                 Ok(cmd) => {
                     if stop.load(Ordering::Acquire) { return; }
                     if process_command(cmd, &mut adapter, event_tx, &mut actual_read, &cover_provider,
+                        &cache_dir,
                         &mut last_status, &mut last_song_pos, &mut last_playlist_version,
                         &mut local_queue, &mut cached_flat_albums, &mut consecutive_failures,
                         stop, metadata_cache,
@@ -785,7 +801,8 @@ fn process_command(
     adapter: &mut MpdAdapter,
     event_tx: &mpsc::SyncSender<MpdEvent>,
     actual_read: &mut crate::coverart::ActualRead,
-    _cover_provider: &std::sync::Arc<std::sync::RwLock<crate::coverart::CoverProvider>>,
+    cover_provider: &std::sync::Arc<std::sync::RwLock<crate::coverart::CoverProvider>>,
+    cache_dir: &std::path::Path,
     last_status: &mut Instant,
     _last_song_pos: &mut Option<u32>,
     last_playlist_version: &mut Option<String>,
@@ -924,35 +941,65 @@ fn process_command(
             log::info!("[cover] enqueuing {} albums for cover fetch", albums.len());
             actual_read.enqueue(albums.clone());
 
-            // Lazy-spawn cover thread on first use (story 28-1)
-            if cover_tx.is_none() {
-                let caps = adapter.capabilities.clone();
-                *cover_tx = Some(cover::spawn(
-                    cover_target.clone(),
-                    caps,
-                    cover_result_tx.clone(),
-                    stop.clone(),
-                ));
-            }
-
-            // Resolve URIs on the MPD IO connection, enqueue (artist, album, uri)
-            // jobs to the cover thread for binary fetch on its own connection
-            let mut jobs = Vec::with_capacity(albums.len());
-            for (artist, album) in &albums {
-                match adapter.find_album_uris(album) {
-                    Ok(uris) => {
-                        if let Some(uri) = uris.first() {
-                            jobs.push((artist.clone(), album.clone(), uri.clone()));
+            // ── Fast path: skip MPD fetch for cached covers ──
+            // Single pass: check CoverProvider index + disk file, emit
+            // CoverPaths directly for cache hits.
+            let mut covers = std::collections::HashMap::new();
+            let mut uncached: Vec<&(String, String)> = Vec::new();
+            if let Ok(prov) = cover_provider.read() {
+                for pair in &albums {
+                    let key = crate::coverart::cover_key(&pair.0, &pair.1);
+                    if let Some(entry) = prov.get(&key) {
+                        let path = cache_dir.join(format!("{}.jpg", entry.md5));
+                        if path.exists() {
+                            covers.insert(key, Some(path.to_string_lossy().to_string()));
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        log::info!("[cover] find_album_uris for '{artist}/{album}' failed: {e}");
-                    }
+                    uncached.push(pair);
                 }
+            } else {
+                uncached.extend(albums.iter());
+            }
+            if !covers.is_empty() {
+                let _ = event_tx.try_send(MpdEvent::CoverPaths(covers));
             }
 
-            if let Some(ref tx) = *cover_tx {
-                tx.enqueue(&jobs);
+            // Uncached albums: full pipeline (resolve URI → albumart MPD fetch → MD5 → cache)
+            if !uncached.is_empty() {
+                log::info!("[cover] {} cached (direct emit), {} need MPD fetch",
+                    albums.len() - uncached.len(), uncached.len());
+
+                // Lazy-spawn cover thread on first use (story 28-1)
+                if cover_tx.is_none() {
+                    let caps = adapter.capabilities.clone();
+                    *cover_tx = Some(cover::spawn(
+                        cover_target.clone(),
+                        caps,
+                        cover_result_tx.clone(),
+                        stop.clone(),
+                    ));
+                }
+
+                let mut jobs = Vec::with_capacity(uncached.len());
+                for (artist, album) in &uncached {
+                    match adapter.find_album_uris(album) {
+                        Ok(uris) => {
+                            if let Some(uri) = uris.first() {
+                                jobs.push(((*artist).clone(), (*album).clone(), uri.clone()));
+                            }
+                        }
+                        Err(e) => {
+                            log::info!("[cover] find_album_uris for '{artist}/{album}' failed: {e}");
+                        }
+                    }
+                }
+
+                if let Some(ref tx) = *cover_tx {
+                    tx.enqueue(&jobs);
+                }
+            } else {
+                log::info!("[cover] all {} albums served from cache (0 MPD round-trips)", albums.len());
             }
         }
         MpdCommand::Search(query) => {

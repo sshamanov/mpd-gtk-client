@@ -2293,20 +2293,11 @@ impl App {
                                     let key = crate::coverart::cover_key(&meta.album_artist, &meta.album);
                                     cell.set_album(&meta.album, &meta.album_artist, meta.year.as_deref(), &meta.album);
                                     cell.set_year_badge(format_year_badge(meta.year.as_deref()).as_deref());
-                                    // Set cover texture from cache or placeholder
                                     let cached = tc.borrow().get(&key).cloned();
                                     if let Some(tex) = cached {
                                         cell.set_cover_texture(&tex);
                                     } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
-                                        if let Ok(img) = image::open(&p) {
-                                            let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
-                                            let bytes = glib::Bytes::from_owned(rgba.into_raw());
-                                            let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
-                                            tc.borrow_mut().insert(key.clone(), tex.clone().into());
-                                            cell.set_cover_texture(&tex);
-                                        } else {
-                                            cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
-                                        }
+                                        cell.set_cover_filename(&p);
                                     } else {
                                         cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
                                     }
@@ -2383,15 +2374,7 @@ impl App {
                                         if let Some(tex) = cached {
                                             cell.set_cover_texture(&tex);
                                         } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
-                                            if let Ok(img) = image::open(&p) {
-                                                let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
-                                                let bytes = glib::Bytes::from_owned(rgba.into_raw());
-                                                let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
-                                                tc.borrow_mut().insert(key.clone(), tex.clone().into());
-                                                cell.set_cover_texture(&tex);
-                                            } else {
-                                                cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
-                                            }
+                                            cell.set_cover_filename(&p);
                                         } else {
                                             cell.set_cover_texture(&placeholder_texture(&meta.album_artist));
                                         }
@@ -2471,15 +2454,7 @@ impl App {
                                     if let Some(tex) = cached {
                                         cell.set_cover_texture(&tex);
                                     } else if let Some(p) = cp.borrow().get(&key).and_then(|o| o.clone()) {
-                                        if let Ok(img) = image::open(&p) {
-                                            let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
-                                            let bytes = glib::Bytes::from_owned(rgba.into_raw());
-                                            let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
-                                            tc.borrow_mut().insert(key.clone(), tex.clone().into());
-                                            cell.set_cover_texture(&tex);
-                                        } else {
-                                            cell.set_cover_texture(&placeholder_texture(artist));
-                                        }
+                                        cell.set_cover_filename(&p);
                                     } else {
                                         cell.set_cover_texture(&placeholder_texture(artist));
                                     }
@@ -2760,38 +2735,30 @@ impl App {
                             *fc_mini_cells.borrow_mut() = cells;
                         }
                         MpdEvent::CoverPaths(paths) => {
-                            log::info!("[UI] CoverPaths: {} covers, keys: {:?}", paths.len(), paths.keys().collect::<Vec<_>>());
                             let mut cp = fc_ev_cover_paths.borrow_mut();
                             let mini_widgets = fc_mini_cw.borrow();
-                            for (album, path) in &paths {
+                            let cells = fc_ev_cells.borrow();
+                            for (album, path) in paths {
                                 cp.insert(album.clone(), path.clone());
                                 if let Some(p) = path.as_deref() {
-                                    if let Ok(img) = image::open(p) {
-                                        let rgba = image::imageops::resize(&img.to_rgba8(), 200, 200, image::imageops::FilterType::Lanczos3);
-                                        let bytes = glib::Bytes::from_owned(rgba.into_raw());
-                                        let tex = gdk4::MemoryTexture::new(200, 200, gdk4::MemoryFormat::R8g8b8a8, &bytes, 200 * 4);
-                                        fc_ev_cover_tex_cache.borrow_mut().insert(album.clone(), tex.clone().into());
-                                        log::info!("[UI] cover push: '{album}' tex={}x{}",
-                                            tex.width(), tex.height());
-                                        // Update grid cell in-place by album_id
-                                        let cells = fc_ev_cells.borrow();
-                                        if let Some(cell) = cells.iter().find(|c| &c.album_id == album) {
-                                            cell.cell.set_cover_texture(&tex);
-                                        }
-                                        drop(cells);
-                                        // Update mini queue grid
-                                        if let Some(pic) = mini_widgets.get(album) {
-                                            pic.set_paintable(Some(&tex));
-                                            pic.set_visible(true);
-                                            pic.queue_draw();
-                                        }
-                                        let is_current = fc_current_album.borrow().as_deref()
-                                            .map(|a| album.ends_with(&format!("||{}", a)))
-                                            .unwrap_or(false);
-                                        if is_current {
-                                            fc_np_cover.set_paintable(Some(&tex));
-                                            fc_np_cover.set_visible(true);
-                                        }
+                                    // Use Picture::set_filename() — GDK loads and scales
+                                    // asynchronously, no CPU decode on the GTK main thread.
+                                    // Update grid cell
+                                    if let Some(cell) = cells.iter().find(|c| c.album_id == *album) {
+                                        cell.cell.set_cover_filename(p);
+                                    }
+                                    // Update mini queue grid
+                                    if let Some(pic) = mini_widgets.get(album.as_str()) {
+                                        pic.set_filename(Some(p));
+                                        pic.set_visible(true);
+                                    }
+                                    // Update now-playing cover
+                                    let is_current = fc_current_album.borrow().as_deref()
+                                        .map(|a| album.ends_with(&format!("||{}", a)))
+                                        .unwrap_or(false);
+                                    if is_current {
+                                        fc_np_cover.set_filename(Some(p));
+                                        fc_np_cover.set_visible(true);
                                     }
                                 }
                             }

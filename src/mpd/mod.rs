@@ -474,18 +474,27 @@ impl MpdAdapter {
     /// Returns `Err` on transient errors (connection reset, timeout).
     /// Returns `Ok(vec![])` if `noidle` was sent externally (empty response).
     pub fn idle(&mut self) -> Result<Vec<String>, Error> {
-        // Flush any buffered data before sending idle
         self.stream.write_all(b"idle\n")?;
         self.stream.flush()?;
 
-        // Send idle — errors are retryable (transient)
+        // MPD idle blocks indefinitely until a subsystem changes. The 10s TCP
+        // read timeout would kill the connection on a quiet server, causing a
+        // flood of broken-pipe errors. Remove the timeout during idle.
         let t0 = std::time::Instant::now();
         let mut subsystems = Vec::new();
         let mut line = String::new();
+        self.reader.get_mut().set_read_timeout(None)?;
         loop {
             line.clear();
-            let n = self.reader.read_line(&mut line)?;
+            let n = match self.reader.read_line(&mut line) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = self.reader.get_mut().set_read_timeout(Some(Duration::from_secs(10)));
+                    return Err(Error::Connection(e));
+                }
+            };
             if n == 0 {
+                let _ = self.reader.get_mut().set_read_timeout(Some(Duration::from_secs(10)));
                 return Err(Error::Protocol("Connection closed during idle".into()));
             }
             let trimmed = line.trim_end();
@@ -493,7 +502,7 @@ impl MpdAdapter {
                 break;
             }
             if trimmed.starts_with("ACK") {
-                // Check for "unknown command" (MPD < 0.19 or idle disabled)
+                let _ = self.reader.get_mut().set_read_timeout(Some(Duration::from_secs(10)));
                 if trimmed.contains("unknown") {
                     log::info!("[adapter] MPD does not support idle command, falling back to polling");
                     return Err(Error::MpdError(trimmed.to_string()));
@@ -504,6 +513,7 @@ impl MpdAdapter {
                 subsystems.push(subsystem.to_string());
             }
         }
+        self.reader.get_mut().set_read_timeout(Some(Duration::from_secs(10)))?;
         let elapsed = t0.elapsed();
         log::debug!("[adapter] idle returned {:?} subsystems in {:?}", subsystems.len(), elapsed);
         Ok(subsystems)

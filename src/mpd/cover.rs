@@ -77,8 +77,22 @@ impl CoverThreadSender {
     /// Enqueue a batch of cover fetch jobs. Uses `try_send` — if the channel
     /// is full, jobs are silently dropped (backpressure; they'll be re-requested).
     pub fn enqueue(&self, jobs: &[(String, String, String)]) {
+        let mut dropped = 0u32;
         for job in jobs {
-            let _ = self.tx.try_send(job.clone());
+            match self.tx.try_send(job.clone()) {
+                Ok(_) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    dropped += 1;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    log::warn!("[mpd-cover] Cover thread disconnected, {} jobs lost", jobs.len());
+                    break;
+                }
+            }
+        }
+        if dropped > 0 {
+            log::warn!("[mpd-cover] Channel full: dropped {dropped}/{total} jobs",
+                total = jobs.len());
         }
     }
 }
@@ -101,7 +115,7 @@ pub fn spawn(
     result_tx: mpsc::SyncSender<CoverFetchResult>,
     shutting_down: Arc<AtomicBool>,
 ) -> CoverThreadSender {
-    let (job_tx, job_rx) = mpsc::sync_channel::<CoverJob>(32);
+    let (job_tx, job_rx) = mpsc::sync_channel::<CoverJob>(512);
 
     let _ = std::thread::Builder::new()
         .name("mpd-cover".into())

@@ -101,56 +101,46 @@ fn process_success(
 ) {
     let md5 = format!("{:x}", Md5::digest(data));
 
-    // Check CoverProvider cache — if hash matches and timestamp not newer, skip
-    match provider.read() {
-        Ok(ref prov) => {
-            if let Some(cached) = prov.get(key) {
-                if cached.md5 == md5 {
-                    if mtime.is_none() {
-                        log::debug!("[cover-proc] '{key}': hash unchanged, emitting cached path");
-                        emit_cover_path(key, &md5, cache_dir, event_tx);
-                        return;
-                    }
-                    if let Some(cached_ts) = cached.timestamp {
-                        if cached_ts >= mtime.unwrap_or(0) {
-                            log::debug!(
-                                "[cover-proc] '{key}': timestamp not newer (cached: {cached_ts}, mtime: {})",
-                                mtime.unwrap_or(0)
-                            );
-                            return;
-                        }
-                    }
-                }
+    // Check CoverProvider cache for hash/timestamp match
+    let cache_hit = match provider.read() {
+        Ok(ref prov) => prov.get(key).filter(|cached| {
+            cached.md5 == md5 && match mtime {
+                None => true,
+                Some(mt) => cached.timestamp.map_or(true, |cts| cts >= mt),
             }
+        }),
+        Err(e) => {
+            log::error!("[cover-proc] CoverProvider RwLock poisoned (read): {e}");
+            None
         }
-        Err(e) => log::error!("[cover-proc] CoverProvider RwLock poisoned (read): {e}"),
+    };
+
+    if cache_hit.is_some() {
+        // Cover unchanged — emit path only. UI uses async set_filename() for
+        // cached covers, avoiding any JPEG decode (GDK loads + scales async).
+        log::debug!("[cover-proc] '{key}': hash unchanged, emitting cached path");
+        emit_cover_path(key, &md5, cache_dir, event_tx);
+        return;
     }
 
     // New or updated cover — write JPEG to disk cache
     write_cache(key, data, &md5, mtime, cache_dir);
-
-    // Update CoverProvider in-memory index
     match provider.read() {
         Ok(ref prov) => prov.update_entry(key, &md5, mtime),
         Err(e) => log::error!("[cover-proc] CoverProvider RwLock poisoned (update_entry): {e}"),
     }
 
-    // Emit CoverPaths (path-based delivery for cached covers)
-    emit_cover_path(key, &md5, cache_dir, event_tx);
-
-    // LRU eviction if cache exceeds size limit
+    // LRU eviction if cache exceeds size limit (only after a new write)
     if let Ok(ref prov) = provider.read() {
         prov.evict_lru(CoverProvider::DEFAULT_MAX_SIZE_BYTES);
     }
 
-    // Decode JPEG → resize to 200×200 RGBA via image crate
+    // Emit CoverPaths so the UI knows the disk path
+    emit_cover_path(key, &md5, cache_dir, event_tx);
+
+    // Decode JPEG -> 200x200 RGBA on background thread (never on GTK main thread)
     match decode_and_resize(data) {
         Ok(rgba) => {
-            log::info!(
-                "[cover-proc] '{key}': decoded {} JPEG bytes → {} RGBA bytes (200×200)",
-                data.len(),
-                rgba.len()
-            );
             if let Err(e) = event_tx.try_send(MpdEvent::CoverRefreshed {
                 album_id: key.to_string(),
                 data: rgba,
@@ -162,8 +152,6 @@ fn process_success(
         }
         Err(e) => {
             log::warn!("[cover-proc] '{key}': JPEG decode failed ({e}), skipping CoverRefreshed (placeholder fallback)");
-            // CoverPaths already emitted above; UI loads cached JPEG from disk.
-            // Emitting raw JPEG as CoverRefreshed would corrupt MemoryTexture (expects RGBA).
         }
     }
 }
@@ -173,26 +161,23 @@ fn process_success(
 /// Rejects MPD protocol maximum 16384×16384 (1 GB buffer) to prevent OOM.
 const MAX_DIM: u32 = 4096;
 
-/// Decode JPEG bytes via the `image` crate and resize to 200×200 RGBA (Lanczos3).
+/// Decode JPEG bytes via the `image` crate and resize to 200×200 RGBA.
 ///
-/// Checks image dimensions via header parse before full decode — rejects images
-/// exceeding `MAX_DIM` to avoid allocating an intermediate RGBA buffer large enough
-/// to OOM the process.
+/// Decodes once, then resizes at native color depth before converting to RGBA8.
+/// This avoids allocating a full-resolution RGBA buffer (e.g. 36 MB for 3000×3000).
+/// Uses CatmullRom filter — perceptually equivalent to Lanczos3 at 200×200 but faster.
 fn decode_and_resize(data: &[u8]) -> Result<Vec<u8>, String> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| format!("{e}"))?;
-    let (w, h) = reader.into_dimensions().map_err(|e| format!("{e}"))?;
+    let img = image::load_from_memory(data)
+        .map_err(|e| format!("{e} (data size: {} bytes)", data.len()))?;
+    let (w, h) = (img.width(), img.height());
     if w > MAX_DIM || h > MAX_DIM {
         return Err(format!(
             "image dimensions {w}x{h} exceed MAX_DIM ({MAX_DIM}), rejecting to prevent OOM"
         ));
     }
-    let img = image::load_from_memory(data)
-        .map_err(|e| format!("{e} (data size: {} bytes)", data.len()))?;
-    let rgba = img.to_rgba8();
-    let resized = image::imageops::resize(&rgba, 200, 200, FilterType::Lanczos3);
-    Ok(resized.into_raw())
+    // Resize at native color depth, then convert to RGBA8 only at 200×200
+    let resized = img.resize_exact(200, 200, FilterType::CatmullRom);
+    Ok(resized.to_rgba8().into_raw())
 }
 
 /// Write cover data to disk cache normalized as JPEG (md5-named file) and update index.json.

@@ -449,6 +449,15 @@ impl AlbumCoverCell {
         }
     }
 
+    /// Load cover from a file path via GTK's async image loading.
+    /// This does NOT decode JPEG on the calling thread — GDK handles
+    /// loading and scaling asynchronously in the compositor.
+    pub fn set_cover_filename(&self, path: &str) {
+        if let Some(ref pic) = *self.imp().cover_picture.borrow() {
+            pic.set_filename(Some(path));
+        }
+    }
+
     pub fn cover_picture(&self) -> Option<gtk4::Picture> {
         self.imp().cover_picture.borrow().clone()
     }
