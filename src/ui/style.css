@@ -12,7 +12,7 @@
     background-color: alpha(@theme_bg_color, 0.75);
     color: @theme_fg_color;
     font-weight: bold;
-    font-size: 0.85em;
+    font-size: 1.5em;
     padding: 2px 6px;
     border-radius: 3px;
 }

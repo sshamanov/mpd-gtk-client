@@ -28,6 +28,14 @@ use crate::mpd::state_machine::MpdEvent;
 
 type EventSender = mpsc::SyncSender<MpdEvent>;
 
+/// RAII guard that resets the `running` AtomicBool on drop (including panic).
+struct RunningGuard(Arc<AtomicBool>);
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Spawn the Cover Proc worker thread.
 ///
 /// Receives `CoverFetchResult` from the MPD Cover thread via `job_rx`, decodes JPEG
@@ -49,9 +57,11 @@ pub fn spawn(
         log::warn!("[cover-proc] Another Cover Proc worker is still running, skipping spawn");
         return;
     }
+    let running_guard = RunningGuard(running.clone());
     std::thread::Builder::new()
         .name("cover-proc".into())
         .spawn(move || {
+            let _guard = running_guard; // reset flag on drop (including panic)
             log::info!("[cover-proc] Thread started");
 
             loop {
@@ -84,7 +94,6 @@ pub fn spawn(
                 }
             }
 
-            running.store(false, Ordering::Release);
             log::info!("[cover-proc] Thread terminated");
         })
         .expect("Failed to spawn cover-proc thread");

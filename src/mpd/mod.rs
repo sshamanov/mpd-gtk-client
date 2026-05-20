@@ -330,12 +330,13 @@ impl MpdAdapter {
                     if !greeting.trim().starts_with("OK ") {
                         return Err(Error::Protocol("invalid MPD greeting".into()));
                     }
-                    let version = greeting.trim().trim_start_matches("OK ").to_string();
+                    let protocol_version = greeting.trim().to_string();
+                    let version = MpdVersion::parse(&protocol_version);
                     Ok(MpdAdapter {
                         stream: MpdStream::Unix(stream),
                         reader,
-                        protocol_version: Some(version),
-                        capabilities: Default::default(),
+                        protocol_version: Some(version.to_string()),
+                        capabilities: MpdCapabilities::from_version(&version),
                         closed: AtomicBool::new(false),
                     })
                 }
@@ -854,49 +855,39 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
     pub fn search_albums(&mut self, query: &str) -> Result<Vec<(String, String)>, Error> {
         let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
         let lines = self.send_command(&format!("search any \"{}\"", escaped))?;
-        let mut results: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Single pass over response lines: build artist map + preserve insertion order
         let mut current_artist = String::new();
-        // First pass: map album names to first artist encountered
         let mut album_artist: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut album_order: Vec<String> = Vec::new();
         for line in &lines {
             if line.starts_with("file: ") {
                 current_artist.clear();
             } else if let Some(artist) = line.strip_prefix("Artist: ") {
                 current_artist = artist.to_string();
             } else if let Some(artist) = line.strip_prefix("AlbumArtist: ") {
-                // AlbumArtist takes priority over per-track Artist
                 current_artist = artist.to_string();
             } else if let Some(album) = line.strip_prefix("Album: ") {
                 let album = album.to_string();
+                let is_new = !album_artist.contains_key(&album);
                 if !current_artist.is_empty() {
-                    // Insert or update: replace empty placeholder with real artist
-                    album_artist.entry(album)
+                    album_artist.entry(album.clone())
                         .and_modify(|e| { if e.is_empty() { *e = current_artist.clone(); } })
                         .or_insert_with(|| current_artist.clone());
                 } else {
-                    // No artist yet — insert empty placeholder (may be updated later or set to Unknown Artist)
-                    album_artist.entry(album).or_insert_with(String::new);
+                    album_artist.entry(album.clone()).or_insert_with(String::new);
+                }
+                if is_new {
+                    album_order.push(album);
                 }
             }
         }
-        // Replace any remaining empty artists with "Unknown Artist"
-        for (_, artist) in album_artist.iter_mut() {
-            if artist.is_empty() {
-                *artist = "Unknown Artist".to_string();
-            }
-        }
-        // Second pass: build results in order
-        for line in &lines {
-            if let Some(album) = line.strip_prefix("Album: ") {
-                if seen.insert(album.to_string()) {
-                    if let Some(artist) = album_artist.get(album) {
-                        results.push((artist.clone(), album.to_string()));
-                    }
-                }
-            }
-        }
-        Ok(results)
+        // Emit results in insertion order, replacing empty artists with "Unknown Artist"
+        Ok(album_order.into_iter().map(|album| {
+            let artist = album_artist.get(&album)
+                .map(|a| if a.is_empty() { "Unknown Artist" } else { a.as_str() })
+                .unwrap_or("Unknown Artist");
+            (artist.to_string(), album)
+        }).collect())
     }
 
     /// List directory contents via MPD's lsinfo command.

@@ -142,7 +142,11 @@ impl AudioFormat {
                 .trim_end_matches('0')
                 .trim_end_matches('.')
                 .to_string();
-            format!("{}/{} · {}", self.bit_depth, rate_str, self.codec)
+            if !self.codec.is_empty() {
+                    format!("{}/{} · {}", self.bit_depth, rate_str, self.codec)
+                } else {
+                    format!("{}/{}", self.bit_depth, rate_str)
+                }
         } else if !self.codec.is_empty() {
             self.codec.clone()
         } else {
@@ -681,7 +685,8 @@ fn connected_loop(
                     log::warn!("[MPD] idle transient error: {e}, polling fallback");
                     transient_failures += 1;
                     if transient_failures >= 10 {
-                        log::info!("[MPD] transient window passed, retrying idle");
+                        log::info!("[MPD] transient window passed, switching to poll fallback");
+                        use_idle = false;
                         transient_failures = 0;
                     }
                 }
@@ -1677,84 +1682,75 @@ fn metadata_thread(
             }
         }
 
-        let a = adapter.as_mut().unwrap();
+        // Retry loop: on connection error, reconnect and retry once
+        let mut retry = true;
+        loop {
+            let a = adapter.as_mut().unwrap();
 
-        match cmd {
-            MpdCommand::ListAlbums => {
-                match a.list_albums() {
-                    Ok(albums) => { let _ = event_tx.try_send(MpdEvent::Albums(albums)); }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] list_albums failed: {e}");
-                        adapter = None;
-                    }
-                }
-            }
-            MpdCommand::ListAlbumsGrouped(group) => {
-                match a.list_albums_full() {
+            let err: Option<crate::mpd::Error> = match &cmd {
+                MpdCommand::ListAlbums => match a.list_albums() {
+                    Ok(albums) => { let _ = event_tx.try_send(MpdEvent::Albums(albums)); None }
+                    Err(e) => Some(e),
+                },
+                MpdCommand::ListAlbumsGrouped(group) => match a.list_albums_full() {
                     Ok(albums) => {
                         let groups = a.list_albums_grouped(&group, &albums);
                         let _ = event_tx.try_send(MpdEvent::AlbumsGrouped(groups));
+                        None
                     }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] list_albums_full failed: {e}");
-                        adapter = None;
-                    }
-                }
-            }
-            MpdCommand::ListDirectory(path) => {
-                match a.lsinfo(&path) {
-                    Ok(entries) => { let _ = event_tx.try_send(MpdEvent::DirectoryListing(path, entries)); }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] lsinfo({path}) failed: {e}");
-                        adapter = None;
-                    }
-                }
-            }
-            MpdCommand::ListAlbumTracks(album) => {
-                match a.find_album_tracks(&album) {
-                    Ok(tracks) => { let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks)); }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] find_album_tracks({album}) failed: {e}");
-                        adapter = None;
-                    }
-                }
-            }
-            MpdCommand::Search(query) => {
-                match a.search_albums(&query) {
+                    Err(e) => Some(e),
+                },
+                MpdCommand::ListDirectory(path) => match a.lsinfo(&path) {
+                    Ok(entries) => { let _ = event_tx.try_send(MpdEvent::DirectoryListing(path.clone(), entries)); None }
+                    Err(e) => Some(e),
+                },
+                MpdCommand::ListAlbumTracks(album) => match a.find_album_tracks(&album) {
+                    Ok(tracks) => { let _ = event_tx.try_send(MpdEvent::AlbumTracks(tracks)); None }
+                    Err(e) => Some(e),
+                },
+                MpdCommand::Search(query) => match a.search_albums(&query) {
                     Ok(results) => {
                         let total = results.len();
                         let _ = event_tx.try_send(MpdEvent::SearchResults { results, generation: 0, total });
+                        None
                     }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] search_albums failed: {e}");
-                        adapter = None;
-                    }
-                }
-            }
-            MpdCommand::SearchFiles(query, cap) => {
-                match a.search_files(&query) {
+                    Err(e) => Some(e),
+                },
+                MpdCommand::SearchFiles(query, cap) => match a.search_files(&query) {
                     Ok(mut results) => {
                         let total = results.len();
-                        results.truncate(cap);
+                        results.truncate(*cap);
                         let _ = event_tx.try_send(MpdEvent::FileSearchResults(results, total));
+                        None
                     }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] search_files failed: {e}");
-                        adapter = None;
-                    }
+                    Err(e) => Some(e),
+                },
+                MpdCommand::ListQueue => match a.list_queue() {
+                    Ok(queue) => { let _ = event_tx.try_send(MpdEvent::Queue(queue)); None }
+                    Err(e) => Some(e),
+                },
+                _ => {
+                    log::warn!("[mpd-metadata] unsupported command routed to metadata thread");
+                    None
                 }
-            }
-            MpdCommand::ListQueue => {
-                match a.list_queue() {
-                    Ok(queue) => { let _ = event_tx.try_send(MpdEvent::Queue(queue)); }
-                    Err(e) => {
-                        log::error!("[mpd-metadata] list_queue failed: {e}");
-                        adapter = None;
+            };
+
+            match err {
+                Some(e) if retry => {
+                    log::warn!("[mpd-metadata] command failed, reconnecting: {e}");
+                    adapter = None;
+                    connect(&mut adapter);
+                    if adapter.is_none() {
+                        break; // reconnect failed
                     }
+                    retry = false;
                 }
-            }
-            _ => {
-                log::warn!("[mpd-metadata] unsupported command routed to metadata thread");
+                Some(e) => {
+                    log::error!("[mpd-metadata] command failed after retry: {e}");
+                    adapter = None;
+                    break;
+                }
+                None => break, // success or unsupported
             }
         }
     }

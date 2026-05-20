@@ -17,10 +17,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 /// Album grid item with optional group overlay badge on first item of each group.
-#[derive(Clone)]
 /// Album cell in the GtkLayout coordinate-based grid.
 /// Each cell holds its AlbumCoverCell widget, an optional group caption label,
 /// and metadata for repositioning and filtering.
+#[derive(Clone)]
 struct AlbumCell {
     cell: AlbumCoverCell,
     caption: Option<gtk4::Label>,
@@ -211,7 +211,7 @@ fn placeholder_rgb(artist: &str) -> (f64, f64, f64) {
 
 /// Slot constants for grid layout.
 const CELL_SLOT_W: f64 = 216.0; // 200 cover + 16 padding/margin
-const CELL_SLOT_H: f64 = 250.0; // 200 cover + 50 metadata
+const CELL_SLOT_H: f64 = 258.0; // 200 cover + 50 metadata + 8 gap
 const CAPTION_H: f64 = 32.0;
 
 /// Reposition all album cells and group captions within the GtkLayout.
@@ -230,13 +230,17 @@ fn reposition(layout: &gtk4::Fixed, cells: &[AlbumCell], width: f64) {
 
         let group_start = item.group_value.as_deref() != current_group;
         if group_start {
+            // If previous group ended mid-row, advance to next row before caption
+            if x > 0 {
+                y += CELL_SLOT_H;
+            }
+            x = 0;
             current_group = item.group_value.as_deref();
             if let Some(ref caption) = item.caption {
                 caption.set_visible(true);
                 layout.move_(caption, 0.0, y);
                 y += CAPTION_H;
             }
-            x = 0;
         } else if let Some(ref caption) = item.caption {
             caption.set_visible(false);
         }
@@ -500,8 +504,8 @@ impl App {
             let resize_cells = album_cells.clone();
             let resize_layout = album_layout.clone();
             resize_sw.connect_notify_local(Some("width"), move |sw, _| {
-                let cells = resize_cells.borrow();
-                reposition(&resize_layout, &cells, sw.width() as f64);
+                let cells_snapshot = resize_cells.borrow().clone();
+                reposition(&resize_layout, &cells_snapshot, sw.width() as f64);
             });
             // Album mode content box (group bar + search + grid)
             let album_content = Box::new(Orientation::Vertical, 0);
@@ -954,6 +958,14 @@ impl App {
             let right_pane = Box::new(Orientation::Vertical, 0);
             right_pane.set_margin_start(4);
             right_pane.set_margin_end(4);
+            // Wrap right_pane in adw::Clamp to enforce a maximum width.
+            // set_size_request only sets a MINIMUM in GTK4 — if children request
+            // more space (e.g. large cover art textures), the natural size expands.
+            // adw::Clamp clamps the child's width to maximum_size, giving us a true max.
+            let right_pane_clamp = adw::Clamp::new();
+            right_pane_clamp.set_child(Some(&right_pane));
+            right_pane_clamp.set_hexpand(false);
+            right_pane_clamp.set_maximum_size(rail_width_min.get() as i32);
 
             // Settings gear button with Ctrl+, shortcut
             let settings_btn = gtk4::Button::new();
@@ -1839,7 +1851,7 @@ impl App {
             });
             queue_list.add_controller(reorder_target);
 
-            multi_view.set_child("right", &right_pane);
+            multi_view.set_child("right", &right_pane_clamp);
 
             // --- MultiLayoutView: wide and narrow layouts ---
             let bottom_sheet = adw::BottomSheet::new();
@@ -1860,7 +1872,10 @@ impl App {
             let wide_left = adw::LayoutSlot::new("left");
             let wide_right = adw::LayoutSlot::new("right");
             wide_left.set_hexpand(true);
-            wide_right.set_size_request(rail_width_min.get() as i32, -1);
+            wide_right.set_hexpand(false);
+            // Set initial right rail width before first tick callback
+            let init_rail_w = rail_width_min.get() as i32;
+            wide_right.set_size_request(init_rail_w, -1);
             wide_box.append(&wide_left);
             wide_box.append(&wide_right);
             let wide_layout = adw::Layout::new(&wide_box);
@@ -1936,8 +1951,11 @@ impl App {
                     let first_row = (scroll_top / CELL_SLOT_H).floor() as usize;
                     let visible_rows = (page_size / CELL_SLOT_H).ceil() as usize + 2;
                     let cells_binding = cells.borrow();
-                    let start_idx = first_row.saturating_mul(cols);
+                    let start_idx = first_row.saturating_mul(cols).min(cells_binding.len());
                     let end_idx = (first_row + visible_rows).saturating_mul(cols).min(cells_binding.len());
+                    if start_idx >= end_idx {
+                        return glib::ControlFlow::Break;
+                    }
                     let new_albums: Vec<_> = cells_binding[start_idx..end_idx].iter()
                         .filter(|c| {
                             let key = crate::coverart::cover_key(&c.artist, &c.album);
@@ -2033,6 +2051,7 @@ impl App {
             let fc_bp_title = bp_title.clone();
             let fc_bp_play = bp_play.clone();
             let fc_track_revealer = track_revealer.clone();
+            let fc_last_repos_w: std::cell::Cell<f64> = std::cell::Cell::new(0.0);
 
             // Wire popover track listbox: click row → play that track
             let tv_cmd = fc_cmd.clone();
@@ -2118,12 +2137,29 @@ impl App {
                 fc_bottom_panel.set_visible(narrow);
 
                 // Update right rail width from layout profile (wide mode only)
+                let grid_est_width: f64; // estimated grid viewport width for initial reposition
+                let mini_vpw_est: i32;   // estimated mini-grid viewport width for initial rebuild
                 if !narrow {
-                    let rw_min = rail_width_min.get() as f64;
-                    let rw_max = rail_width_max.get() as f64;
-                    let sr = split_ratio.get();
-                    let rail_w = (win_width * (1.0 - sr)).clamp(rw_min, rw_max) as i32;
+                    let rail_w = rail_width_min.get() as i32;
                     wide_right.set_size_request(rail_w, -1);
+                    right_pane_clamp.set_maximum_size(rail_w);
+                    grid_est_width = (win_width - rail_w as f64).max(200.0);
+                    mini_vpw_est = rail_w;
+                } else {
+                    grid_est_width = win_width.max(200.0);
+                    mini_vpw_est = win_width as i32;
+                }
+
+                // Reposition album grid when viewport width changes (e.g. window resize)
+                let grid_w = fc_scroll.width() as f64;
+                let last_w = fc_last_repos_w.get();
+                if (grid_w - last_w).abs() > 1.0 && grid_w > 0.0 {
+                    fc_last_repos_w.set(grid_w);
+                    // Clone cells to drop RefCell borrow before reposition() —
+                    // layout.move_() can trigger scroll adjustment signals that
+                    // re-enter and borrow the same album_cells RefCell.
+                    let cells_snapshot = fc_ev_cells.borrow().clone();
+                    reposition(&fc_layout, &cells_snapshot, grid_w);
                 }
 
                 // Ensure queue display matches current mode
@@ -2201,7 +2237,8 @@ impl App {
                                 *fc_mini_current.borrow_mut() = update.album.clone();
                                 let items = fc_mini_data.borrow();
                                 if !items.is_empty() {
-                                    let vpw = fc_mini_scroll_ref.width();
+                                    let raw_vpw = fc_mini_scroll_ref.width();
+                                    let vpw = if raw_vpw > 0 { raw_vpw } else { mini_vpw_est };
                                     let cells = rebuild_mini_fixed(
                                         &fc_mini_fixed,
                                         &items,
@@ -2314,10 +2351,9 @@ impl App {
                                 *cells_rc.borrow_mut() = new_cells;
                                 let sw = fc_scroll.clone();
                                 let w = sw.width() as f64;
-                                if w > 0.0 {
-                                    let cells = cells_rc.borrow();
-                                    reposition(&layout, &cells, w);
-                                }
+                                let effective_w = if w > 0.0 { w } else { grid_est_width };
+                                let cells_snapshot = cells_rc.borrow().clone();
+                                reposition(&layout, &cells_snapshot, effective_w);
                                 fc_stack.set_visible_child(&fc_scroll);
                                 if !all_albums.is_empty() {
                                     log::debug!("[ui] initial load: enqueuing {} albums for cover fetch", all_albums.len());
@@ -2405,10 +2441,9 @@ impl App {
                                 *cells_rc.borrow_mut() = new_cells;
                                 let sw = fc_scroll.clone();
                                 let w = sw.width() as f64;
-                                if w > 0.0 {
-                                    let cells = cells_rc.borrow();
-                                    reposition(&layout, &cells, w);
-                                }
+                                let effective_w = if w > 0.0 { w } else { grid_est_width };
+                                let cells_snapshot = cells_rc.borrow().clone();
+                                reposition(&layout, &cells_snapshot, effective_w);
                                 fc_stack.set_visible_child(&fc_scroll);
                                 if !all_albums.is_empty() {
                                     log::debug!("[ui] grouped: enqueuing {} albums for cover fetch", all_albums.len());
@@ -2471,10 +2506,9 @@ impl App {
                                 *cells_rc.borrow_mut() = new_cells;
                                 let sw = fc_scroll.clone();
                                 let w = sw.width() as f64;
-                                if w > 0.0 {
-                                    let cells = cells_rc.borrow();
-                                    reposition(&layout, &cells, w);
-                                }
+                                let effective_w = if w > 0.0 { w } else { grid_est_width };
+                                let cells_snapshot = cells_rc.borrow().clone();
+                                reposition(&layout, &cells_snapshot, effective_w);
                                 fc_stack.set_visible_child(&fc_scroll);
                                 // Enqueue cover art fetch for search results
                                 let _ = cmd.send(MpdCommand::FetchCovers(results.clone()));
@@ -2722,7 +2756,8 @@ impl App {
 
                             // Rebuild Fixed layout with new items
                             let current = fc_mini_current.borrow().clone();
-                            let vpw = fc_mini_scroll_ref.width();
+                            let raw_vpw = fc_mini_scroll_ref.width();
+                            let vpw = if raw_vpw > 0 { raw_vpw } else { mini_vpw_est };
                             let cells = rebuild_mini_fixed(
                                 &fc_mini_fixed,
                                 &fc_mini_data.borrow(),
