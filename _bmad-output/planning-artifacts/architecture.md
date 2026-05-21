@@ -236,19 +236,19 @@ enum MpdEvent {
 - Binary data (cover art) requires dedicated channel
 - Thread lifecycle must be managed on app shutdown
 
-### Scoped Refinement: Idle Protocol (2026-04-28)
+### Scoped Refinement: Idle Protocol (2026-04-28, updated 2026-05-20)
 
-**Decision:** True MPD `idle`/`noidle` protocol with `TcpStream::try_clone()` for thread-safe socket access. CoverGrid pattern: worker thread blocks on `idle` when queue empty; main thread writes `noidle\n` to socket clone to break idle.
+**Decision:** True MPD `idle`/`noidle` protocol with `TcpStream::try_clone()` for thread-safe socket access. Worker thread blocks on MPD `idle` when no commands are pending. When a command is sent, `MpdCommandSender` writes `noidle\n` to a stream clone to break idle. After processing the command and its responses, the worker re-enters idle.
 
-**Thread safety:** `TcpStream::try_clone()` creates two file descriptors sharing the same TCP connection. Worker owns the read clone (blocks on `recv` for idle responses). Main-thread-side writer uses the write clone to send `noidle\n` and commands. Safe because MPD protocol is half-duplex — read and write never contend.
+**Thread safety:** `TcpStream::try_clone()` creates two file descriptors sharing the same TCP connection. Worker owns the read clone (blocks on `recv` for idle responses). `MpdCommandSender` holds a `Mutex<Option<MpdStream>>` — on first use, clones the stream and caches it. Subsequent commands reuse the cached clone. Safe because MPD protocol is half-duplex — read and write never contend. If `try_clone()` fails (e.g., abstract socket), the worker falls back to polling.
 
-**Fallback behavior:**
-- If `idle` returns transient error (connection reset, timeout): fall back to 100ms `status` polling for 10 cycles (1 second), then retry `idle`.
-- If `idle` returns "unknown command" (MPD < 0.19 or idle disabled): fall back to 500ms polling permanently.
+**Fallback behavior (implemented):**
+- If `idle` returns "unknown command" (MPD < 0.19 or idle disabled): fall back to 500ms `status` polling permanently.
+- If `idle` returns transient error (connection reset, timeout): increment a counter. While `transient_failures > 0` AND `use_idle` is true, the poll path processes commands via `recv_timeout(100ms)` but does NOT re-enter idle. On each successful `fetch_full_update()` (500ms period), decrement the counter.
+- If transient failures reach 10: disable idle permanently (`use_idle = false`) and stay in 500ms polling mode. This prevents tight retry loops that spam MPD with idle commands when the transient condition persists.
+- If `idle` returns a fatal error (BrokenPipe, ConnectionReset, ConnectionAborted, "Connection closed"): exit `connected_loop` and trigger reconnect.
 
-**Status: NOT IMPLEMENTED — scoped (epic 25).** Currently uses 500ms polling in `connected_loop` (line 548). Idle protocol would replace this with event-driven updates via `TcpStream::try_clone()` for thread-safe socket access.
-
-**Proven pattern:** dead connection detection via 3 consecutive `fetch_full_update()` failures → return from `connected_loop` → outer state machine triggers reconnect with exponential backoff.
+**Proven pattern:** dead connection detection via 3 consecutive `fetch_full_update()` failures → return from `connected_loop` → outer state machine triggers reconnect with fixed 1s backoff.
 
 ## Architecture Decision Record: Cover Art Pipeline
 
@@ -1363,6 +1363,14 @@ The following three-tier design is documented for future implementation but is *
 - Minimum version of 0.19 excludes some older MPD installations (Debian stable may ship older versions in LTS)
 - Protocol probing adds ~1 round-trip to connection setup time (~50ms)
 
+### Known Limitation (2026-05-20)
+
+`MpdCapabilities` is derived from the MPD protocol version string in the greeting banner (`OK MPD {major}.{minor}`), not from MPD's `commands` output which lists every supported command explicitly. The version-based heuristic works for standard MPD builds but could misreport capabilities for:
+- MPD forks that diverge from the standard version numbering (Mopidy, RompR, etc.)
+- MPD builds with features disabled at compile time (`--disable-readpicture`, etc.)
+
+No known MPD forks or configurations currently break this assumption. A more robust approach would parse `commands` output, but this would add a startup round-trip and is deferred as low priority.
+
 ### Compatibility Profiles (Formal)
 
 The capability matrix is grouped into named profiles for deterministic feature detection:
@@ -1507,7 +1515,18 @@ The following contracts define the guarantees, invariants, and fault behavior fo
   - `coverart/` — `CoverArtService`, providers, caches, rate limiter, priority queue
   - `search/` — `SearchService`, relevance scoring, fuzzy matching, mode-scoped search strategies
   - `layout/` — `LayoutService`, responsive breakpoints, column computation
-  - `ui/` — widgets, CSS, theming. Sub-modules: `widgets/` (custom widgets), `theme/` (CSS, colors). Each custom widget follows the GTK4 Rust subclass pattern: `widget_name.rs` + `widget_name/imp.rs` (private implementation). See Custom Widget Architecture ADR for widget catalog.
+  - `ui/` — widgets, CSS, theming. Sub-modules:
+    - `mod.rs` — `App` struct, window construction (`adw::ApplicationWindow`), left/right rail assembly, mode switching (album ↔ folder), event dispatch via frame-clock tick callback, keyboard shortcuts, drag-and-drop cross-mode coordination, bottom panel assembly
+    - `grid.rs` — `AlbumCell`, group captions (`group_caption_for_view`), coordinate-based cover layout (`reposition`), scroll-aware progressive cover loading (300ms debounce), placeholder textures, mini-grid cells (`MiniGridItem`, `MiniCell`)
+    - `now_playing.rs` — `NowPlayingWidgets`, `PlaybackDisplay`, cover art display, track title/artist/album lines, format badges, bitrate display, transport controls (prev/play-pause/next), seekbar with time labels
+    - `queue.rs` — Mini-grid queue view (horizontal scrolling), track-list queue view (vertical `ListBox`), drag-and-drop handlers (row reorder, delete, insert), drop highlight indicators, drag-remove zone
+    - `search.rs` — Album-mode omnibox (`Ctrl+F`), folder-mode search entry, result list boxes with inline notes, mode-aware result caps (album=100, folder=500), search generation counter
+    - `folder.rs` — Folder browser tree (`folder_tree` widget), breadcrumb navigation, directory listing, CUE/DSD normalized entry indicators
+    - `settings.rs` — Settings dialog window, layout profile editor (`split_ratio`, `rail_width`), config read/write via `ConfigManager`
+    - `toast.rs` — Toast notification overlay (`adw::ToastOverlay`), deduplication within 2s window, three-tier severity display (Info 3s, Warn 5s, Error persistent)
+    - `widgets/` — Reusable custom widgets (`album_cover`, `folder_tree`). Each follows the GTK4 Rust subclass pattern: `widget_name.rs` + `widget_name/imp.rs`. See Custom Widget Architecture ADR.
+    - `style.css` — Application stylesheet, embedded via `gtk::CssProvider`
+  - **Note (2026-05-20):** `ui/mod.rs` currently contains the grid, queue, now-playing, search, folder, settings, and toast logic inline (~3100 lines). The sub-module split documented above is the target architecture; implementation is deferred.
   - `config/` — config loading, schema, migration, CLI flag parsing
   - `logging/` — logger setup, rotation, output formatting
   - `ipc/` — Unix socket listener, MPRIS D-Bus interface
@@ -2236,6 +2255,7 @@ The following represent the final state of all pattern refinements. **Where thes
 - If new/different: writes JPEG to disk cache, emits `AppEvent::CoverRefreshed(id, RGBA_bytes)`.
 - RGBA bytes pre-scaled to 200×200 (Lanczos3) — GTK does zero-copy GPU upload only.
 - No MPD protocol knowledge. No GTK widget access. Filesystem access for cache only.
+- **Duplicate prevention:** Uses a `RunningGuard` RAII struct wrapping an `Arc<AtomicBool>`. `spawn()` sets the flag via `compare_exchange` — if already true, returns `None` (worker already running). The guard is moved into the thread closure; its `Drop` implementation resets the flag on both clean exit and panic unwind, preventing a leaked `AtomicBool` from blocking future Cover Proc workers for the lifetime of the MPD connection.
 
 **Search worker (1 thread):**
 - Owns the search index. Rebuilds on library change events.
@@ -2258,11 +2278,21 @@ Three separate TCP connections to the same MPD host, each for a single purpose:
 |-----------|--------|---------|------------|
 | Command/Status | MPD IO | `status`, `currentsong`, `playlistinfo`, `add`, `play`, `list`, `idle` | Never blocked |
 | Cover binary | MPD Cover | `albumart <uri> <offset>`, `readpicture <uri> <offset>` | Binary data only |
-| Metadata (future) | MPD Metadata | `list album group ...`, `lsinfo`, bulk queries | Never blocks commands |
+| Metadata | MPD Metadata | `list album group ...`, `lsinfo`, bulk queries | Never blocks commands |
 
 The command/status connection is the fast path — it must never wait on binary cover transfers or large list queries. Each connection is a separate TCP socket to the same MPD instance. MPD handles multiple concurrent connections routinely.
 
-**3d. Shutdown Coordination**
+**3d. Metadata Connection Resilience (2026-05-20)**
+
+The metadata thread's MPD connection can go stale while the thread blocks on `cmd_rx.recv()` (not reading from MPD). When a command arrives after a long idle period, `send_command` may detect a dead connection (read returns 0 bytes) and return `Error::Protocol("Connection closed")`.
+
+The metadata thread's command dispatch retries once after reconnect:
+1. On first error: close the stale connection, open a new one, re-execute the same command.
+2. On second error: log the final error and give up (connection or MPD may be genuinely down).
+
+Commands are borrowed (`match &cmd`) rather than moved, enabling retry without cloning the command payload. If a command fails after retry, it is silently dropped — the caller on the GTK thread observes no response event and shows a toast.
+
+**3e. Shutdown Coordination**
 
 All workers check a shared `ShuttingDown` flag (`AtomicBool`). When set:
 - MPD IO thread: exits idle loop, closes socket, terminates.
