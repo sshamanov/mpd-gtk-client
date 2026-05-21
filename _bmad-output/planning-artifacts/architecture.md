@@ -346,7 +346,7 @@ UI thread: receives CoverRefreshed → decode bytes → GdkTexture → redraw wi
 
 **Decision:** Offload all JPEG decoding and scaling from GTK/glycin to the `image` crate. GTK handles only GPU texture upload and display compositing via `gdk4::MemoryTexture`. This eliminates the glycin sandbox overhead entirely.
 
-**Status:** Committed design. The `image` crate is already compiled into the binary (jpeg/png/webp features) but unused. Implementation phases below.
+**Status:** IMPLEMENTED. The `image` crate handles all JPEG decoding and scaling. GTK handles GPU texture upload and display compositing via `gdk4::MemoryTexture`.
 
 **Motivation:** The current pipeline routes all cover images through `gdk-pixbuf` → glycin, which spawns sandboxed `bwrap` subprocesses, communicates over D-Bus, and applies ICC color management. For album covers — which are universally RGB JPEGs that don't need color management — this machinery is pure overhead: 11–65ms per cold decode, sandbox lifecycle noise, and ICC conversion that the `strip_jpeg_icc()` function was added to work around.
 
@@ -444,7 +444,7 @@ The original design was never fully realized — the codebase uses `pad_groups()
 
 **Decision:** Replace the single-GridView-with-fillers architecture with a flat `GtkLayout` where all album cover cells and group captions are positioned by pure Rust coordinate math. No GridView, no ListModel, no factories, no bind/unbind callbacks, no fillers.
 
-**Status:** Committed design. Implementation pending — replaces current GridView+fillers approach documented as broken (see Issues §437).
+**Status:** IMPLEMENTED. Coordinate-based `GtkLayout` grid with pure Rust position math replaces GridView+fillers.
 
 ### Motivation
 
@@ -815,7 +815,7 @@ last_profile = "local"
 - Cached status for CurrentSong may be ≤1s stale — acceptable for elapsed/duration fields during track transitions
 - Cover path not stored in SharedState — future consumers that need it must listen to CoverPaths events directly
 
-**Status: PLANNED — to be implemented as story 19-2 (or next available).**
+**Status: IMPLEMENTED.** Now-playing pane uses `PlaybackDisplay` view model with ≤1s stale cache for elapsed/duration.
 
 
 
@@ -1247,7 +1247,7 @@ The following three-tier design is documented for future implementation but is *
 - Global shortcuts (like Space for play/pause) must not conflict with GTK's built-in widget shortcuts (e.g., Space toggles buttons)
 - `GdkKey` values are hardware-dependent — keyboard layout differences handled by GTK's key event normalization
 
-**Status: PARTIALLY IMPLEMENTED — scoped.** All shortcuts work (Ctrl+F search, Ctrl+1/2 modes, Space play/pause, Ctrl+, settings, arrow keys, Enter, Delete, Shift+Up/Down queue reorder) but are wired as ad-hoc GTK accelerators and `EventControllerKey` handlers. Centralized `KeybindingService` with compile-time conflict detection still needs to be built for the release.
+**Status: IMPLEMENTED.** Centralized `KeybindingContext`/`Action`/`Binding` system in `src/keybindings.rs` with compile-time conflict detection via `resolve()`.
 
 ## Architecture Decision Record: Undo/Redo for Queue Operations
 
@@ -1550,9 +1550,9 @@ The following contracts define the guarantees, invariants, and fault behavior fo
 - **Application structure:** `MpdClientApp` struct wrapping `gtk::Application`. Holds `Arc<AppState>`, channel receivers, and service handles. Constructed in `main.rs`, run via `run()`.
 - **Action registration:** All user-invocable actions registered as `GAction` entries during app startup. Actions include: mode toggle, playback control, queue operations, search focus, settings open, quit. Actions are enabled/disabled based on context (e.g., "pause" disabled when already paused).
 - **Action-to-command flow:** `GAction` → `Action` enum → handler closure that either (a) sends to MPD command channel, (b) mutates state directly, (c) triggers UI transition. This centralizes all entry points (keyboard, menu, hover button, IPC) into one dispatch.
-- **CSS loading:** Stylesheet loaded from embedded `gresource` at `com.mpdclient.style.css` path. CSS is compiled into the binary — no runtime file lookup, no missing-stylesheet failure mode. Hot-reload in debug builds via filesystem watch.
+- **CSS loading:** Stylesheet embedded via `include_str!("style.css")` — compile-time embedding, no runtime file lookup, no `gresource` or `build.rs` needed. Functionally equivalent to gresource with zero build-dependency overhead. Hot-reload in debug builds via filesystem watch.
 - **Window management:** Single window per application instance. `GtkApplicationWindow` with `GtkPaned` as root widget. Window geometry restored from session file on startup, saved on shutdown.
-- **Resource system:** Icons, CSS, and UI definitions (if any `.ui` files) embedded via `gio` resource system. Compiled by `glib-compile-resources` at build time via `build.rs`.
+- **Resource system:** CSS embedded via `include_str!`. No `.ui` files, no `gresource` XML, no `build.rs`.
 - **Main loop integration:** GTK main loop drives the application. MPD event channel receiver is polled via `glib::idle_add()` or `g_timeout_add()` — adapter pushes events into the main loop's event queue for thread-safe processing.
 
 ### Explicit Trade-offs Accepted

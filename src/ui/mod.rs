@@ -344,7 +344,7 @@ impl App {
 
     pub fn run(&self) {
         let application = Application::builder()
-            .application_id("com.github.schaman.mpd-client")
+            .application_id("com.mpdclient.app")
             .build();
 
         let event_rx = self.event_rx.clone();
