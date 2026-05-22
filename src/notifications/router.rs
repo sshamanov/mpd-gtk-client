@@ -136,9 +136,9 @@ fn handle_event(
         MpdEvent::Toast { message, level } => {
             if let Some(d) = dbus {
                 let (summary, persistent) = match level {
-                    ToastLevel::Error => ("MPD Error", true),
-                    ToastLevel::Warn => ("MPD Warning", false),
-                    ToastLevel::Info => ("mpd-client", false),
+                    ToastLevel::Error => (crate::strings::NOTIF_ERROR, true),
+                    ToastLevel::Warn => (crate::strings::NOTIF_WARNING, false),
+                    ToastLevel::Info => (crate::strings::NOTIF_INFO, false),
                 };
                 dbus::send(d, summary, &message, persistent);
             }
@@ -149,7 +149,12 @@ fn handle_event(
                 if d.last_disconnected.map_or(true, |t| {
                     t.elapsed() >= Duration::from_secs(30)
                 }) {
-                    dbus::send(d, "MPD Disconnected", "Connection lost — retrying...", true);
+                    dbus::send(
+                        d,
+                        crate::strings::NOTIF_DISCONNECTED,
+                        crate::strings::NOTIF_DISCONNECTED_BODY,
+                        true,
+                    );
                     d.last_disconnected = Some(now);
                 }
             }
@@ -157,7 +162,12 @@ fn handle_event(
         MpdEvent::Connected => {
             if let Some(d) = dbus {
                 if d.last_disconnected.is_some() {
-                    dbus::send(d, "MPD Reconnected", "Connection restored.", false);
+                    dbus::send(
+                        d,
+                        crate::strings::NOTIF_RECONNECTED,
+                        crate::strings::NOTIF_RECONNECTED_BODY,
+                        false,
+                    );
                     d.last_disconnected = None;
                 }
             }

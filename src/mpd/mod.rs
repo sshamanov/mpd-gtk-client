@@ -884,8 +884,8 @@ fn parse_albumart_chunk(raw: &[u8]) -> Vec<u8> {
         // Emit results in insertion order, replacing empty artists with "Unknown Artist"
         Ok(album_order.into_iter().map(|album| {
             let artist = album_artist.get(&album)
-                .map(|a| if a.is_empty() { "Unknown Artist" } else { a.as_str() })
-                .unwrap_or("Unknown Artist");
+                .map(|a| if a.is_empty() { crate::strings::UNKNOWN_ARTIST } else { a.as_str() })
+                .unwrap_or(crate::strings::UNKNOWN_ARTIST);
             (artist.to_string(), album)
         }).collect())
     }
@@ -1108,7 +1108,7 @@ fn normalize_year(date: &str) -> String {
             match group {
                 "Artist" | "AlbumArtist" => {
                     if a.album_artist.is_empty() {
-                        "Unknown Artist".into()
+                        crate::strings::UNKNOWN_ARTIST.into()
                     } else {
                         a.album_artist.clone()
                     }

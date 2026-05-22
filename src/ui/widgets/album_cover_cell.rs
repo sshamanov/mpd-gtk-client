@@ -155,19 +155,19 @@ mod imp {
 
             // --- Hover buttons — bottom-right of cover ---
 
-            let btn_add = gtk4::Button::with_label("+");
+            let btn_add = gtk4::Button::with_label(crate::strings::BTN_ADD_LABEL);
             btn_add.set_css_classes(&["album-cover-hover-btn"]);
-            btn_add.set_tooltip_text(Some("Add to queue"));
+            btn_add.set_tooltip_text(Some(crate::strings::TOOLTIP_ADD_TO_QUEUE));
             self.btn_add.replace(Some(btn_add.clone()));
 
-            let btn_next = gtk4::Button::with_label("↩");
+            let btn_next = gtk4::Button::with_label(crate::strings::BTN_NEXT_LABEL);
             btn_next.set_css_classes(&["album-cover-hover-btn"]);
-            btn_next.set_tooltip_text(Some("Play next"));
+            btn_next.set_tooltip_text(Some(crate::strings::TOOLTIP_PLAY_NEXT));
             self.btn_next.replace(Some(btn_next.clone()));
 
-            let btn_play = gtk4::Button::with_label("▶");
+            let btn_play = gtk4::Button::with_label(crate::strings::BTN_PLAY_LABEL);
             btn_play.set_css_classes(&["album-cover-hover-btn"]);
-            btn_play.set_tooltip_text(Some("Clear queue and play"));
+            btn_play.set_tooltip_text(Some(crate::strings::TOOLTIP_CLEAR_AND_PLAY));
             self.btn_play.replace(Some(btn_play.clone()));
 
             let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
@@ -372,9 +372,9 @@ impl AlbumCoverCell {
 
             let pop = gtk4::Popover::new();
             let popbox = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-            let btn_play = gtk4::Button::with_label("Play Now");
-            let btn_next = gtk4::Button::with_label("Play Next");
-            let btn_add = gtk4::Button::with_label("Add to Queue");
+            let btn_play = gtk4::Button::with_label(crate::strings::PLAY_NOW);
+            let btn_next = gtk4::Button::with_label(crate::strings::PLAY_NEXT);
+            let btn_add = gtk4::Button::with_label(crate::strings::ADD_TO_QUEUE);
             let pop_close = cell.clone();
 
             let tp = cmd_tx.clone();
@@ -431,7 +431,7 @@ impl AlbumCoverCell {
         }
         if let Some(ref ar) = *imp.artist_label.borrow() {
             let artist_text = if artist.is_empty() {
-                "Unknown Artist"
+                crate::strings::UNKNOWN_ARTIST
             } else {
                 artist
             };

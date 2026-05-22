@@ -1,5 +1,6 @@
 //! Application entry point — CLI parsing, initializes env_logger, creates state, starts GTK main loop. Thread: UI (startup then GTK main loop).
 
+pub mod app;
 pub mod config;
 
 pub mod coverart;
@@ -10,6 +11,7 @@ pub mod logging;
 pub mod memory;
 pub mod profiling;
 pub mod mpd;
+pub mod strings;
 #[cfg(feature = "mpris")]
 pub mod mpris;
 pub mod notifications;
@@ -28,31 +30,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use ui::App;
 
 /// Print usage information to stdout.
 fn print_usage() {
-    println!(
-        "\
-Usage: mpd-client [OPTIONS]
-
-Session overrides (not persisted):
-  --mpd-host <HOST>        MPD server hostname (default: 127.0.0.1)
-  --mpd-port <PORT>        MPD server port (default: 6600)
-  --profile <NAME>         Connection profile name (reserved, not yet implemented)
-  --mode <album|folder>    Startup UI mode (default: album)
-
-Media actions (dispatched after connection):
-  --start-playing          Start playback
-  --toggle-playback        Toggle play/pause
-  --next                   Skip to next track
-  --prev                   Skip to previous track
-
-Info:
-  --help, -h               Show this help and exit
-  --version, -V            Print version and exit\
-"
-    );
+    println!("{}", crate::strings::usage_text());
 }
 
 /// Parse CLI arguments into overrides and an optional action command.
@@ -204,12 +185,11 @@ fn main() {
 
     // Apply mode override (--mode) to initial state
     if let Some(ref mode_str) = overrides.mode {
-        if let Ok(mut s) = state.write() {
-            s.mode = match mode_str.as_str() {
-                "folder" => crate::state::Mode::Folder,
-                _ => crate::state::Mode::Album,
-            };
-        }
+        let mode = match mode_str.as_str() {
+            "folder" => crate::state::Mode::Folder,
+            _ => crate::state::Mode::Album,
+        };
+        crate::state::Store::new(state.clone()).switch_mode(mode);
     }
 
     // Shared connection target for live reconnect (Settings writes, background thread reads)
@@ -289,8 +269,7 @@ fn main() {
 
     // Block until the GTK application exits
     let close_tx = cmd_tx.clone();
-    let app = App::new(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache, search_cmd_tx, toast_tx);
-    app.run();
+    app::run(state, event_rx, cmd_tx, conn_params, mpris_update_tx, metadata_cache, search_cmd_tx, toast_tx);
 
     info!("Shutting down MPD connection");
 

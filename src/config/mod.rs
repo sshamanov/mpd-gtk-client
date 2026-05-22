@@ -499,17 +499,7 @@ impl Config {
             .join("applications");
         std::fs::create_dir_all(&apps_dir)?;
         let path = apps_dir.join("mpd-client.desktop");
-        let content = format!(
-            "[Desktop Entry]\n\
-             Type=Application\n\
-             Name=mpd-client\n\
-             Exec={}\n\
-             Icon=mpd-client\n\
-             Terminal=false\n\
-             Categories=Audio;Music;Player;\n\
-             MimeType=audio/flac;audio/mpeg;audio/ogg;audio/wav;audio/x-flac;\n",
-            exe.display()
-        );
+        let content = crate::strings::desktop_entry(&exe.display().to_string());
         std::fs::write(&path, content)
     }
 }

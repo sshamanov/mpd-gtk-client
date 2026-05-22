@@ -165,17 +165,17 @@ impl FolderBrowser {
 
             if name.starts_with("file:") {
                 let filepath = name.strip_prefix("file:").unwrap_or("").to_string();
-                let btn_play = gtk4::Button::with_label("Play Now");
+                let btn_play = gtk4::Button::with_label(crate::strings::PLAY_NOW);
                 let tp = tx.clone();
                 let fp = filepath.clone();
                 let pc = pop_close.clone();
                 btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayFile(fp.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                let btn_next = gtk4::Button::with_label("Play Next");
+                let btn_next = gtk4::Button::with_label(crate::strings::PLAY_NEXT);
                 let tn = tx.clone();
                 let fnp = filepath.clone();
                 let pc = pop_close.clone();
                 btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(vec![fnp.clone()])); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                let btn_add = gtk4::Button::with_label("Add to Queue");
+                let btn_add = gtk4::Button::with_label(crate::strings::ADD_TO_QUEUE);
                 let ta = tx.clone();
                 let fap = filepath.clone();
                 let pc = pop_close.clone();
@@ -189,15 +189,15 @@ impl FolderBrowser {
                     let uris_play = uris.clone();
                     let uris_insert = uris.clone();
                     let uris_add = uris.clone();
-                    let btn_play = gtk4::Button::with_label("Play Now");
+                    let btn_play = gtk4::Button::with_label(crate::strings::PLAY_NOW);
                     let tp = tx.clone();
                     let pc = pop_close.clone();
                     btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayUris(uris_play.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                    let btn_next = gtk4::Button::with_label("Play Next");
+                    let btn_next = gtk4::Button::with_label(crate::strings::PLAY_NEXT);
                     let tn = tx.clone();
                     let pc = pop_close.clone();
                     btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(uris_insert.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                    let btn_add = gtk4::Button::with_label("Add to Queue");
+                    let btn_add = gtk4::Button::with_label(crate::strings::ADD_TO_QUEUE);
                     let ta = tx.clone();
                     let pc = pop_close.clone();
                     btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddUris(uris_add.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
@@ -213,15 +213,15 @@ impl FolderBrowser {
                     let uris_play = uris.clone();
                     let uris_insert = uris.clone();
                     let uris_add = uris.clone();
-                    let btn_play = gtk4::Button::with_label("Play Now");
+                    let btn_play = gtk4::Button::with_label(crate::strings::PLAY_NOW);
                     let tp = tx.clone();
                     let pc = pop_close.clone();
                     btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayUris(uris_play.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                    let btn_next = gtk4::Button::with_label("Play Next");
+                    let btn_next = gtk4::Button::with_label(crate::strings::PLAY_NEXT);
                     let tn = tx.clone();
                     let pc = pop_close.clone();
                     btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextUris(uris_insert.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                    let btn_add = gtk4::Button::with_label("Add to Queue");
+                    let btn_add = gtk4::Button::with_label(crate::strings::ADD_TO_QUEUE);
                     let ta = tx.clone();
                     let pc = pop_close.clone();
                     btn_add.connect_clicked(move |_| { let _ = ta.send(MpdCommand::AddUris(uris_add.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
@@ -233,17 +233,17 @@ impl FolderBrowser {
                 }
             } else if name.starts_with("dir:") {
                 let dirpath = name.strip_prefix("dir:").unwrap_or("").to_string();
-                let btn_play = gtk4::Button::with_label("Play Now");
+                let btn_play = gtk4::Button::with_label(crate::strings::PLAY_NOW);
                 let tp = tx.clone();
                 let dp = dirpath.clone();
                 let pc = pop_close.clone();
                 btn_play.connect_clicked(move |_| { let _ = tp.send(MpdCommand::PlayDirectory(dp.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                let btn_next = gtk4::Button::with_label("Play Next");
+                let btn_next = gtk4::Button::with_label(crate::strings::PLAY_NEXT);
                 let tn = tx.clone();
                 let dn = dirpath.clone();
                 let pc = pop_close.clone();
                 btn_next.connect_clicked(move |_| { let _ = tn.send(MpdCommand::InsertNextDirectory(dn.clone())); if let Some(ref p) = *pc.borrow() { p.popdown(); } });
-                let btn_add = gtk4::Button::with_label("Add to Queue");
+                let btn_add = gtk4::Button::with_label(crate::strings::ADD_TO_QUEUE);
                 let ta = tx.clone();
                 let da = dirpath.clone();
                 let pc = pop_close.clone();
@@ -579,7 +579,7 @@ fn render_dir(
     // Empty state
     if !has_visible && !has_cue && !has_dsd {
         let empty_row = gtk4::ListBoxRow::new();
-        let lbl = Label::new(Some("(empty directory)"));
+        let lbl = Label::new(Some(crate::strings::EMPTY_DIRECTORY));
         lbl.set_css_classes(&["album-grid-status"]);
         lbl.set_margin_start((depth * 20 + 8) as i32);
         empty_row.set_child(Some(&lbl));
@@ -694,17 +694,17 @@ fn cue_summary_row(path: &str, depth: u32, track_count: usize) -> gtk4::ListBoxR
     icon.set_pixel_size(16);
     hbox.append(&icon);
 
-    let lbl = Label::new(Some("Cue Sheet Album"));
+    let lbl = Label::new(Some(crate::strings::CUE_SHEET_ALBUM));
     lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     hbox.append(&lbl);
 
-    let badge = Label::new(Some("CUE"));
+    let badge = Label::new(Some(crate::strings::CUE_BADGE));
     badge.set_css_classes(&["normalized-badge"]);
     hbox.append(&badge);
 
     hbox.set_css_classes(&["dir-entry"]);
     hbox.set_widget_name(&format!("cue:{}", path));
-    let tooltip = format!("Cue sheet — {} track{}", track_count, if track_count == 1 { "" } else { "s" });
+    let tooltip = crate::strings::cue_tooltip(track_count);
     row.set_tooltip_text(Some(&tooltip));
     row.set_child(Some(&hbox));
     row
@@ -722,17 +722,17 @@ fn dsd_summary_row(path: &str, depth: u32, file_count: usize) -> gtk4::ListBoxRo
     icon.set_pixel_size(16);
     hbox.append(&icon);
 
-    let lbl = Label::new(Some("DSD Album"));
+    let lbl = Label::new(Some(crate::strings::DSD_ALBUM));
     lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     hbox.append(&lbl);
 
-    let badge = Label::new(Some("DSD"));
+    let badge = Label::new(Some(crate::strings::DSD_BADGE));
     badge.set_css_classes(&["normalized-badge"]);
     hbox.append(&badge);
 
     hbox.set_css_classes(&["dir-entry"]);
     hbox.set_widget_name(&format!("dsd:{}", path));
-    let tooltip = format!("DSD folder — {} file{}", file_count, if file_count == 1 { "" } else { "s" });
+    let tooltip = crate::strings::dsd_tooltip(file_count);
     row.set_tooltip_text(Some(&tooltip));
     row.set_child(Some(&hbox));
     row

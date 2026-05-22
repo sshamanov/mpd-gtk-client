@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: "2026-04-25"
-last_updated: "2026-05-16"
+last_updated: "2026-05-22"
 
 
 
@@ -260,3 +260,12 @@ development_status:
 
   epic-42: done
   42-1-visual-indicator-normalized-entries: done
+
+  epic-43: done
+  43-1-standalone-quick-changes: done
+  43-2-extract-app-rs-wiring: done
+  43-3-split-ui-mod-rs-submodules: done
+  43-4-extract-event-loop: done
+  43-5-reducer-and-errorsink-cleanup: done
+  43-6-strings-rs-centralization: done
+  43-7-update-architecture-md: done

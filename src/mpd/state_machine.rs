@@ -383,7 +383,7 @@ impl MpdEventLoop {
                             if !*first_attempt {
                                 let _ = event_tx.try_send(MpdEvent::Disconnected);
                                 let _ = event_tx.try_send(MpdEvent::Toast {
-                                    message: "MPD connection lost — retrying...".into(),
+                                    message: crate::strings::TOAST_CONNECTION_LOST.into(),
                                     level: ToastLevel::Warn,
                                 });
                             }
@@ -421,7 +421,11 @@ impl MpdEventLoop {
                                 }
                                 Err(e) => {
                                     let _ = event_tx.try_send(MpdEvent::Toast {
-                                        message: format!("MPD connection failed: {e}\n\nCheck your MPD server and settings."),
+                                        message: format!(
+                                            "{}{e}{}",
+                                            crate::strings::TOAST_CONNECTION_FAILED_PREFIX,
+                                            crate::strings::TOAST_CONNECTION_FAILED_SUFFIX,
+                                        ),
                                         level: ToastLevel::Error,
                                     });
                                     let b = ExponentialBackoff::new();
@@ -1302,7 +1306,7 @@ fn process_command(
                 if s.is_empty() {
                     log::error!("[MPD] Batch: unsupported sub-command {:?}", cmd);
                     let _ = event_tx.try_send(MpdEvent::Toast {
-                        message: "Batch error: unsupported sub-command".into(),
+                        message: crate::strings::TOAST_BATCH_ERROR.into(),
                         level: crate::mpd::state_machine::ToastLevel::Error,
                     });
                     return false;
@@ -1434,7 +1438,7 @@ fn sync_queue(
                 *local_queue = reconciled;
                 if removed > 0 {
                     let _ = event_tx.try_send(MpdEvent::Toast {
-                        message: format!("Removed {removed} missing or modified track(s) from queue"),
+                        message: crate::strings::removed_tracks_toast(removed),
                         level: ToastLevel::Warn,
                     });
                 }
@@ -1651,7 +1655,7 @@ fn metadata_thread(
             Err(e) => {
                 log::error!("[mpd-metadata] connect failed: {e}");
                 let _ = event_tx.try_send(MpdEvent::Toast {
-                    message: format!("Metadata connection failed: {e}"),
+                    message: format!("{}{e}", crate::strings::TOAST_METADATA_FAILED),
                     level: ToastLevel::Error,
                 });
             }

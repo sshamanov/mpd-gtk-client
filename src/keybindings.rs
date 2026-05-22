@@ -98,26 +98,9 @@ pub fn resolve(key: Key, mods: ModifierType, active_context: &[KeybindingContext
 }
 
 /// Map an `Action` to its display description for the help dialog.
+/// Delegates to the centralized strings module.
 pub fn action_description(action: &Action) -> &'static str {
-    match action {
-        Action::PlayPause => "Play / Pause",
-        Action::NextTrack => "Next track",
-        Action::PreviousTrack => "Previous track",
-        Action::Stop => "Stop",
-        Action::ToggleMode => "Toggle Album / Folder mode",
-        Action::FocusSearch => "Focus search bar",
-        Action::OpenSettings => "Open settings",
-        Action::OpenShortcuts => "Show keyboard shortcuts",
-        Action::Quit => "Quit",
-        Action::QueueMoveUp => "Move item up in queue",
-        Action::QueueMoveDown => "Move item down in queue",
-        Action::QueueRemoveSelected => "Remove from queue",
-        Action::ActivateSelection => "Activate selected item",
-        Action::DeleteSelected => "Delete selected",
-        Action::Escape => "Cancel / Deselect",
-        Action::FolderCollapse => "Collapse folder",
-        Action::AlbumPlay => "Play album",
-    }
+    crate::strings::action_description(action)
 }
 
 /// Return the keybinding as a human-readable string.

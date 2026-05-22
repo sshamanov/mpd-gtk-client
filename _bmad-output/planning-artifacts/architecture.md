@@ -882,16 +882,15 @@ last_profile = "local"
 
 ## Architecture Decision Record: Error Handling Architecture
 
-**Decision:** Typed error propagation using `thiserror` enums with a three-tier error model (Recoverable, Retryable, Fatal), surfaced to the UI through a unified `ErrorSink`.
+**Decision:** Typed error propagation using `thiserror` enums with a three-tier error model (Recoverable, Retryable, Fatal), surfaced to the UI through `MpdEvent::Toast` (formerly ErrorSink).
 
 ### Key Details
 
 - **Recoverable:** Transient errors shown as toast notifications (3s timeout) — e.g., "MPD connection lost, retrying..."
 - **Retryable:** Errors with automatic retry and backoff — e.g., cover art download failure, MPD command timeout
 - **Fatal:** Errors requiring user action — e.g., config corruption, MPD protocol version mismatch. Modal dialog with specific guidance.
-- `ErrorSink` aggregator collects errors from all layers (MPD thread, cover art compute worker, search) and routes them to the appropriate presentation
-- **Refined per patterns elicitation:** ErrorSink is now a typed channel (`mpsc::Sender<ErrorSinkEvent>`) with a `glib::idle_add` consumer on the main loop, not a formal aggregator struct. See Elicitation-Driven Refinements → ErrorSink. The three-tier model (Recoverable/Retryable/Fatal) and `user_facing_message()` interface remain unchanged.
-- Each error type implements `user_facing_message()` returning a localized, actionable string
+- **Superseded (2026-05-22):** The original `ErrorSink` aggregator has been replaced by `MpdEvent::Toast` (Consolidated Refinements §4). All errors emit `MpdEvent::Toast` via the shared event channel, flowing through `reduce()` → `AppState.toast_queue`. The three-tier severity model maps to `ToastLevel::Info | Warn | Error`. See Consolidated Refinements §2 for the complete toast/notification design.
+- Each error type implements `user_facing_message()` returning a localized, actionable string (delegated to `strings.rs` for centralized string management).
 - Internal errors (unwrap-able invariants) use `expect` with descriptive messages — no catch-all `unwrap()`
 
 ### Explicit Trade-offs Accepted
@@ -1526,7 +1525,7 @@ The following contracts define the guarantees, invariants, and fault behavior fo
     - `toast.rs` — Toast notification overlay (`adw::ToastOverlay`), deduplication within 2s window, three-tier severity display (Info 3s, Warn 5s, Error persistent)
     - `widgets/` — Reusable custom widgets (`album_cover`, `folder_tree`). Each follows the GTK4 Rust subclass pattern: `widget_name.rs` + `widget_name/imp.rs`. See Custom Widget Architecture ADR.
     - `style.css` — Application stylesheet, embedded via `gtk::CssProvider`
-  - **Note (2026-05-20):** `ui/mod.rs` currently contains the grid, queue, now-playing, search, folder, settings, and toast logic inline (~3100 lines). The sub-module split documented above is the target architecture; implementation is deferred.
+  - **Note (2026-05-22):** The sub-module split is implemented. `ui/mod.rs` (~1960 lines) contains scaffolding (`build_ui`), action registration, and sub-module declarations. `event_loop.rs` (923 lines) holds `UiHandles` and `process_events()` (the extracted tick callback). `settings.rs`, `help.rs`, `bottom_panel.rs` are extracted but not yet wired in — their inline equivalents still reside in `build_ui`.
   - `config/` — config loading, schema, migration, CLI flag parsing
   - `logging/` — logger setup, rotation, output formatting
   - `ipc/` — Unix socket listener, MPRIS D-Bus interface
@@ -1663,7 +1662,7 @@ thiserror = "2"
 ```
 src/
   main.rs              # Entry point, CLI parsing, startup phases
-  app.rs               # GtkApplication wiring, GAction registration, CSS
+  app.rs               # Thin wiring: `pub fn run()` creates Application, registers actions, calls build_ui
   state/               # AppState, SharedState, ActiveMode enum
   mpd/                 # MPD adapter: state machine, protocol, commands
   queue/               # QueueStore, undo stack, sync
@@ -2178,6 +2177,8 @@ source (MPD/cover/search) → per-module Error → ErrorSink.aggregate()
 
 The following represent the final state of all pattern refinements. **Where these conflict with the ADRs above, this section is authoritative.** The ADRs document the initial design; this section records adjustments made through analysis. Cross-reference notes have been added to affected ADRs (Error Handling, Concurrency & Threading, Startup/Shutdown) pointing here.
 
+**Naming note:** This section references `AppEvent` throughout. The code uses `MpdEvent` for the same role — the single event enum flowing through the event channel to `reduce()`. The two names are interchangeable within this document.
+
 **1. Channel & Event Ordering**
 
 - Causally related events (playback state + queue state) must share a single channel to preserve causal ordering. Per-domain channels are for *fire-and-forget* events (cover art, toasts) that have no ordering dependency.
@@ -2222,16 +2223,19 @@ The following represent the final state of all pattern refinements. **Where thes
     (separate TCP connections)    (offloaded from MPD & GTK)
 ```
 
-**6 threads total:**
+**8 threads total** (7 non-GTK):
 
 | Thread | Kingdom | Role | Type | Communication |
 |--------|---------|------|------|---------------|
-| **GTK main** | GTK | UI rendering, `reduce()`, in-app toast overlay | Single-threaded per GTK4 | Receives `AppEvent` via channel. NO D-Bus. |
-| **MPD IO** | MPD | Idle loop, command dispatch, status, queue | Persistent connection | `mpsc::Sender<MpdCommand>` in, `mpsc::Sender<AppEvent>` out |
+| **GTK main** | GTK | UI rendering, `reduce()`, in-app toast overlay | Single-threaded per GTK4 | Receives `MpdEvent` via channel. NO D-Bus. |
+| **MPD IO** | MPD | Idle loop, command dispatch, status, queue | Persistent connection | `mpsc::Sender<MpdCommand>` in, `mpsc::Sender<MpdEvent>` out |
 | **MPD Cover** | MPD | `albumart`/`readpicture` binary fetch | On-demand, 30s idle timeout | Receives cover URIs via channel, sends raw bytes to Cover Proc |
-| **Cover Proc** | Computation | JPEG decode → RGBA, MD5 hash, disk cache write | Persistent worker | Receives raw bytes, emits `AppEvent::CoverRefreshed` |
-| **Search** | Computation | Index rebuild, query execution, ranking | Persistent worker | Receives search/index commands, emits `AppEvent::SearchResults` |
-| **NotificationRouter** | Computation | Reads Toast events, fires D-Bus desktop notifications | Lightweight, on-demand | Receives cloned `AppEvent::Toast` via channel receiver |
+| **MPD Metadata** | MPD | Tag cache: `readcomments` for year/genre, rate-limited | On-demand, idle timeout | Receives metadata requests, writes to `MetadataCache` |
+| **Cover Proc** | Computation | JPEG decode → RGBA, MD5 hash, disk cache write | Persistent worker | Receives raw bytes, emits `MpdEvent::CoverRefreshed` |
+| **Search** | Computation | Index rebuild, query execution, ranking | Persistent worker | Receives search/index commands, emits `MpdEvent::SearchResults` |
+| **NotificationRouter** | Computation | Reads Toast events, fires D-Bus desktop notifications | Lightweight, on-demand | Receives cloned `MpdEvent::Toast` via channel receiver |
+| **IPC Listener** | IPC | Unix socket for second-instance action forwarding | Lightweight, on-demand | Receives forwarded actions, sends `MpdCommand` |
+| **MPRIS** | D-Bus | MPRIS2 media player interface (feature-gated) | On-demand | `mpsc` for playback state, zbus `Connection` |
 
 **3b. Thread Responsibilities**
 
@@ -2866,8 +2870,10 @@ The project structure supports all architectural decisions:
 
 **Nice-to-Have Gaps:**
 - `tests/common/mod.rs` needs to be created before first integration test (noted in structure — it's an empty scaffold)
-- Module docstrings (`//!` comments) are required by convention but not yet written (they're implementation-phase work)
-- The `MIGRATION.md` file for workspace→single-crate collapse is defined in the tree but not yet populated with `git mv` commands
+- Module docstrings (`//!` comments) are partially written for new sub-modules (`event_loop.rs`, `grid.rs`, `queue.rs`, `now_playing.rs`, `strings.rs`, etc.)
+- `strings.rs` exists for centralized user-facing strings (story 43-6)
+- `app.rs` exists for application wiring (story 43-2)
+- `help.rs`, `settings.rs`, `bottom_panel.rs` stubs extracted but not yet wired into `build_ui` (story 43-3 deferred)
 
 ### Architecture Readiness Assessment
 
@@ -2886,8 +2892,8 @@ The project structure supports all architectural decisions:
 - Cross-referenced: ADRs point to refinements; refinements override ADRs; no silent contradictions
 
 **Areas for Future Enhancement:**
-- Module docstrings (implementation-phase task, tick before first PR)
-- Migration from current workspace to single crate (one-time `git mv` operation)
+- Complete module docstrings for remaining sub-modules (partially done for event_loop, grid, queue, now_playing, strings, app)
+- Wire up `help.rs::show()`, `bottom_panel.rs::build()`, and `settings.rs` into `build_ui` (currently inline equivalents in mod.rs)
 - Integration test scaffolding (`tests/common/mod.rs` — create before first integration test)
 
 ### Implementation Handoff
@@ -2899,6 +2905,7 @@ The project structure supports all architectural decisions:
 - Place widget tests inline as `#[cfg(test)]`; integration tests in `tests/` with feature gate
 - Run `scripts/check-patterns.sh` before marking any implementation task complete
 - Keep `app.rs` thin — wiring only, no business logic
+- All user-facing strings go in `strings.rs` — no inline string literals in widget code
 - All `mod.rs` files must have `//!` docstrings explaining module scope and thread affinity
 
 **First Implementation Priority:**

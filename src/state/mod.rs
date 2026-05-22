@@ -1,10 +1,11 @@
 //! Application state — shared playback/queue state and mode-local browsing state. Thread: UI (single-threaded mutations).
 
 use crate::mpd::state_machine::MpdEvent;
+use crate::mpd::state_machine::ToastLevel;
 #[cfg(test)]
 use crate::mpd::state_machine::PlaybackUpdate;
 use crate::mpd::{Album, QueueItem, Track};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use serde::{Serialize, Deserialize};
@@ -69,6 +70,8 @@ pub struct AppState {
     pub album_browsing: AlbumBrowsingState,
     pub folder_browsing: FolderBrowsingState,
     pub mode: Mode,
+    #[serde(skip)]
+    pub toast_queue: VecDeque<(String, ToastLevel)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -108,9 +111,11 @@ pub fn create_initial_state() -> SharedState {
             scroll_position: 0.0,
         },
         mode: Mode::Album,
+        toast_queue: VecDeque::new(),
     }))
 }
 
+#[derive(Clone)]
 pub struct Store {
     state: SharedState,
 }
@@ -180,8 +185,39 @@ impl Store {
         }
     }
 
+    pub fn save_album_scroll_position(&self, value: f64) {
+        if let Err(e) = self.state.write().map(|mut s| s.album_browsing.scroll_position.1 = value) {
+            log::error!("RwLock poisoned in save_album_scroll_position: {e}");
+        }
+    }
+
+    pub fn save_folder_browsing_state(&self, expanded_paths: Vec<std::path::PathBuf>, scroll_position: f64) {
+        if let Err(e) = self.state.write().map(|mut s| {
+            s.folder_browsing.expanded_paths = expanded_paths;
+            s.folder_browsing.scroll_position = scroll_position;
+        }) {
+            log::error!("RwLock poisoned in save_folder_browsing_state: {e}");
+        }
+    }
+
+    pub fn set_custom_album_order(&self, order: Vec<String>) {
+        if let Err(e) = self.state.write().map(|mut s| s.album_browsing.custom_album_order = order) {
+            log::error!("RwLock poisoned in set_custom_album_order: {e}");
+        }
+    }
+
     pub fn get_state(&self) -> SharedState {
         self.state.clone()
+    }
+}
+
+/// Apply an MPD event to shared state — acquires write lock and calls reduce.
+///
+/// This is the only entry point for event-driven state mutations outside of Store methods.
+pub fn apply_event(state: &SharedState, event: &MpdEvent) {
+    match state.write() {
+        Ok(mut s) => reduce(&mut s, event),
+        Err(e) => log::error!("RwLock poisoned in apply_event: {e}"),
     }
 }
 
@@ -226,7 +262,7 @@ pub fn reduce(state: &mut AppState, event: &MpdEvent) {
                 });
             }
         }
-        // Events with no state changes — widget-only
+        // Events with no state changes — widget-only (processed in event_loop.rs)
         MpdEvent::Queue(_)
         | MpdEvent::Albums(_)
         | MpdEvent::AlbumsGrouped(_)
@@ -237,9 +273,15 @@ pub fn reduce(state: &mut AppState, event: &MpdEvent) {
         | MpdEvent::AlbumTracks(_)
         | MpdEvent::CoverPaths(_)
         | MpdEvent::CoverRefreshed { .. }
-        | MpdEvent::LibraryChanged
-        | MpdEvent::Error(_)
-        | MpdEvent::Toast { .. } => {}
+        | MpdEvent::LibraryChanged => {}
+        // Error → toast for user-visible feedback
+        MpdEvent::Error(msg) => {
+            state.toast_queue.push_back((msg.clone(), ToastLevel::Error));
+        }
+        // Toast → enqueue for display (consumed by event_loop widget update)
+        MpdEvent::Toast { message, level } => {
+            state.toast_queue.push_back((message.clone(), *level));
+        }
     }
 }
 
@@ -266,6 +308,7 @@ mod tests {
                 scroll_position: 0.0,
             },
             mode: Mode::Album,
+            toast_queue: VecDeque::new(),
         }
     }
 
