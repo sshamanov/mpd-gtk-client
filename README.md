@@ -1,4 +1,4 @@
-# mpd-gtk-client
+# rust-mpd-client
 
 An album-centric desktop client for [MPD](https://www.musicpd.org/) (Music Player Daemon), written in Rust with GTK4 and libadwaita.
 
