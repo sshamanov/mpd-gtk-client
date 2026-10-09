@@ -31,9 +31,35 @@ error.log
 .claude/
 .codex
 .codex/
+.cursor/
+.cursorignore
+.cursorindexingignore
+.windsurf/
+.aider*
+.continue/
+.gemini/
+.deepseek/
+.opencode/
+.roo/
+.cline/
+.clinerules
+.kiro/
+.qwen/
+.amazonq/
+.junie/
+.goose/
+.copilot/
+.serena/
+.specstory/
+.mcp.json
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# BMAD tooling and its outputs (local only; docs live in .claude/docs/)
+_bmad/
+_bmad-output/
 
 # Temporary files
 tmp/
 temp/
-# BMAD tooling (vendored, installed locally)
-_bmad/
