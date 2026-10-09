@@ -35,3 +35,5 @@ error.log
 # Temporary files
 tmp/
 temp/
+# BMAD tooling (vendored, installed locally)
+_bmad/
